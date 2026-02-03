@@ -58,7 +58,12 @@ extern "C"
       IMPAPI(AttachWindowTopmostButton);
       IMPAPI(ShowConsoleMsg);
       IMPAPI(DockWindowAdd);
+      IMPAPI(DockWindowAddEx);
+      IMPAPI(DockWindowRemove);
       IMPAPI(DockWindowActivate);
+      IMPAPI(DockIsChildOfDock);
+      IMPAPI(get_ini_file);
+      IMPAPI(EnsureNotCompletelyOffscreen);
       
       if (gErrorCount > 0)
         return 0;

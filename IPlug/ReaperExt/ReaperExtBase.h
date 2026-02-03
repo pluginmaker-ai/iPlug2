@@ -18,10 +18,21 @@
 
 #include "IPlugTimer.h"
 #include "IPlugDelegate_select.h"
+#include "wdlstring.h"
 
 struct reaper_plugin_info_t;
 
 BEGIN_IPLUG_NAMESPACE
+
+#pragma pack(push, 4)
+/** State structure for dock window persistence - matches SWS pattern */
+struct ReaperExtDockState
+{
+  RECT r;          // Window rect when floating
+  int state;       // Bit 0 = visible, Bit 1 = docked
+  int whichdock;   // Docker index when docked
+};
+#pragma pack(pop)
 
 /** Reaper extension base class interface */
 class ReaperExtBase : public EDITOR_DELEGATE_CLASS
@@ -50,8 +61,16 @@ public:
 
   /** Toggles the visibility of the main extension window */
   void ShowHideMainWindow();
-  
+
+  /** Toggles between docked and floating state */
   void ToggleDocking();
+
+  /** Returns true if the window is currently docked */
+  bool IsDocked() const { return (mDockState.state & 2) == 2; }
+
+  /** Sets the unique identifier used for dock state persistence
+   * @param id Unique identifier string (defaults to PLUG_CLASS_NAME) */
+  void SetDockId(const char* id) { mDockId.Set(id); }
 
 public:
   // Reaper calls back to this when it wants to execute an action registered by the extension plugin
@@ -64,10 +83,17 @@ private:
   static WDL_DLGRET MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam);
   
   void OnTimer(Timer& t);
+  void CreateMainWindow();
+  void DestroyMainWindow();
+  void SaveDockState();
+  void LoadDockState();
 
   reaper_plugin_info_t* mRec = nullptr;
   std::unique_ptr<Timer> mTimer;
-  bool mDocked = false;
+  ReaperExtDockState mDockState = {};
+  WDL_FastString mDockId;
+  bool mSaveStateOnDestroy = true;
+  bool mStateLoaded = false;
 };
 
 END_IPLUG_NAMESPACE

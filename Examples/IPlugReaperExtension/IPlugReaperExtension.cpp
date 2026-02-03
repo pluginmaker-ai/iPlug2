@@ -47,11 +47,11 @@ IPlugReaperExtension::IPlugReaperExtension(reaper_plugin_info_t* pRec)
                                                    action2();
                                                  }, "Action 2 - Add Track"));
 
-//    pGraphics->AttachControl(new IVButtonControl(bounds.GetGridCell(0, 2, 2).GetPadded(-20.).SubRectVertical(2, 1).GetMidVPadded(20),
-//                                                 [&](IControl* pCaller) {
-//                                                   SplashClickActionFunc(pCaller);
-//                                                   ToggleDocking();
-//                                                 }, "Dock"));
+    pGraphics->AttachControl(new IVButtonControl(bounds.GetGridCell(0, 2, 2).GetPadded(-20.).SubRectVertical(2, 1).GetMidVPadded(20),
+                                                 [&](IControl* pCaller) {
+                                                   SplashClickActionFunc(pCaller);
+                                                   ToggleDocking();
+                                                 }, "Dock"));
     
     WDL_String str;
     mPrevTrackCount = CountTracks(0);
