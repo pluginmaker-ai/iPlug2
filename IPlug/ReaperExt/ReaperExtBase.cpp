@@ -50,12 +50,16 @@ bool ReaperExtBase::EditorResizeFromUI(int viewWidth, int viewHeight, bool needs
 {
   if (viewWidth != GetEditorWidth() || viewHeight != GetEditorHeight())
   {
+    // Don't resize the window when docked — REAPER controls the dock size
+    if (!IsDocked() && needsPlatformResize)
+    {
 #ifdef OS_MAC
 #define TITLEBAR_BODGE 22 //TODO: sort this out
-    RECT r;
-    GetWindowRect(gHWND, &r);
-    SetWindowPos(gHWND, 0, r.left, r.bottom - viewHeight - TITLEBAR_BODGE, viewWidth, viewHeight + TITLEBAR_BODGE, 0);
+      RECT r;
+      GetWindowRect(gHWND, &r);
+      SetWindowPos(gHWND, 0, r.left, r.bottom - viewHeight - TITLEBAR_BODGE, viewWidth, viewHeight + TITLEBAR_BODGE, 0);
 #endif
+    }
 
     return true;
   }
@@ -262,6 +266,18 @@ WDL_DLGRET ReaperExtBase::MainDlgProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARA
       }
 
       gPlug->OpenWindow(hwnd);
+
+      // Trigger initial resize now that IGraphics exists
+      // (WM_SIZE during SetWindowPos/DockWindowAddEx above fires before OpenWindow)
+      {
+        RECT r;
+        GetClientRect(hwnd, &r);
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        if (w > 0 && h > 0)
+          gPlug->OnParentWindowResize(w, h);
+      }
+
       GetWindowRect(hwnd, &gPrevBounds);
       
       return 0;
@@ -273,6 +289,19 @@ WDL_DLGRET ReaperExtBase::MainDlgProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARA
 
       DockWindowRemove(hwnd);
       gHWND = NULL;
+      return 0;
+    }
+    case WM_SIZE:
+    {
+      if (gPlug->GetUI())
+      {
+        RECT r;
+        GetClientRect(hwnd, &r);
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        if (w > 0 && h > 0)
+          gPlug->OnParentWindowResize(w, h);
+      }
       return 0;
     }
     case WM_CLOSE:
