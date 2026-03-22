@@ -117,7 +117,7 @@
 }
 
 - (BOOL)acceptsFirstResponder {
-    return YES;
+    return NO;
 }
 
 #ifdef OS_MAC

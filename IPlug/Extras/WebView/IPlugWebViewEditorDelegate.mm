@@ -35,6 +35,7 @@
 
 #ifdef OS_MAC
 #import <AppKit/AppKit.h>
+#import <QuartzCore/QuartzCore.h>
 #elif defined(OS_IOS)
 #import <UIKit/UIKit.h>
 #endif
@@ -57,6 +58,7 @@ using namespace iplug;
 
 @implementation IPLUG_WKWEBVIEW_EDITOR_HELPER
 {
+  BOOL mInResize;
 }
 
 - (id) initWithEditorDelegate: (WebViewEditorDelegate*) pDelegate;
@@ -83,6 +85,31 @@ using namespace iplug;
   [super removeFromSuperview];
 }
 
+#ifdef OS_MAC
+- (void) viewDidMoveToWindow
+{
+  [super viewDidMoveToWindow];
+  if (self.window && mDelegate)
+  {
+    CGFloat w = mDelegate->GetEditorWidth();
+    CGFloat h = mDelegate->GetEditorHeight();
+    if (w > 0 && h > 0)
+      [self.window setContentAspectRatio:NSMakeSize(w, h)];
+  }
+}
+
+- (void) setFrameSize:(NSSize)newSize
+{
+  [super setFrameSize:newSize];
+  if (mDelegate && !mInResize)
+  {
+    mInResize = YES;
+    mDelegate->OnParentWindowResize(static_cast<int>(newSize.width), static_cast<int>(newSize.height));
+    mInResize = NO;
+  }
+}
+#endif
+
 @end
 
 WebViewEditorDelegate::WebViewEditorDelegate(int nParams)
@@ -103,7 +130,12 @@ WebViewEditorDelegate::~WebViewEditorDelegate()
 void* WebViewEditorDelegate::OpenWindow(void* pParent)
 {
   PLATFORM_VIEW* pParentView = (PLATFORM_VIEW*) pParent;
-    
+
+  if (mDesignWidth == 0) {
+    mDesignWidth = GetEditorWidth();
+    mDesignHeight = GetEditorHeight();
+  }
+
   IPLUG_WKWEBVIEW_EDITOR_HELPER* pHelperView = [[IPLUG_WKWEBVIEW_EDITOR_HELPER alloc] initWithEditorDelegate: this];
   mView = (void*) pHelperView;
 
@@ -138,7 +170,22 @@ void WebViewEditorDelegate::ResizeWebViewAndHelper(float width, float height)
   CGFloat h = static_cast<float>(height);
   IPLUG_WKWEBVIEW_EDITOR_HELPER* pHelperView = (IPLUG_WKWEBVIEW_EDITOR_HELPER*) mView;
   [pHelperView setFrame:CGRectMake(0, 0, w, h)];
-  SetWebViewBounds(0, 0, w, h);
+
+  // Use CSS transform for uniform scaling — works for both rendering AND hit testing.
+  // The WKWebView fills the window, but CSS locks the layout to design dimensions
+  // and visually scales to fit.
+  float scale = (mDesignWidth > 0) ? (w / static_cast<float>(mDesignWidth)) : 1.f;
+  SetWebViewBounds(0, 0, w, h, 1.f);
+
+  char js[512];
+  snprintf(js, sizeof(js),
+    "document.documentElement.style.width='%dpx';"
+    "document.documentElement.style.height='%dpx';"
+    "document.documentElement.style.overflow='hidden';"
+    "document.documentElement.style.transform='scale(%f)';"
+    "document.documentElement.style.transformOrigin='top left';",
+    mDesignWidth, mDesignHeight, scale);
+  EvaluateJavaScript(js, nullptr);
 }
 
 bool WebViewEditorDelegate::OnKeyDown(const IKeyPress& key)

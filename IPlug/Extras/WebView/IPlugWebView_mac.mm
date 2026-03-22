@@ -145,6 +145,22 @@ void* IWebViewImpl::OpenWebView(void* pParent, float x, float y, float w, float 
                                head.appendChild(meta);"
                              injectionTime:WKUserScriptInjectionTimeAtDocumentEnd
                              forMainFrameOnly:YES]];
+
+#ifdef OS_MAC
+  // Prevent WKWebView internal scroll by locking overflow on html+body before any rendering
+  [controller addUserScript:[[WKUserScript alloc] initWithSource:
+                             @"document.addEventListener('DOMContentLoaded', function() { "
+                              "document.documentElement.style.overflow = 'hidden'; "
+                              "document.body.style.overflow = 'hidden'; "
+                              "document.body.style.position = 'fixed'; "
+                              "document.body.style.width = '100%'; "
+                              "document.body.style.height = '100%'; "
+                              "document.body.style.top = '0'; "
+                              "document.body.style.left = '0'; "
+                              "});"
+                             injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                             forMainFrameOnly:YES]];
+#endif
   
   // this script receives global key down events and forwards them to the C++ side
   [controller addUserScript:[[WKUserScript alloc] initWithSource:
@@ -178,6 +194,10 @@ void* IWebViewImpl::OpenWebView(void* pParent, float x, float y, float w, float 
   }
   
   [wkWebView setAllowsMagnification:NO];
+
+  if (@available(macOS 13.3, *)) {
+    [wkWebView setInspectable:YES];
+  }
 #endif
   
   auto* navigationDelegate = [[IPLUG_WKWEBVIEW_DELEGATE alloc] initWithIWebView: mIWebView];
@@ -322,6 +342,15 @@ void IWebViewImpl::SetWebViewBounds(float x, float y, float w, float h, float sc
 #ifdef OS_MAC
   if (@available(macOS 11.0, *)) {
     [mWKWebView setPageZoom:scale ];
+  }
+
+  // Reset internal scroll view position to prevent content offset bug
+  for (NSView* subview in mWKWebView.subviews) {
+    if ([subview isKindOfClass:[NSScrollView class]]) {
+      NSScrollView* scrollView = (NSScrollView*)subview;
+      [scrollView.contentView scrollToPoint:NSMakePoint(0, 0)];
+      [scrollView reflectScrolledClipView:scrollView.contentView];
+    }
   }
 #endif
 }

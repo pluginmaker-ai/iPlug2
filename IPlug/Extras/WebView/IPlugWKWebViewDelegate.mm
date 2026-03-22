@@ -106,6 +106,19 @@ NS_ASSUME_NONNULL_BEGIN
 - (void) webView:(IPLUG_WKWEBVIEW*) webView didFinishNavigation:(WKNavigation*) navigation
 {
   mIWebView->OnWebContentLoaded();
+
+#ifdef OS_MAC
+  // Fix WKWebView scroll offset bug: nudge the frame by 1px and back.
+  // This forces a re-layout that resets the internal scroll position.
+  // The user confirmed resizing once fixes the issue — this automates it.
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(200 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+    CGRect frame = webView.frame;
+    [webView setFrame:CGRectMake(0, 0, frame.size.width - 1, frame.size.height)];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(50 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+      [webView setFrame:frame];
+    });
+  });
+#endif
 }
 
 - (void)download:(WKDownload*)download decideDestinationUsingResponse:(NSURLResponse*)response suggestedFilename:(NSString*)filename completionHandler:(void (^_Nonnull)(NSURL* _Nullable))completionHandler API_AVAILABLE(macos(11.3), ios(14.5))

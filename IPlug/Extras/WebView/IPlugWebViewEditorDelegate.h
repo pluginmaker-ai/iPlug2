@@ -241,6 +241,8 @@ protected:
   int mMaxJSStringLength = kDefaultMaxJSStringLength;
   std::function<void()> mEditorInitFunc = nullptr;
   void* mView = nullptr;
+  int mDesignWidth = 0;  // Initial PLUG_WIDTH, used for pageZoom scaling on resize
+  int mDesignHeight = 0;
   
 private:
   IKeyPress ConvertToIKeyPress(uint32_t keyCode, const char* utf8, bool shift, bool ctrl, bool alt)
