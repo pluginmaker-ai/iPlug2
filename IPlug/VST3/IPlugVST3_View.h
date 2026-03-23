@@ -59,6 +59,7 @@ public:
     if (pSize && mOwner.GetHostResizeEnabled())
     {
       rect = *pSize;
+      mOwner.SetEditorSize(rect.getWidth(), rect.getHeight());
       mOwner.OnParentWindowResize(rect.getWidth(), rect.getHeight());
       return Steinberg::kResultTrue;
     }

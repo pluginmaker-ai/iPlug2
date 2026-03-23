@@ -160,6 +160,12 @@ using namespace iplug;
   CGRect r = CGRectMake(0, 0, w, h);
   self = [super initWithFrame:r];
 
+#ifdef OS_MAC
+  // Follow parent frame changes so hosts that resize the parent without calling
+  // IPlugView::onSize() (e.g. FL Studio) still trigger our setFrameSize: handler.
+  self.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+#endif
+
   void* pWebView = pDelegate->OpenWebView(self, 0, 0, w, h, 1.0f);
 
   [self addSubview: (PLATFORM_VIEW*) pWebView];
