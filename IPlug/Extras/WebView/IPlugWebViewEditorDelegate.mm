@@ -98,15 +98,16 @@ using namespace iplug;
   NSBezierPath* path = [NSBezierPath bezierPath];
   [path setLineWidth:1.5];
 
-  // macOS Y is flipped (0 = bottom). Lines go from bottom-right toward top-left.
-  [path moveToPoint:NSMakePoint(w - 2, 2)];
-  [path lineToPoint:NSMakePoint(2, h - 2)];
+  // Standard resize grip: three parallel lines from bottom-left to top-right.
+  // macOS coords: (0,0) = bottom-left of this 16x16 view.
+  [path moveToPoint:NSMakePoint(w - 4,  2)];
+  [path lineToPoint:NSMakePoint(2,  h - 4)];
 
-  [path moveToPoint:NSMakePoint(w - 2, h * 0.25 + 2)];
-  [path lineToPoint:NSMakePoint(w * 0.25 + 2, h - 2)];
+  [path moveToPoint:NSMakePoint(w - 4,  6)];
+  [path lineToPoint:NSMakePoint(6,  h - 4)];
 
-  [path moveToPoint:NSMakePoint(w - 2, h * 0.5 + 2)];
-  [path lineToPoint:NSMakePoint(w * 0.5 + 2, h - 2)];
+  [path moveToPoint:NSMakePoint(w - 4, 10)];
+  [path lineToPoint:NSMakePoint(10, h - 4)];
 
   [path stroke];
 }
