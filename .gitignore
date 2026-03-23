@@ -52,3 +52,4 @@ Examples/*/build*
 Tests/*/build*
 build/*
 .claude/settings.local.json
+iPlug2
