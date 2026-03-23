@@ -88,26 +88,27 @@ using namespace iplug;
   return self;
 }
 
+- (BOOL) isFlipped { return YES; }
+
 - (void) drawRect:(NSRect)dirtyRect
 {
-  NSRect bounds = self.bounds;
-  CGFloat w = bounds.size.width;
-  CGFloat h = bounds.size.height;
+  CGFloat w = self.bounds.size.width;
+  CGFloat h = self.bounds.size.height;
 
+  // Draw standard resize grip: three diagonal lines ⟍
+  // With isFlipped=YES, (0,0) is top-left, (w,h) is bottom-right.
   [[NSColor colorWithWhite:1.0 alpha:0.3] setStroke];
   NSBezierPath* path = [NSBezierPath bezierPath];
   [path setLineWidth:1.5];
 
-  // Standard resize grip: three parallel lines from bottom-left to top-right.
-  // macOS coords: (0,0) = bottom-left of this 16x16 view.
-  [path moveToPoint:NSMakePoint(w - 4,  2)];
-  [path lineToPoint:NSMakePoint(2,  h - 4)];
+  [path moveToPoint:NSMakePoint(4,  h)];
+  [path lineToPoint:NSMakePoint(w,  4)];
 
-  [path moveToPoint:NSMakePoint(w - 4,  6)];
-  [path lineToPoint:NSMakePoint(6,  h - 4)];
+  [path moveToPoint:NSMakePoint(8,  h)];
+  [path lineToPoint:NSMakePoint(w,  8)];
 
-  [path moveToPoint:NSMakePoint(w - 4, 10)];
-  [path lineToPoint:NSMakePoint(10, h - 4)];
+  [path moveToPoint:NSMakePoint(12, h)];
+  [path lineToPoint:NSMakePoint(w, 12)];
 
   [path stroke];
 }
