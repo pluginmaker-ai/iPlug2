@@ -176,13 +176,6 @@ public:
       IKeyPress keyPress = ConvertToIKeyPress(json["keyCode"].get<uint32_t>(), json["utf8"].get<std::string>().c_str(), json["S"].get<bool>(), json["C"].get<bool>(), json["A"].get<bool>());
       json["isUp"].get<bool>() ? OnKeyUp(keyPress) : OnKeyDown(keyPress); // return value not used
     }
-    else if(json["msg"] == "RSZFUI")
-    {
-      int w = json["width"].get<int>();
-      int h = json["height"].get<int>();
-      if (w > 0 && h > 0)
-        Resize(w, h);
-    }
   }
 
   void Resize(int width, int height);
@@ -214,57 +207,6 @@ public:
     msg["params"] = params;
 
     SendJSONFromDelegate(msg);
-
-    // Inject a resize handle for hosts that don't support host-initiated resize (e.g. AUv2 in Logic).
-    // The handle sits in the bottom-right corner; dragging it sends RSZFUI messages to the C++ side
-    // which calls Resize() → setFrameSize: → NSViewFrameDidChangeNotification → host follows.
-    if (mDesignWidth > 0 && mDesignHeight > 0)
-    {
-      char resizeJs[2048];
-      snprintf(resizeJs, sizeof(resizeJs),
-        "(function(){"
-        "if(document.getElementById('iplug-resize-handle'))return;"
-        "var h=document.createElement('div');"
-        "h.id='iplug-resize-handle';"
-        "h.style.cssText='position:fixed;right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize;z-index:999999;touch-action:none;';"
-        "var svg='<svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">"
-        "<line x1=\"14\" y1=\"4\" x2=\"4\" y2=\"14\" stroke=\"rgba(255,255,255,0.3)\" stroke-width=\"1.5\"/>"
-        "<line x1=\"14\" y1=\"8\" x2=\"8\" y2=\"14\" stroke=\"rgba(255,255,255,0.3)\" stroke-width=\"1.5\"/>"
-        "<line x1=\"14\" y1=\"12\" x2=\"12\" y2=\"14\" stroke=\"rgba(255,255,255,0.3)\" stroke-width=\"1.5\"/>"
-        "</svg>';"
-        "h.innerHTML=svg;"
-        "document.body.appendChild(h);"
-        "var dw=%d,dh=%d,ratio=dw/dh;"
-        "var startX,startY,startW,startH;"
-        "h.addEventListener('pointerdown',function(e){"
-        "e.preventDefault();e.stopPropagation();"
-        "h.setPointerCapture(e.pointerId);"
-        "var cs=getComputedStyle(document.documentElement);"
-        "var t=cs.transform||cs.webkitTransform||'';"
-        "var s=1;var m=t.match(/matrix\\(([^,]+)/);"
-        "if(m)s=parseFloat(m[1]);"
-        "startW=dw*s;startH=dh*s;"
-        "startX=e.clientX*s;startY=e.clientY*s;"
-        "});"
-        "h.addEventListener('pointermove',function(e){"
-        "if(!h.hasPointerCapture(e.pointerId))return;"
-        "e.preventDefault();e.stopPropagation();"
-        "var cs=getComputedStyle(document.documentElement);"
-        "var t=cs.transform||cs.webkitTransform||'';"
-        "var s=1;var m=t.match(/matrix\\(([^,]+)/);"
-        "if(m)s=parseFloat(m[1]);"
-        "var dx=e.clientX*s-startX,dy=e.clientY*s-startY;"
-        "var nw=Math.max(200,startW+dx);"
-        "var nh=Math.round(nw/ratio);"
-        "IPlugSendMsg({msg:'RSZFUI',width:Math.round(nw),height:nh});"
-        "});"
-        "h.addEventListener('pointerup',function(e){"
-        "h.releasePointerCapture(e.pointerId);"
-        "});"
-        "})();",
-        mDesignWidth, mDesignHeight);
-      EvaluateJavaScript(resizeJs, nullptr);
-    }
 
     OnUIOpen();
   }

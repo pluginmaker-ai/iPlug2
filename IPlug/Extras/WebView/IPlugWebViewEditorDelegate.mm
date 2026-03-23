@@ -56,6 +56,90 @@ using namespace iplug;
 - (id) initWithEditorDelegate: (WebViewEditorDelegate*) pDelegate;
 @end
 
+#ifdef OS_MAC
+// Native resize handle — sits outside CSS transform so it's always visible and draggable.
+// Dragging calls setFrameSize: on the helper view, which posts NSViewFrameDidChangeNotification
+// so AU hosts (Logic Pro) resize their container to match.
+@interface IPLUG_RESIZE_HANDLE : NSView
+{
+  NSPoint mDragStart;
+  NSSize mSizeAtDragStart;
+  CGFloat mAspectRatio;
+  NSView* mTargetView;
+}
+- (id) initWithTarget:(NSView*)target aspectRatio:(CGFloat)ratio;
+@end
+
+@implementation IPLUG_RESIZE_HANDLE
+
+- (id) initWithTarget:(NSView*)target aspectRatio:(CGFloat)ratio
+{
+  CGFloat handleSize = 16.0;
+  NSRect frame = NSMakeRect(target.frame.size.width - handleSize,
+                            0,
+                            handleSize, handleSize);
+  self = [super initWithFrame:frame];
+  if (self)
+  {
+    mTargetView = target;
+    mAspectRatio = ratio;
+    self.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+  }
+  return self;
+}
+
+- (void) drawRect:(NSRect)dirtyRect
+{
+  NSRect bounds = self.bounds;
+  CGFloat w = bounds.size.width;
+  CGFloat h = bounds.size.height;
+
+  [[NSColor colorWithWhite:1.0 alpha:0.3] setStroke];
+  NSBezierPath* path = [NSBezierPath bezierPath];
+  [path setLineWidth:1.5];
+
+  [path moveToPoint:NSMakePoint(w - 2, h * 0.25)];
+  [path lineToPoint:NSMakePoint(w * 0.25, h - 2)];
+
+  [path moveToPoint:NSMakePoint(w - 2, h * 0.5)];
+  [path lineToPoint:NSMakePoint(w * 0.5, h - 2)];
+
+  [path moveToPoint:NSMakePoint(w - 2, h * 0.75)];
+  [path lineToPoint:NSMakePoint(w * 0.75, h - 2)];
+
+  [path stroke];
+}
+
+- (void) mouseDown:(NSEvent*)event
+{
+  mDragStart = [NSEvent mouseLocation];
+  mSizeAtDragStart = mTargetView.frame.size;
+}
+
+- (void) mouseDragged:(NSEvent*)event
+{
+  NSPoint current = [NSEvent mouseLocation];
+  CGFloat dx = current.x - mDragStart.x;
+  // macOS y is flipped — dragging down = negative dy, but we want width to grow
+  CGFloat newWidth = MAX(200.0, mSizeAtDragStart.width + dx);
+  CGFloat newHeight = round(newWidth / mAspectRatio);
+
+  [mTargetView setFrameSize:NSMakeSize(newWidth, newHeight)];
+}
+
+- (BOOL) acceptsFirstMouse:(NSEvent*)event
+{
+  return YES;
+}
+
+- (void) resetCursorRects
+{
+  [self addCursorRect:self.bounds cursor:[NSCursor resizeUpDownCursor]];
+}
+
+@end
+#endif
+
 @implementation IPLUG_WKWEBVIEW_EDITOR_HELPER
 {
   BOOL mInResize;
@@ -68,10 +152,19 @@ using namespace iplug;
   CGFloat h = pDelegate->GetEditorHeight();
   CGRect r = CGRectMake(0, 0, w, h);
   self = [super initWithFrame:r];
-  
+
   void* pWebView = pDelegate->OpenWebView(self, 0, 0, w, h, 1.0f);
 
   [self addSubview: (PLATFORM_VIEW*) pWebView];
+
+#ifdef OS_MAC
+  // Add native resize handle on top of the WebView
+  if (w > 0 && h > 0)
+  {
+    IPLUG_RESIZE_HANDLE* resizeHandle = [[IPLUG_RESIZE_HANDLE alloc] initWithTarget:self aspectRatio:(w / h)];
+    [self addSubview:resizeHandle positioned:NSWindowAbove relativeTo:nil];
+  }
+#endif
 
   return self;
 }
