@@ -46,6 +46,11 @@ WebViewEditorDelegate::~WebViewEditorDelegate()
 
 void* WebViewEditorDelegate::OpenWindow(void* pParent)
 {
+  if (mDesignWidth == 0) {
+    mDesignWidth = GetEditorWidth();
+    mDesignHeight = GetEditorHeight();
+  }
+
   mView = OpenWebView(pParent, 0.0f, 0.0f, static_cast<float>(GetEditorWidth()), static_cast<float>(GetEditorHeight()), 1.0f);
   return mView;
 }
@@ -53,12 +58,36 @@ void* WebViewEditorDelegate::OpenWindow(void* pParent)
 void WebViewEditorDelegate::Resize(int width, int height)
 {
   SetWebViewBounds(0, 0, static_cast<float>(width), static_cast<float>(height));
+
+  float scale = (mDesignWidth > 0) ? (static_cast<float>(width) / static_cast<float>(mDesignWidth)) : 1.f;
+  char js[512];
+  snprintf(js, sizeof(js),
+    "document.documentElement.style.width='%dpx';"
+    "document.documentElement.style.height='%dpx';"
+    "document.documentElement.style.overflow='hidden';"
+    "document.documentElement.style.transform='scale(%f)';"
+    "document.documentElement.style.transformOrigin='top left';",
+    mDesignWidth, mDesignHeight, scale);
+  EvaluateJavaScript(js, nullptr);
+
   EditorResizeFromUI(width, height, true);
 }
 
 void WebViewEditorDelegate::OnParentWindowResize(int width, int height)
 {
   SetWebViewBounds(0, 0, static_cast<float>(width), static_cast<float>(height));
+
+  float scale = (mDesignWidth > 0) ? (static_cast<float>(width) / static_cast<float>(mDesignWidth)) : 1.f;
+  char js[512];
+  snprintf(js, sizeof(js),
+    "document.documentElement.style.width='%dpx';"
+    "document.documentElement.style.height='%dpx';"
+    "document.documentElement.style.overflow='hidden';"
+    "document.documentElement.style.transform='scale(%f)';"
+    "document.documentElement.style.transformOrigin='top left';",
+    mDesignWidth, mDesignHeight, scale);
+  EvaluateJavaScript(js, nullptr);
+
   EditorResizeFromUI(width, height, false);
 }
 
