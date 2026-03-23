@@ -98,14 +98,15 @@ using namespace iplug;
   NSBezierPath* path = [NSBezierPath bezierPath];
   [path setLineWidth:1.5];
 
-  [path moveToPoint:NSMakePoint(w - 2, h * 0.25)];
-  [path lineToPoint:NSMakePoint(w * 0.25, h - 2)];
+  // macOS Y is flipped (0 = bottom). Lines go from bottom-right toward top-left.
+  [path moveToPoint:NSMakePoint(w - 2, 2)];
+  [path lineToPoint:NSMakePoint(2, h - 2)];
 
-  [path moveToPoint:NSMakePoint(w - 2, h * 0.5)];
-  [path lineToPoint:NSMakePoint(w * 0.5, h - 2)];
+  [path moveToPoint:NSMakePoint(w - 2, h * 0.25 + 2)];
+  [path lineToPoint:NSMakePoint(w * 0.25 + 2, h - 2)];
 
-  [path moveToPoint:NSMakePoint(w - 2, h * 0.75)];
-  [path lineToPoint:NSMakePoint(w * 0.75, h - 2)];
+  [path moveToPoint:NSMakePoint(w - 2, h * 0.5 + 2)];
+  [path lineToPoint:NSMakePoint(w * 0.5 + 2, h - 2)];
 
   [path stroke];
 }
@@ -134,7 +135,11 @@ using namespace iplug;
 
 - (void) resetCursorRects
 {
-  [self addCursorRect:self.bounds cursor:[NSCursor resizeUpDownCursor]];
+  // Use private API for diagonal resize cursor (nwse), fall back to arrow
+  NSCursor* resizeCursor = nil;
+  if ([NSCursor respondsToSelector:@selector(_windowResizeNorthWestSouthEastCursor)])
+    resizeCursor = [NSCursor performSelector:@selector(_windowResizeNorthWestSouthEastCursor)];
+  [self addCursorRect:self.bounds cursor:(resizeCursor ?: [NSCursor arrowCursor])];
 }
 
 @end
