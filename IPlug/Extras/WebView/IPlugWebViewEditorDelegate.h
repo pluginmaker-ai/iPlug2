@@ -35,6 +35,10 @@
 #include "json.hpp"
 #include <functional>
 #include <filesystem>
+#include <cstdio>
+#ifdef OS_WIN
+#include <windows.h>
+#endif
 
 /**
  * @file
@@ -125,7 +129,31 @@ public:
   void OnMessageFromWebView(const char* jsonStr) override
   {
     auto json = nlohmann::json::parse(jsonStr, nullptr, false);
-    
+
+#ifdef OS_WIN
+    if (json["msg"] == "RESIZE_DEBUG")
+    {
+      auto d = json["data"];
+      FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
+      if (f) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        fprintf(f, "[%02d:%02d:%02d.%03d][Browser] inner=%dx%d dpr=%.2f docOff=%dx%d docScroll=%dx%d bodyScroll=%dx%d csW=%s csH=%s csTransform=%s csOverflow=%s\n",
+          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+          d["innerW"].get<int>(), d["innerH"].get<int>(),
+          d["dpr"].get<double>(),
+          d["docOffW"].get<int>(), d["docOffH"].get<int>(),
+          d["docScrollW"].get<int>(), d["docScrollH"].get<int>(),
+          d["bodyScrollW"].get<int>(), d["bodyScrollH"].get<int>(),
+          d["csWidth"].get<std::string>().c_str(),
+          d["csHeight"].get<std::string>().c_str(),
+          d["csTransform"].get<std::string>().c_str(),
+          d["csOverflow"].get<std::string>().c_str());
+        fflush(f); fclose(f);
+      }
+      return;
+    }
+#endif
+
     if (json["msg"] == "SPVFUI")
     {
       assert(json["paramIdx"] > -1);
@@ -186,6 +214,26 @@ public:
   void SetScreenScale(float scale) override
   {
     mScreenScale = scale;
+    // Capture design dimensions before any host resizing (onSize) modifies them.
+    // setContentScaleFactor is called before onSize, so GetEditorWidth() still
+    // has the original PLUG_WIDTH/PLUG_HEIGHT values here.
+    if (mDesignWidth == 0)
+    {
+      mDesignWidth = GetEditorWidth();
+      mDesignHeight = GetEditorHeight();
+    }
+  }
+
+  void SetDpiZoomCompensation(bool needed, const char* hostName = "unknown")
+  {
+    mNeedsDpiZoomCompensation = needed;
+    FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
+    if (f) {
+      SYSTEMTIME st; GetLocalTime(&st);
+      fprintf(f, "[%02d:%02d:%02d.%03d][SetDpiZoomCompensation] host=%s needed=%d screenScale=%.2f\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, hostName, needed, mScreenScale);
+      fflush(f); fclose(f);
+    }
   }
 #endif
 
@@ -251,6 +299,7 @@ protected:
   int mDesignWidth = 0;  // Initial PLUG_WIDTH, used for pageZoom scaling on resize
   int mDesignHeight = 0;
   float mScreenScale = 1.f;
+  bool mNeedsDpiZoomCompensation = false;
   
 private:
   IKeyPress ConvertToIKeyPress(uint32_t keyCode, const char* utf8, bool shift, bool ctrl, bool alt)

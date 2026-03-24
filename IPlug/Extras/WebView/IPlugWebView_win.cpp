@@ -148,7 +148,7 @@ void* IWebViewImpl::OpenWebView(void* pParent, float,float,float,float,float)
 
             mWebViewCtrlr->put_IsVisible(mShowOnLoad);
 
-            const auto enableDevTools = mIWebView->GetEnableDevTools();
+            const auto enableDevTools = true; // TEMP: force devtools for debugging
 
             ICoreWebView2Settings* Settings;
             mCoreWebView->get_Settings(&Settings);
@@ -418,6 +418,16 @@ void IWebViewImpl::LoadURL(const char* url)
 
 void IWebViewImpl::LoadFile(const char* fileName, const char* bundleID)
 {
+  {
+    FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
+    if (f) {
+      SYSTEMTIME st; GetLocalTime(&st);
+      fprintf(f, "[%02d:%02d:%02d.%03d][LoadFile] fileName='%s' bundleID='%s' mCoreWebView=%p\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        fileName ? fileName : "(null)", bundleID ? bundleID : "(null)", (void*)mCoreWebView.get());
+      fflush(f); fclose(f);
+    }
+  }
   if (mCoreWebView)
   {
     wil::com_ptr<ICoreWebView2_3> webView3 = mCoreWebView.try_query<ICoreWebView2_3>();
@@ -492,16 +502,74 @@ void IWebViewImpl::EnableInteraction(bool enable)
 void IWebViewImpl::SetWebViewBounds(float x, float y, float w, float h, float scale)
 {
   float dpiScale = GetScaleForHWND(mParentWnd);
+  if (dpiScale <= 0.f) dpiScale = 1.f;
   mWebViewBounds = GetScaledRect(x, y, w, h, dpiScale);
 
-  // Compensate for WebView2's built-in DPI scaling so CSS pixels match logical pixels.
-  // This adapts per-monitor when the window moves between displays with different DPI.
-  double dpiZoomCompensation = 1.0 / static_cast<double>(dpiScale);
+  {
+    FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
+    if (f) {
+      SYSTEMTIME st; GetLocalTime(&st);
+      fprintf(f, "[%02d:%02d:%02d.%03d][SetWebViewBounds] w=%.0f h=%.0f scale=%.2f dpiScale=%.2f rect=%ldx%ld\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        w, h, scale, dpiScale,
+        mWebViewBounds.right - mWebViewBounds.left, mWebViewBounds.bottom - mWebViewBounds.top);
+      fflush(f); fclose(f);
+    }
+  }
 
   if (mWebViewCtrlr)
   {
-    mWebViewCtrlr->put_Bounds(mWebViewBounds);
-    mWebViewCtrlr->put_ZoomFactor(dpiZoomCompensation);
+    // scale == -1: FL Studio — zoom = 1/dpiScale, normal DPI bounds
+    // scale == -2: Cubase — zoom = 1.0, skip DPI bounds (host sends physical pixels)
+    // scale >= 0: Ableton/default — pass through as-is
+    float zoom = 1.f;
+    if (scale == -1.f)
+    {
+      zoom = 1.f / dpiScale;
+    }
+    else if (scale == -2.f)
+    {
+      mWebViewBounds = GetScaledRect(x, y, w, h, 1.f);
+      zoom = 1.f;
+    }
+    else
+    {
+      zoom = scale;
+    }
+    mWebViewCtrlr->SetBoundsAndZoomFactor(mWebViewBounds, zoom);
+
+    // Log actual HWND client rect vs our WebView bounds
+    RECT clientRect;
+    GetClientRect(mParentWnd, &clientRect);
+    {
+      FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
+      if (f) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        fprintf(f, "[%02d:%02d:%02d.%03d][HWNDvsWV] hwndClient=%ldx%ld webviewRect=%ldx%ld zoom=%.3f dpi=%.2f\n",
+          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+          clientRect.right - clientRect.left, clientRect.bottom - clientRect.top,
+          mWebViewBounds.right - mWebViewBounds.left, mWebViewBounds.bottom - mWebViewBounds.top,
+          zoom, dpiScale);
+        fflush(f); fclose(f);
+      }
+    }
+
+    // Log the actual zoom applied and what WebView2 reports back
+    double actualZoom = 0;
+    mWebViewCtrlr->get_ZoomFactor(&actualZoom);
+    RECT actualBounds;
+    mWebViewCtrlr->get_Bounds(&actualBounds);
+    {
+      FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
+      if (f) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        fprintf(f, "[%02d:%02d:%02d.%03d][WebView2State] requestedZoom=%.3f actualZoom=%.3f actualBounds=%ldx%ld\n",
+          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+          zoom, actualZoom,
+          actualBounds.right - actualBounds.left, actualBounds.bottom - actualBounds.top);
+        fflush(f); fclose(f);
+      }
+    }
   }
 }
 

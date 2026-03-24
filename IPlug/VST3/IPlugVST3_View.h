@@ -14,6 +14,7 @@
 #include "pluginterfaces/base/keycodes.h"
 
 #include "IPlugStructs.h"
+#include "IPlugUtilities.h"
 
 /** IPlug VST3 View  */
 template <class T>
@@ -137,6 +138,16 @@ public:
   {
 #ifdef OS_WIN
     mOwner.SetScreenScale(factor);
+    WDL_String hostStr;
+    GetHostNameStr(mOwner.GetHost(), hostStr);
+
+    // Per-DAW DPI zoom compensation:
+    // FL Studio: sends logical pixels in onSize(), WebView2 DPI-scales content
+    //   → need zoom = 1/dpiScale to cancel WebView2's built-in scaling
+    // Cubase: works correctly with zoom = 1.0 (original behavior)
+    // Ableton: works correctly with zoom = 1.0 (original behavior)
+    bool needsZoom = (mOwner.GetHost() == iplug::kHostFL);
+    mOwner.SetDpiZoomCompensation(needsZoom, hostStr.Get());
 #endif
 
     return Steinberg::kResultOk;
