@@ -491,11 +491,17 @@ void IWebViewImpl::EnableInteraction(bool enable)
 
 void IWebViewImpl::SetWebViewBounds(float x, float y, float w, float h, float scale)
 {
-  mWebViewBounds = GetScaledRect(x, y, w, h, GetScaleForHWND(mParentWnd));
+  float dpiScale = GetScaleForHWND(mParentWnd);
+  mWebViewBounds = GetScaledRect(x, y, w, h, dpiScale);
+
+  // Compensate for WebView2's built-in DPI scaling so CSS pixels match logical pixels.
+  // This adapts per-monitor when the window moves between displays with different DPI.
+  double dpiZoomCompensation = 1.0 / static_cast<double>(dpiScale);
 
   if (mWebViewCtrlr)
   {
-    mWebViewCtrlr->SetBoundsAndZoomFactor(mWebViewBounds, scale);
+    mWebViewCtrlr->put_Bounds(mWebViewBounds);
+    mWebViewCtrlr->put_ZoomFactor(dpiZoomCompensation);
   }
 }
 

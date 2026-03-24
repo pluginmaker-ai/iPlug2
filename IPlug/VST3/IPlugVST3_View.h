@@ -55,7 +55,7 @@ public:
   Steinberg::tresult PLUGIN_API onSize(Steinberg::ViewRect* pSize) override
   {
     TRACE
-    
+
     if (pSize && mOwner.GetHostResizeEnabled())
     {
       rect = *pSize;
@@ -70,11 +70,10 @@ public:
   Steinberg::tresult PLUGIN_API getSize(Steinberg::ViewRect* pSize) override
   {
     TRACE
-    
+
     if (mOwner.HasUI())
     {
       *pSize = Steinberg::ViewRect(0, 0, mOwner.GetEditorWidth(), mOwner.GetEditorHeight());
-      
       return Steinberg::kResultTrue;
     }
     else
@@ -97,13 +96,12 @@ public:
   {
     int w = pRect->getWidth();
     int h = pRect->getHeight();
-    
+
     if(!mOwner.ConstrainEditorResize(w, h))
     {
       pRect->right = pRect->left + w;
       pRect->bottom = pRect->top + h;
     }
-    
     return Steinberg::kResultTrue;
   }
   
