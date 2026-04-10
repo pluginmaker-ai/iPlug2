@@ -76,10 +76,16 @@ void WebViewEditorDelegate::Resize(int width, int height)
   SetWebViewBounds(0, 0, static_cast<float>(width), static_cast<float>(height), zoomFactor);
 
   float effectiveWidth = static_cast<float>(width);
+  float effectiveHeight = static_cast<float>(height);
   if (!mNeedsDpiZoomCompensation && mScreenScale > 1.f)
+  {
     effectiveWidth /= mScreenScale;
+    effectiveHeight /= mScreenScale;
+  }
 
-  float scale = (mDesignWidth > 0) ? (effectiveWidth / static_cast<float>(mDesignWidth)) : 1.f;
+  float scaleX = (mDesignWidth > 0) ? (effectiveWidth / static_cast<float>(mDesignWidth)) : 1.f;
+  float scaleY = (mDesignHeight > 0) ? (effectiveHeight / static_cast<float>(mDesignHeight)) : 1.f;
+  float scale = (scaleX < scaleY) ? scaleX : scaleY;
   char js[512];
   snprintf(js, sizeof(js),
     "document.documentElement.style.width='%dpx';"
@@ -111,19 +117,25 @@ void WebViewEditorDelegate::OnParentWindowResize(int width, int height)
   // logical CSS scale. For hosts that send logical pixels (FL Studio, Ableton),
   // screenScale is 1.0 or zoom compensation handles it — no division needed.
   float effectiveWidth = static_cast<float>(width);
+  float effectiveHeight = static_cast<float>(height);
   if (!mNeedsDpiZoomCompensation && mScreenScale > 1.f)
+  {
     effectiveWidth /= mScreenScale;
+    effectiveHeight /= mScreenScale;
+  }
 
-  float scale = (mDesignWidth > 0) ? (effectiveWidth / static_cast<float>(mDesignWidth)) : 1.f;
+  float scaleX = (mDesignWidth > 0) ? (effectiveWidth / static_cast<float>(mDesignWidth)) : 1.f;
+  float scaleY = (mDesignHeight > 0) ? (effectiveHeight / static_cast<float>(mDesignHeight)) : 1.f;
+  float scale = (scaleX < scaleY) ? scaleX : scaleY;
 
 #ifdef OS_WIN
   {
     FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
     if (f) {
       SYSTEMTIME st; GetLocalTime(&st);
-      fprintf(f, "[%02d:%02d:%02d.%03d][OnParentWindowResize] w=%d h=%d effectiveW=%.0f designW=%d cssScale=%.3f screenScale=%.2f needsComp=%d zoomFactor=%.2f\n",
+      fprintf(f, "[%02d:%02d:%02d.%03d][OnParentWindowResize] w=%d h=%d effectiveW=%.0f effectiveH=%.0f designW=%d designH=%d scaleX=%.3f scaleY=%.3f scale=%.3f screenScale=%.2f needsComp=%d zoomFactor=%.2f\n",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        width, height, effectiveWidth, mDesignWidth, scale, mScreenScale, mNeedsDpiZoomCompensation, zoomFactor);
+        width, height, effectiveWidth, effectiveHeight, mDesignWidth, mDesignHeight, scaleX, scaleY, scale, mScreenScale, mNeedsDpiZoomCompensation, zoomFactor);
       fflush(f); fclose(f);
     }
   }

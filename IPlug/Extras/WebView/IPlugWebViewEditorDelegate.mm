@@ -279,8 +279,12 @@ void WebViewEditorDelegate::ResizeWebViewAndHelper(float width, float height)
 
   // Use CSS transform for uniform scaling — works for both rendering AND hit testing.
   // The WKWebView fills the window, but CSS locks the layout to design dimensions
-  // and visually scales to fit.
-  float scale = (mDesignWidth > 0) ? (w / static_cast<float>(mDesignWidth)) : 1.f;
+  // and visually scales to fit. Use min(scaleX, scaleY) so the content fits both
+  // horizontally and vertically — width-only scaling clips the bottom when hosts
+  // give less vertical space than PLUG_HEIGHT.
+  float scaleX = (mDesignWidth > 0) ? (w / static_cast<float>(mDesignWidth)) : 1.f;
+  float scaleY = (mDesignHeight > 0) ? (h / static_cast<float>(mDesignHeight)) : 1.f;
+  float scale = (scaleX < scaleY) ? scaleX : scaleY;
   SetWebViewBounds(0, 0, w, h, 1.f);
 
   char js[512];
