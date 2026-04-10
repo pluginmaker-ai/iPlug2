@@ -86,14 +86,18 @@ void WebViewEditorDelegate::Resize(int width, int height)
   float scaleX = (mDesignWidth > 0) ? (effectiveWidth / static_cast<float>(mDesignWidth)) : 1.f;
   float scaleY = (mDesignHeight > 0) ? (effectiveHeight / static_cast<float>(mDesignHeight)) : 1.f;
   float scale = (scaleX < scaleY) ? scaleX : scaleY;
-  char js[512];
+  char js[1024];
   snprintf(js, sizeof(js),
     "document.documentElement.style.width='%dpx';"
     "document.documentElement.style.height='%dpx';"
     "document.documentElement.style.overflow='hidden';"
     "document.documentElement.style.transform='scale(%f)';"
-    "document.documentElement.style.transformOrigin='top left';",
-    mDesignWidth, mDesignHeight, scale);
+    "document.documentElement.style.transformOrigin='top left';"
+    "document.body.style.width='%dpx';"
+    "document.body.style.height='%dpx';"
+    "document.body.style.position='relative';"
+    "document.body.style.overflow='hidden';",
+    mDesignWidth, mDesignHeight, scale, mDesignWidth, mDesignHeight);
   EvaluateJavaScript(js, nullptr);
 
   EditorResizeFromUI(width, height, true);
@@ -140,14 +144,18 @@ void WebViewEditorDelegate::OnParentWindowResize(int width, int height)
     }
   }
 #endif
-  char js[512];
+  char js[1024];
   snprintf(js, sizeof(js),
     "document.documentElement.style.width='%dpx';"
     "document.documentElement.style.height='%dpx';"
     "document.documentElement.style.overflow='hidden';"
     "document.documentElement.style.transform='scale(%f)';"
-    "document.documentElement.style.transformOrigin='top left';",
-    mDesignWidth, mDesignHeight, scale);
+    "document.documentElement.style.transformOrigin='top left';"
+    "document.body.style.width='%dpx';"
+    "document.body.style.height='%dpx';"
+    "document.body.style.position='relative';"
+    "document.body.style.overflow='hidden';",
+    mDesignWidth, mDesignHeight, scale, mDesignWidth, mDesignHeight);
   EvaluateJavaScript(js, nullptr);
 
   // Query full browser state for debugging
