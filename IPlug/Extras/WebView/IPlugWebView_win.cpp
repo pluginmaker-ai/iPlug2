@@ -124,6 +124,7 @@ void* IWebViewImpl::OpenWebView(void* pParent, float,float,float,float,float)
   options->put_ExclusiveUserDataFolderAccess(FALSE);
   // options->put_Language(m_language.c_str());
   options->put_IsCustomCrashReportingEnabled(FALSE);
+  options->put_AdditionalBrowserArguments(L"--disable-gpu");
 
   CreateCoreWebView2EnvironmentWithOptions(
     nullptr, cachePathWide.data(), options.Get(),
