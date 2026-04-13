@@ -189,6 +189,10 @@ public:
 
   bool ConstrainEditorResize(int& w, int& h) const override
   {
+    // The return value is inverted: `checkSizeConstraint` only writes w/h back to
+    // the host's ViewRect when this returns false (meaning "I modified the values").
+    // Return true means "unchanged, use the caller's original values". So when we
+    // enforce aspect ratio we MUST return false to get the correction through.
     if (mDesignWidth > 0 && mDesignHeight > 0)
     {
       float aspectRatio = static_cast<float>(mDesignWidth) / static_cast<float>(mDesignHeight);
@@ -202,6 +206,7 @@ public:
         h = Clip(newH, GetMinHeight(), GetMaxHeight());
         w = static_cast<int>(std::round(static_cast<float>(h) * aspectRatio));
       }
+      return false;
     }
     return IEditorDelegate::ConstrainEditorResize(w, h);
   }
