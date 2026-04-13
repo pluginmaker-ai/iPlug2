@@ -419,6 +419,16 @@ void IWebViewImpl::LoadURL(const char* url)
 
 void IWebViewImpl::LoadFile(const char* fileName, const char* bundleID)
 {
+  {
+    FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
+    if (f) {
+      SYSTEMTIME st; GetLocalTime(&st);
+      fprintf(f, "[%02d:%02d:%02d.%03d][LoadFile] fileName='%s' bundleID='%s' mCoreWebView=%p\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        fileName ? fileName : "(null)", bundleID ? bundleID : "(null)", (void*)mCoreWebView.get());
+      fflush(f); fclose(f);
+    }
+  }
   if (mCoreWebView)
   {
     wil::com_ptr<ICoreWebView2_3> webView3 = mCoreWebView.try_query<ICoreWebView2_3>();
@@ -496,6 +506,18 @@ void IWebViewImpl::SetWebViewBounds(float x, float y, float w, float h, float sc
   if (dpiScale <= 0.f) dpiScale = 1.f;
   mWebViewBounds = GetScaledRect(x, y, w, h, dpiScale);
 
+  {
+    FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
+    if (f) {
+      SYSTEMTIME st; GetLocalTime(&st);
+      fprintf(f, "[%02d:%02d:%02d.%03d][SetWebViewBounds] w=%.0f h=%.0f scale=%.2f dpiScale=%.2f rect=%ldx%ld\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        w, h, scale, dpiScale,
+        mWebViewBounds.right - mWebViewBounds.left, mWebViewBounds.bottom - mWebViewBounds.top);
+      fflush(f); fclose(f);
+    }
+  }
+
   if (mWebViewCtrlr)
   {
     // scale == -1: FL Studio — zoom = 1/dpiScale, normal DPI bounds
@@ -517,6 +539,38 @@ void IWebViewImpl::SetWebViewBounds(float x, float y, float w, float h, float sc
     }
     mWebViewCtrlr->SetBoundsAndZoomFactor(mWebViewBounds, zoom);
 
+    // Log actual HWND client rect vs our WebView bounds
+    RECT clientRect;
+    GetClientRect(mParentWnd, &clientRect);
+    {
+      FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
+      if (f) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        fprintf(f, "[%02d:%02d:%02d.%03d][HWNDvsWV] hwndClient=%ldx%ld webviewRect=%ldx%ld zoom=%.3f dpi=%.2f\n",
+          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+          clientRect.right - clientRect.left, clientRect.bottom - clientRect.top,
+          mWebViewBounds.right - mWebViewBounds.left, mWebViewBounds.bottom - mWebViewBounds.top,
+          zoom, dpiScale);
+        fflush(f); fclose(f);
+      }
+    }
+
+    // Log the actual zoom applied and what WebView2 reports back
+    double actualZoom = 0;
+    mWebViewCtrlr->get_ZoomFactor(&actualZoom);
+    RECT actualBounds;
+    mWebViewCtrlr->get_Bounds(&actualBounds);
+    {
+      FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
+      if (f) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        fprintf(f, "[%02d:%02d:%02d.%03d][WebView2State] requestedZoom=%.3f actualZoom=%.3f actualBounds=%ldx%ld\n",
+          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+          zoom, actualZoom,
+          actualBounds.right - actualBounds.left, actualBounds.bottom - actualBounds.top);
+        fflush(f); fclose(f);
+      }
+    }
   }
 }
 
