@@ -59,9 +59,35 @@ public:
 
     if (pSize && mOwner.GetHostResizeEnabled())
     {
-      rect = *pSize;
-      mOwner.SetEditorSize(rect.getWidth(), rect.getHeight());
-      mOwner.OnParentWindowResize(rect.getWidth(), rect.getHeight());
+      int w = pSize->getWidth();
+      int h = pSize->getHeight();
+
+      // Enforce aspect ratio — some hosts (e.g. Ableton on Windows) call
+      // onSize without first calling checkSizeConstraint, so we must
+      // correct non-proportional dimensions here as well.
+      int correctedW = w;
+      int correctedH = h;
+      mOwner.ConstrainEditorResize(correctedW, correctedH);
+
+      if (correctedW != w || correctedH != h)
+      {
+        // Request the host to use the corrected size
+        Steinberg::ViewRect correctedRect(pSize->left, pSize->top,
+          pSize->left + correctedW, pSize->top + correctedH);
+        rect = correctedRect;
+        mOwner.SetEditorSize(correctedW, correctedH);
+        mOwner.OnParentWindowResize(correctedW, correctedH);
+
+        if (plugFrame)
+          plugFrame->resizeView(this, &correctedRect);
+      }
+      else
+      {
+        rect = *pSize;
+        mOwner.SetEditorSize(w, h);
+        mOwner.OnParentWindowResize(w, h);
+      }
+
       return Steinberg::kResultTrue;
     }
 
