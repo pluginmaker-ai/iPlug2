@@ -36,6 +36,7 @@
 #include <functional>
 #include <filesystem>
 #include <cstdio>
+#include <cmath>
 #ifdef OS_WIN
 #include <windows.h>
 #endif
@@ -130,30 +131,6 @@ public:
   {
     auto json = nlohmann::json::parse(jsonStr, nullptr, false);
 
-#ifdef OS_WIN
-    if (json["msg"] == "RESIZE_DEBUG")
-    {
-      auto d = json["data"];
-      FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
-      if (f) {
-        SYSTEMTIME st; GetLocalTime(&st);
-        fprintf(f, "[%02d:%02d:%02d.%03d][Browser] inner=%dx%d dpr=%.2f docOff=%dx%d docScroll=%dx%d bodyScroll=%dx%d csW=%s csH=%s csTransform=%s csOverflow=%s\n",
-          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-          d["innerW"].get<int>(), d["innerH"].get<int>(),
-          d["dpr"].get<double>(),
-          d["docOffW"].get<int>(), d["docOffH"].get<int>(),
-          d["docScrollW"].get<int>(), d["docScrollH"].get<int>(),
-          d["bodyScrollW"].get<int>(), d["bodyScrollH"].get<int>(),
-          d["csWidth"].get<std::string>().c_str(),
-          d["csHeight"].get<std::string>().c_str(),
-          d["csTransform"].get<std::string>().c_str(),
-          d["csOverflow"].get<std::string>().c_str());
-        fflush(f); fclose(f);
-      }
-      return;
-    }
-#endif
-
     if (json["msg"] == "SPVFUI")
     {
       assert(json["paramIdx"] > -1);
@@ -210,6 +187,25 @@ public:
   
   void OnParentWindowResize(int width, int height) override;
 
+  bool ConstrainEditorResize(int& w, int& h) const override
+  {
+    if (mDesignWidth > 0 && mDesignHeight > 0)
+    {
+      float aspectRatio = static_cast<float>(mDesignWidth) / static_cast<float>(mDesignHeight);
+      int newH = static_cast<int>(std::round(static_cast<float>(w) / aspectRatio));
+      if (newH >= GetMinHeight() && newH <= GetMaxHeight())
+      {
+        h = newH;
+      }
+      else
+      {
+        h = Clip(newH, GetMinHeight(), GetMaxHeight());
+        w = static_cast<int>(std::round(static_cast<float>(h) * aspectRatio));
+      }
+    }
+    return IEditorDelegate::ConstrainEditorResize(w, h);
+  }
+
 #ifdef OS_WIN
   void SetScreenScale(float scale) override
   {
@@ -227,13 +223,6 @@ public:
   void SetDpiZoomCompensation(bool needed, const char* hostName = "unknown")
   {
     mNeedsDpiZoomCompensation = needed;
-    FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
-    if (f) {
-      SYSTEMTIME st; GetLocalTime(&st);
-      fprintf(f, "[%02d:%02d:%02d.%03d][SetDpiZoomCompensation] host=%s needed=%d screenScale=%.2f\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, hostName, needed, mScreenScale);
-      fflush(f); fclose(f);
-    }
   }
 #endif
 

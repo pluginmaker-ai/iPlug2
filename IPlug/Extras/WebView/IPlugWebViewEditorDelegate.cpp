@@ -51,19 +51,6 @@ void* WebViewEditorDelegate::OpenWindow(void* pParent)
     mDesignHeight = GetEditorHeight();
   }
 
-#ifdef OS_WIN
-  {
-    FILE* f = fopen("C:\\temp\\iplug-resize.log", "w");
-    if (f) {
-      SYSTEMTIME st; GetLocalTime(&st);
-      fprintf(f, "[%02d:%02d:%02d.%03d][OpenWindow] pParent=%p editorW=%d editorH=%d designW=%d designH=%d\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        pParent, GetEditorWidth(), GetEditorHeight(), mDesignWidth, mDesignHeight);
-      fflush(f); fclose(f);
-    }
-  }
-#endif
-
   mView = OpenWebView(pParent, 0.0f, 0.0f, static_cast<float>(GetEditorWidth()), static_cast<float>(GetEditorHeight()), 1.0f);
   return mView;
 }
@@ -132,18 +119,6 @@ void WebViewEditorDelegate::OnParentWindowResize(int width, int height)
   float scaleY = (mDesignHeight > 0) ? (effectiveHeight / static_cast<float>(mDesignHeight)) : 1.f;
   float scale = (scaleX < scaleY) ? scaleX : scaleY;
 
-#ifdef OS_WIN
-  {
-    FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
-    if (f) {
-      SYSTEMTIME st; GetLocalTime(&st);
-      fprintf(f, "[%02d:%02d:%02d.%03d][OnParentWindowResize] w=%d h=%d effectiveW=%.0f effectiveH=%.0f designW=%d designH=%d scaleX=%.3f scaleY=%.3f scale=%.3f screenScale=%.2f needsComp=%d zoomFactor=%.2f\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        width, height, effectiveWidth, effectiveHeight, mDesignWidth, mDesignHeight, scaleX, scaleY, scale, mScreenScale, mNeedsDpiZoomCompensation, zoomFactor);
-      fflush(f); fclose(f);
-    }
-  }
-#endif
   char js[1024];
   snprintf(js, sizeof(js),
     "document.documentElement.style.width='%dpx';"
@@ -157,26 +132,6 @@ void WebViewEditorDelegate::OnParentWindowResize(int width, int height)
     "document.body.style.overflow='hidden';",
     mDesignWidth, mDesignHeight, scale, mDesignWidth, mDesignHeight);
   EvaluateJavaScript(js, nullptr);
-
-  // Query full browser state for debugging
-  EvaluateJavaScript(
-    "try { var cs = getComputedStyle(document.documentElement);"
-    "IPlugSendMsg({msg:'RESIZE_DEBUG', data: {"
-    "  innerW: window.innerWidth,"
-    "  innerH: window.innerHeight,"
-    "  dpr: window.devicePixelRatio,"
-    "  docOffW: document.documentElement.offsetWidth,"
-    "  docOffH: document.documentElement.offsetHeight,"
-    "  docScrollW: document.documentElement.scrollWidth,"
-    "  docScrollH: document.documentElement.scrollHeight,"
-    "  bodyScrollW: document.body ? document.body.scrollWidth : -1,"
-    "  bodyScrollH: document.body ? document.body.scrollHeight : -1,"
-    "  csWidth: cs.width,"
-    "  csHeight: cs.height,"
-    "  csTransform: cs.transform,"
-    "  csOverflow: cs.overflow"
-    "}}); } catch(e) {}",
-    nullptr);
 
   EditorResizeFromUI(width, height, false);
 }
