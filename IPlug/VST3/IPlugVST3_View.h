@@ -59,6 +59,26 @@ public:
 
     if (pSize && mOwner.GetHostResizeEnabled())
     {
+      // Windows has no OS-level aspect-ratio lock like macOS setContentAspectRatio,
+      // so we enforce it here: run the plugin's ConstrainEditorResize, and if it
+      // modified the dimensions, ask the host to snap its window to the corrected
+      // size via plugFrame->resizeView(). Hosts must respect resizeView() even when
+      // they ignore checkSizeConstraint(), so this works across Ableton/Bitwig/etc.
+      int w = pSize->getWidth();
+      int h = pSize->getHeight();
+      const int origW = w;
+      const int origH = h;
+
+      mOwner.ConstrainEditorResize(w, h);
+
+      if ((w != origW || h != origH) && plugFrame)
+      {
+        Steinberg::ViewRect correctedRect(0, 0, w, h);
+        plugFrame->resizeView(this, &correctedRect);
+        pSize->right = pSize->left + w;
+        pSize->bottom = pSize->top + h;
+      }
+
       rect = *pSize;
       mOwner.SetEditorSize(rect.getWidth(), rect.getHeight());
       mOwner.OnParentWindowResize(rect.getWidth(), rect.getHeight());

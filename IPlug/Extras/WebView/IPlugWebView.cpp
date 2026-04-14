@@ -98,6 +98,16 @@ void IWebView::SetWebViewBounds(float x, float y, float w, float h, float scale)
   mpImpl->SetWebViewBounds(x, y, w, h, scale);
 }
 
+void IWebView::SetWindowsMinSize(int minW, int minH)
+{
+#ifdef OS_WIN
+  mpImpl->SetMinSize(minW, minH);
+#else
+  (void)minW;
+  (void)minH;
+#endif
+}
+
 void IWebView::OnGetLocalDownloadPathForFile(const char* fileName, WDL_String& localPath)
 {
   // the default implementation here calls a Pimpl function

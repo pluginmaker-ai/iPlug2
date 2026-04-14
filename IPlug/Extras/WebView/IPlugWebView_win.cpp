@@ -33,7 +33,10 @@
 #include <windows.h>
 #include <wininet.h>
 #include <shlobj.h>
+#include <commctrl.h>
 #include <cassert>
+
+#pragma comment(lib, "comctl32.lib")
 
 #include <wrl.h>
 #include <wil/com.h>
@@ -76,9 +79,21 @@ private:
     return r;
   }
 
+  static LRESULT CALLBACK AspectRatioSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
+  void InstallAspectRatioHook(int designWidth, int designHeight);
+  void RemoveAspectRatioHook();
+public:
+  void SetMinSize(int minW, int minH) { mMinWidth = minW; mMinHeight = minH; }
+private:
+
   IWebView* mIWebView;
   bool mOpaque;
   HWND mParentWnd = NULL;
+  HWND mSubclassedHwnd = NULL;
+  int mDesignWidth = 0;
+  int mDesignHeight = 0;
+  int mMinWidth = 0;
+  int mMinHeight = 0;
   wil::com_ptr<ICoreWebView2Controller> mWebViewCtrlr;
   wil::com_ptr<ICoreWebView2> mCoreWebView;
   wil::com_ptr<ICoreWebView2Environment> mWebViewEnvironment;
@@ -99,6 +114,183 @@ END_IPLUG_NAMESPACE
 using namespace iplug;
 using namespace Microsoft::WRL;
 
+// Windows has no OS-level content-aspect-ratio lock like macOS's
+// NSWindow setContentAspectRatio. To get the same behavior we subclass the
+// host's top-level plugin window and intercept WM_SIZING, which fires during
+// the user's live drag gesture and lets us clamp the rect in place before
+// Windows (and the host DAW) ever see a non-proportional size.
+static const UINT_PTR kAspectRatioSubclassId = 0x1AA5BEC7;
+
+LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+  if (msg == WM_NCDESTROY)
+  {
+    RemoveWindowSubclass(hWnd, &IWebViewImpl::AspectRatioSubclassProc, uIdSubclass);
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+  }
+
+  if ((msg != WM_SIZING && msg != WM_GETMINMAXINFO) || !dwRefData)
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+
+  IWebViewImpl* self = reinterpret_cast<IWebViewImpl*>(dwRefData);
+  const int designW = self->mDesignWidth;
+  const int designH = self->mDesignHeight;
+  const int minW = (self->mMinWidth > 0) ? self->mMinWidth : 1;
+  const int minH = (self->mMinHeight > 0) ? self->mMinHeight : 1;
+  if (designW <= 0 || designH <= 0)
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+
+  // WM_GETMINMAXINFO is Windows's authoritative "what are your size bounds"
+  // query — it's checked before any resize path, interactive or programmatic.
+  // Setting ptMinTrackSize here makes Windows itself refuse to go smaller,
+  // which closes the loophole where Ableton commits a sub-minimum size via
+  // WM_SIZE directly (bypassing WM_SIZING).
+  if (msg == WM_GETMINMAXINFO)
+  {
+    RECT windowRect, clientRect;
+    GetWindowRect(hWnd, &windowRect);
+    GetClientRect(hWnd, &clientRect);
+    const int ncW = (windowRect.right - windowRect.left) - clientRect.right;
+    const int ncH = (windowRect.bottom - windowRect.top) - clientRect.bottom;
+
+    MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+    mmi->ptMinTrackSize.x = minW + ncW;
+    mmi->ptMinTrackSize.y = minH + ncH;
+    return 0;
+  }
+
+  // Below here: msg == WM_SIZING
+
+  RECT* rect = reinterpret_cast<RECT*>(lParam);
+  // Subtract non-client (title bar, borders) so aspect applies to the client
+  // area only — otherwise the title bar skews the ratio.
+  RECT windowRect, clientRect;
+  GetWindowRect(hWnd, &windowRect);
+  GetClientRect(hWnd, &clientRect);
+  const int ncW = (windowRect.right - windowRect.left) - clientRect.right;
+  const int ncH = (windowRect.bottom - windowRect.top) - clientRect.bottom;
+
+  const int draggedW = (rect->right - rect->left) - ncW;
+  const int draggedH = (rect->bottom - rect->top) - ncH;
+  if (draggedW <= 0 || draggedH <= 0)
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+
+  const float aspect = static_cast<float>(designW) / static_cast<float>(designH);
+  int newW = draggedW;
+  int newH = draggedH;
+
+  switch (wParam)
+  {
+    case WMSZ_LEFT:
+    case WMSZ_RIGHT:
+      // Horizontal edge drag — keep width, adjust height to match aspect.
+      newH = static_cast<int>(static_cast<float>(draggedW) / aspect + 0.5f);
+      break;
+    case WMSZ_TOP:
+    case WMSZ_BOTTOM:
+      // Vertical edge drag — keep height, adjust width to match aspect.
+      newW = static_cast<int>(static_cast<float>(draggedH) * aspect + 0.5f);
+      break;
+    case WMSZ_TOPLEFT:
+    case WMSZ_TOPRIGHT:
+    case WMSZ_BOTTOMLEFT:
+    case WMSZ_BOTTOMRIGHT:
+    {
+      // Corner drag — pick the dimension that was dragged more aggressively
+      // relative to the design aspect, and clamp the other to match.
+      const float draggedAspect = static_cast<float>(draggedW) / static_cast<float>(draggedH);
+      if (draggedAspect > aspect)
+        newW = static_cast<int>(static_cast<float>(draggedH) * aspect + 0.5f);
+      else
+        newH = static_cast<int>(static_cast<float>(draggedW) / aspect + 0.5f);
+      break;
+    }
+    default:
+      return DefSubclassProc(hWnd, msg, wParam, lParam);
+  }
+
+  // Clamp to the plugin's minimum size while preserving aspect ratio. If
+  // either dimension would go below its minimum, rescale both so the smaller
+  // dimension sits exactly at its minimum — this keeps the resize smooth
+  // instead of snapping to sub-minimum sizes.
+  if (newW < minW || newH < minH)
+  {
+    const float scaleW = static_cast<float>(minW) / static_cast<float>(newW);
+    const float scaleH = static_cast<float>(minH) / static_cast<float>(newH);
+    const float scaleUp = (scaleW > scaleH) ? scaleW : scaleH;
+    newW = static_cast<int>(static_cast<float>(newW) * scaleUp + 0.5f);
+    newH = static_cast<int>(static_cast<float>(newH) * scaleUp + 0.5f);
+  }
+
+  // Anchor the non-moving edge, move the other to apply the corrected dims.
+  switch (wParam)
+  {
+    case WMSZ_LEFT:
+      rect->left = rect->right - (newW + ncW);
+      rect->bottom = rect->top + newH + ncH;
+      break;
+    case WMSZ_RIGHT:
+      rect->right = rect->left + newW + ncW;
+      rect->bottom = rect->top + newH + ncH;
+      break;
+    case WMSZ_TOP:
+      rect->top = rect->bottom - (newH + ncH);
+      rect->right = rect->left + newW + ncW;
+      break;
+    case WMSZ_BOTTOM:
+      rect->bottom = rect->top + newH + ncH;
+      rect->right = rect->left + newW + ncW;
+      break;
+    case WMSZ_TOPLEFT:
+      rect->top = rect->bottom - (newH + ncH);
+      rect->left = rect->right - (newW + ncW);
+      break;
+    case WMSZ_TOPRIGHT:
+      rect->top = rect->bottom - (newH + ncH);
+      rect->right = rect->left + newW + ncW;
+      break;
+    case WMSZ_BOTTOMLEFT:
+      rect->bottom = rect->top + newH + ncH;
+      rect->left = rect->right - (newW + ncW);
+      break;
+    case WMSZ_BOTTOMRIGHT:
+      rect->bottom = rect->top + newH + ncH;
+      rect->right = rect->left + newW + ncW;
+      break;
+  }
+
+  return TRUE;
+}
+
+void IWebViewImpl::InstallAspectRatioHook(int designWidth, int designHeight)
+{
+  if (mSubclassedHwnd || !mParentWnd || designWidth <= 0 || designHeight <= 0)
+    return;
+
+  mDesignWidth = designWidth;
+  mDesignHeight = designHeight;
+
+  // Walk up to the top-level window — WM_SIZING only fires on the outermost
+  // window of the resize drag, which is the host's plugin frame window.
+  HWND topLevel = GetAncestor(mParentWnd, GA_ROOT);
+  if (!topLevel)
+    return;
+
+  if (SetWindowSubclass(topLevel, &IWebViewImpl::AspectRatioSubclassProc, kAspectRatioSubclassId, reinterpret_cast<DWORD_PTR>(this)))
+  {
+    mSubclassedHwnd = topLevel;
+  }
+}
+
+void IWebViewImpl::RemoveAspectRatioHook()
+{
+  if (mSubclassedHwnd)
+  {
+    RemoveWindowSubclass(mSubclassedHwnd, &IWebViewImpl::AspectRatioSubclassProc, kAspectRatioSubclassId);
+    mSubclassedHwnd = NULL;
+  }
+}
+
 IWebViewImpl::IWebViewImpl(IWebView* owner)
   : mIWebView(owner)
 {
@@ -109,9 +301,14 @@ IWebViewImpl::~IWebViewImpl()
   CloseWebView();
 }
 
-void* IWebViewImpl::OpenWebView(void* pParent, float,float,float,float,float)
+void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, float)
 {
   mParentWnd = (HWND)pParent;
+
+  // Install the Win32 aspect-ratio hook now that we know the parent HWND.
+  // w/h here are the design dimensions passed by IPlugWebViewEditorDelegate
+  // on first open (they equal GetEditorWidth/Height).
+  InstallAspectRatioHook(static_cast<int>(w), static_cast<int>(h));
 
   WDL_String cachePath;
   WebViewCachePath(cachePath);
@@ -372,6 +569,8 @@ void* IWebViewImpl::OpenWebView(void* pParent, float,float,float,float,float)
 
 void IWebViewImpl::CloseWebView()
 {
+  RemoveAspectRatioHook();
+
   if (mWebViewCtrlr.get() != nullptr)
   {
     mWebViewCtrlr->Close();
