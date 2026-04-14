@@ -56,6 +56,10 @@ public:
   void* OpenWebView(void* pParent, float x, float y, float w, float h, float scale = 1.0f);
   void CloseWebView();
   void HideWebView(bool hide);
+
+  /** Set the minimum editor dimensions that the Win32 aspect-ratio hook will
+   * respect. On other platforms this is a no-op. Call after OpenWebView. */
+  void SetWindowsMinSize(int minW, int minH);
   
   /** Load an HTML string into the webview */
   void LoadHTML(const char* html);

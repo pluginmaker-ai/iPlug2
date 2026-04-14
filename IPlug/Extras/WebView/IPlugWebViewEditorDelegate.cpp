@@ -52,6 +52,12 @@ void* WebViewEditorDelegate::OpenWindow(void* pParent)
   }
 
   mView = OpenWebView(pParent, 0.0f, 0.0f, static_cast<float>(GetEditorWidth()), static_cast<float>(GetEditorHeight()), 1.0f);
+
+  // Plumb min-size constraints through to the Win32 WM_SIZING hook so the
+  // aspect-ratio-locked drag clamps at the plugin's configured minimum
+  // instead of shrinking past it.
+  SetWindowsMinSize(GetMinWidth(), GetMinHeight());
+
   return mView;
 }
 
