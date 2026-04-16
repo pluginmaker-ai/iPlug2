@@ -49,6 +49,7 @@ jobs:
           cat alexh/backend/services/native-build/iplug2.sha
 
       - name: Open or update bump PR
+        id: cpr
         uses: peter-evans/create-pull-request@v6
         with:
           path: alexh
@@ -64,7 +65,8 @@ jobs:
           title: "Bump iPlug2 to ${{ steps.meta.outputs.short }} — ${{ steps.meta.outputs.subject }}"
           body: |
             Auto-bump of `backend/services/native-build/iplug2.sha` triggered by
-            a new push to master on `pluginmaker-ai/iPlug2`.
+            a new push to master on `pluginmaker-ai/iPlug2`. Auto-merge is
+            enabled, so this PR lands as soon as required checks pass.
 
             - **New iPlug2 commit:** [`${{ steps.meta.outputs.short }}`](https://github.com/pluginmaker-ai/iPlug2/commit/${{ github.sha }})
             - **Subject:** ${{ steps.meta.outputs.subject }}
@@ -80,3 +82,13 @@ jobs:
           labels: |
             iplug2-bump
             auto-generated
+
+      - name: Enable auto-merge on the bump PR
+        if: steps.cpr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ secrets.ALEXH_PR_TOKEN }}
+        run: |
+          gh pr merge \
+            --repo pluginmaker-ai/alexh \
+            --auto --squash \
+            "${{ steps.cpr.outputs.pull-request-number }}"
