@@ -104,3 +104,26 @@ jobs:
             --repo pluginmaker-ai/alexh \
             --auto --squash \
             "${{ steps.cpr.outputs.pull-request-number }}"
+
+      - name: Notify Slack that bump PR was opened
+        # Only fire on brand-new PRs, not when create-pull-request updates an
+        # existing open PR with a newer commit.
+        if: steps.cpr.outputs.pull-request-operation == 'created'
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
+          PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+          SHORT: ${{ steps.meta.outputs.short }}
+          SUBJECT: ${{ steps.meta.outputs.subject }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then
+            echo "SLACK_ALERTS_WEBHOOK_URL not set — skipping"
+            exit 0
+          fi
+          TEXT=":robot_face: *iPlug2 auto-bump PR opened* → \`$SHORT\`
+<$PR_URL|PR #$PR_NUMBER> · $SUBJECT
+Auto-merges once alexh CI passes; native-build deploy follows."
+          jq -n --arg text "$TEXT" '{text: $text}' | \
+            curl -sf -X POST "$SLACK_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d @-
