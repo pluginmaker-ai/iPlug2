@@ -97,7 +97,7 @@ using namespace iplug;
 
   // Draw standard resize grip: three diagonal lines ⟍
   // With isFlipped=YES, (0,0) is top-left, (w,h) is bottom-right.
-  [[NSColor colorWithWhite:1.0 alpha:0.3] setStroke];
+  // Use paired dark + light strokes for contrast on any background.
   NSBezierPath* path = [NSBezierPath bezierPath];
   [path setLineWidth:1.5];
 
@@ -110,6 +110,17 @@ using namespace iplug;
   [path moveToPoint:NSMakePoint(12, h)];
   [path lineToPoint:NSMakePoint(w, 12)];
 
+  // Dark stroke first, slightly offset for a subtle drop-shadow effect that
+  // gives readable contrast against light plugin backgrounds.
+  [[NSColor colorWithWhite:0.0 alpha:0.45] setStroke];
+  NSAffineTransform* offset = [NSAffineTransform transform];
+  [offset translateXBy:1.0 yBy:1.0];
+  NSBezierPath* shadow = [path copy];
+  [shadow transformUsingAffineTransform:offset];
+  [shadow stroke];
+
+  // Light stroke on top — visible against dark backgrounds.
+  [[NSColor colorWithWhite:1.0 alpha:0.6] setStroke];
   [path stroke];
 }
 
