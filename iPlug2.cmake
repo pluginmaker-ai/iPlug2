@@ -7,6 +7,7 @@
 #  ==============================================================================
 
 # This file should be included in your main CMakeLists.txt file.
+# (no-op comment edit to exercise the pluginmaker-ai/alexh auto-bump pipeline)
 
 if (APPLE)
   enable_language(OBJC)
