@@ -1,10 +1,38 @@
 name: Alert on CMake CI failure
 
 on:
+  workflow_run:
+    workflows: ["CMake CI"]
+    types: [completed]
+    branches: [master]
   workflow_dispatch:
 
 jobs:
-  hello:
+  alert:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     steps:
-      - run: echo hello
+      - name: Post Slack alert
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          COMMIT_MSG: ${{ github.event.workflow_run.head_commit.message || 'manual test' }}
+          AUTHOR: ${{ github.event.workflow_run.head_commit.author.username || github.actor }}
+          RUN_URL: ${{ github.event.workflow_run.html_url || format('{0}/{1}/actions', github.server_url, github.repository) }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then
+            echo "SLACK_ALERTS_WEBHOOK_URL not set -- skipping alert"
+            exit 0
+          fi
+          SHORT_SHA="${SHA:0:12}"
+          SUBJECT=$(printf '%s' "$COMMIT_MSG" | head -1 | cut -c1-120)
+          TEXT=":rotating_light: iPlug2 master broken -- CMake CI failed on \`$SHORT_SHA\`
+<$RUN_URL|View CI run> (by @$AUTHOR) - ${SUBJECT}
+
+Auto-bump to pluginmaker-ai/alexh is paused until master is green again."
+          jq -n --arg text "$TEXT" '{text: $text}' | \
+            curl -sf -X POST "$SLACK_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d @-
