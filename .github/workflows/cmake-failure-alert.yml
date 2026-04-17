@@ -5,19 +5,22 @@ on:
     workflows: ["CMake CI"]
     types: [completed]
     branches: [master]
+  workflow_dispatch:
 
 jobs:
   alert:
-    if: github.event.workflow_run.conclusion == 'failure'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     steps:
       - name: Post Slack alert
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
-          SHA: ${{ github.event.workflow_run.head_sha }}
-          COMMIT_MSG: ${{ github.event.workflow_run.head_commit.message }}
-          AUTHOR: ${{ github.event.workflow_run.head_commit.author.username }}
-          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          COMMIT_MSG: ${{ github.event.workflow_run.head_commit.message || 'manual test' }}
+          AUTHOR: ${{ github.event.workflow_run.head_commit.author.username || github.actor }}
+          RUN_URL: ${{ github.event.workflow_run.html_url || github.server_url }}/pluginmaker-ai/iPlug2/actions
         run: |
           if [ -z "$SLACK_WEBHOOK" ]; then
             echo "SLACK_ALERTS_WEBHOOK_URL not set -- skipping alert"
