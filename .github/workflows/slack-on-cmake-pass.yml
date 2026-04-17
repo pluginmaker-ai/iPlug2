@@ -1,4 +1,4 @@
-name: Alert on CMake CI failure
+name: Slack on CMake CI pass
 
 on:
   workflow_run:
@@ -8,13 +8,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  alert:
+  post:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'failure'
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Post Slack message
+      - name: Post Slack success
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
           SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -25,7 +25,9 @@ jobs:
             exit 0
           fi
           SHORT_SHA="${SHA:0:12}"
-          TEXT=":rotating_light: iPlug2 master broken -- CMake CI failed on \`$SHORT_SHA\`
-<$RUN_URL|View CI run>"
+          TEXT=":white_check_mark: iPlug2 master CMake CI passed on \`$SHORT_SHA\`
+<$RUN_URL|View CI run>
+
+Auto-bump PR on pluginmaker-ai/alexh is being opened..."
           jq -n --arg text "$TEXT" '{text: $text}' | \
             curl -sf -X POST "$SLACK_WEBHOOK" -H "Content-Type: application/json" -d @-
