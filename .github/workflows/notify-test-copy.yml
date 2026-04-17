@@ -1,21 +1,18 @@
-name: Notify Test Copy
+name: Simple if test
 
 on:
   workflow_run:
     workflows: ["CMake CI"]
     types: [completed]
     branches: [master]
-  workflow_dispatch:
 
 concurrency:
-  group: bump-alexh-pin
+  group: simple-if-test
   cancel-in-progress: false
 
 jobs:
   bump-pin:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     steps:
       - name: Compute commit metadata
