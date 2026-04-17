@@ -60,5 +60,4 @@ if(WIN32)
   endif()
 endif()
 set(IPLUG2_DEBUG_HOST "${_default_debug_host}" CACHE FILEPATH "Host application for debugging plugins (e.g., path to REAPER, Ableton, etc.)")
-set(IPLUG2_DEBUG_HOST_ARGS "" CACHE STRING "Command line arguments for the debug host application")// 1776410267
-// verify alerts 1776410962
+set(IPLUG2_DEBUG_HOST_ARGS "" CACHE STRING "Command line arguments for the debug host application")
