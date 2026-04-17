@@ -1,18 +1,5 @@
 name: Bump iPlug2 pin in pluginmaker-ai/alexh
 
-# Runs after CMake CI succeeds on master. Opens (or updates) a PR on
-# pluginmaker-ai/alexh that bumps backend/services/native-build/iplug2.sha to
-# the new master tip. Merging that PR triggers the alexh deploy workflow, which
-# rolls the new iPlug2 out to the Mac mini + Windows build workers.
-#
-# Gating on CMake CI means a broken master never propagates -- no wasted Mac mini
-# deploys, no red smoke-test failures. If CMake CI is skipped (e.g. docs-only
-# change where nothing C++ moved), the bump is also skipped, which is correct:
-# nothing affects plugin builds so there's nothing to deploy.
-#
-# Requires a repository secret ALEXH_PR_TOKEN -- a GitHub token with
-# `contents: write` and `pull-requests: write` scoped to pluginmaker-ai/alexh.
-
 on:
   workflow_run:
     workflows: ["CMake CI"]

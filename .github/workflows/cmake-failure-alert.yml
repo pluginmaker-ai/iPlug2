@@ -1,12 +1,5 @@
 name: Alert on CMake CI failure
 
-# Posts a Slack alert when CMake CI fails on master. Master being broken is
-# what pauses the pluginmaker-ai/alexh auto-bump workflow -- without this
-# alert, nobody would know master is red until the next release or build.
-#
-# Requires a repository secret SLACK_ALERTS_WEBHOOK_URL (same name as alexh
-# uses). If the secret isn't set, the workflow logs and exits cleanly.
-
 on:
   workflow_run:
     workflows: ["CMake CI"]
