@@ -1,10 +1,17 @@
 name: Bump iPlug2 pin in pluginmaker-ai/alexh
 
 on:
+  workflow_run:
+    workflows: ["CMake CI"]
+    types: [completed]
+    branches: [master]
   workflow_dispatch:
 
 jobs:
   hello:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - run: echo hello
