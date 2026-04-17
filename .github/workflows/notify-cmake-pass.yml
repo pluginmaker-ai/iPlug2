@@ -24,8 +24,8 @@ jobs:
           if [ -z "$SLACK_WEBHOOK" ]; then echo skip; exit 0; fi
           SHORT_SHA="${SHA:0:12}"
           TEXT=":white_check_mark: iPlug2 master CMake CI passed on \`$SHORT_SHA\`
-<$RUN_URL|View CI run>
+          <$RUN_URL|View CI run>
 
-Auto-bump PR on pluginmaker-ai/alexh is being opened..."
+          Auto-bump PR on pluginmaker-ai/alexh is being opened..."
           jq -n --arg text "$TEXT" '{text: $text}' | \
             curl -sf -X POST "$SLACK_WEBHOOK" -H "Content-Type: application/json" -d @-

@@ -24,8 +24,8 @@ jobs:
           if [ -z "$SLACK_WEBHOOK" ]; then echo skip; exit 0; fi
           SHORT_SHA="${SHA:0:12}"
           TEXT=":rotating_light: iPlug2 master broken -- CMake CI failed on \`$SHORT_SHA\`
-<$RUN_URL|View CI run>
+          <$RUN_URL|View CI run>
 
-Auto-bump to pluginmaker-ai/alexh is paused until master is green again."
+          Auto-bump to pluginmaker-ai/alexh is paused until master is green again."
           jq -n --arg text "$TEXT" '{text: $text}' | \
             curl -sf -X POST "$SLACK_WEBHOOK" -H "Content-Type: application/json" -d @-
