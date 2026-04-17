@@ -1,0 +1,96 @@
+name: Notify Test Copy
+
+on:
+  workflow_run:
+    workflows: ["CMake CI"]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: bump-alexh-pin
+  cancel-in-progress: false
+
+jobs:
+  bump-pin:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute commit metadata
+        id: meta
+        env:
+          FULL_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          COMMIT_MSG: ${{ github.event.workflow_run.head_commit.message || github.event.head_commit.message }}
+        run: |
+          echo "sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${FULL_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          SUBJECT=$(printf '%s' "$COMMIT_MSG" | head -1 | cut -c1-72)
+          echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pluginmaker-ai/alexh
+        uses: actions/checkout@v4
+        with:
+          repository: pluginmaker-ai/alexh
+          token: ${{ secrets.ALEXH_PR_TOKEN }}
+          path: alexh
+          ref: main
+
+      - name: Update iPlug2 SHA pin
+        env:
+          NEW_SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          echo "$NEW_SHA" > alexh/backend/services/native-build/iplug2.sha
+          cat alexh/backend/services/native-build/iplug2.sha
+
+      - name: Open or update bump PR
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: alexh
+          token: ${{ secrets.ALEXH_PR_TOKEN }}
+          base: main
+          branch: auto/bump-iplug2-to-${{ steps.meta.outputs.short }}
+          delete-branch: true
+          commit-message: |
+            native-build: bump iPlug2 pin to ${{ steps.meta.outputs.short }}
+
+            Upstream commit: ${{ steps.meta.outputs.subject }}
+            Full SHA: ${{ steps.meta.outputs.sha }}
+          title: "Bump iPlug2 to ${{ steps.meta.outputs.short }}: ${{ steps.meta.outputs.subject }}"
+          body: |
+            Auto-bump of backend/services/native-build/iplug2.sha.
+            New iPlug2 commit: ${{ steps.meta.outputs.short }}
+          labels: |
+            iplug2-bump
+            auto-generated
+
+      - name: Enable auto-merge on the bump PR
+        if: steps.cpr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ secrets.ALEXH_PR_TOKEN }}
+        run: |
+          gh pr merge \
+            --repo pluginmaker-ai/alexh \
+            --auto --squash \
+            "${{ steps.cpr.outputs.pull-request-number }}"
+
+      - name: Notify Slack that bump PR was opened
+        if: steps.cpr.outputs.pull-request-operation == 'created'
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
+          PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+          SHORT: ${{ steps.meta.outputs.short }}
+          SUBJECT: ${{ steps.meta.outputs.subject }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then
+            echo "SLACK_ALERTS_WEBHOOK_URL not set"
+            exit 0
+          fi
+          TEXT="iPlug2 auto-bump PR opened: $SHORT ($SUBJECT) <$PR_URL|PR #$PR_NUMBER>"
+          jq -n --arg text "$TEXT" '{text: $text}' | \
+            curl -sf -X POST "$SLACK_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d @-
