@@ -9,6 +9,9 @@ on:
 
 jobs:
   alert:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     steps:
       - name: Post Slack alert
@@ -19,5 +22,5 @@ jobs:
             echo "SLACK_ALERTS_WEBHOOK_URL not set"
             exit 0
           fi
-          jq -n '{text: ":rotating_light: Test alert (workflow_run added)"}' | \
+          jq -n '{text: ":rotating_light: Test alert (with if gate)"}' | \
             curl -sf -X POST "$SLACK_WEBHOOK" -H "Content-Type: application/json" -d @-
