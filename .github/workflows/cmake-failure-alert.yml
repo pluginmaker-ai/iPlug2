@@ -1,21 +1,38 @@
 name: Alert on CMake CI failure
 
 on:
+  workflow_run:
+    workflows: ["CMake CI"]
+    types: [completed]
+    branches: [master]
   workflow_dispatch:
 
 jobs:
   alert:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     steps:
       - name: Post Slack alert
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url || '' }}
         run: |
           if [ -z "$SLACK_WEBHOOK" ]; then
             echo "SLACK_ALERTS_WEBHOOK_URL not set"
             exit 0
           fi
-          jq -n '{text: ":rotating_light: Test alert from cmake-failure-alert workflow"}' | \
+          SHORT_SHA="${SHA:0:12}"
+          if [ -z "$RUN_URL" ]; then
+            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions"
+          fi
+          TEXT=":rotating_light: iPlug2 master broken -- CMake CI failed on \`$SHORT_SHA\`
+<$RUN_URL|View CI run>
+
+Auto-bump to pluginmaker-ai/alexh is paused until master is green again."
+          jq -n --arg text "$TEXT" '{text: $text}' | \
             curl -sf -X POST "$SLACK_WEBHOOK" \
               -H "Content-Type: application/json" \
               -d @-
