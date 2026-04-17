@@ -2,37 +2,15 @@ name: Alert on CMake CI success
 
 on:
   workflow_dispatch:
-  workflow_run:
-    workflows: ["CMake CI"]
-    types: [completed]
-    branches: [master]
 
 jobs:
   alert:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Post Slack success notice
+      - name: Post Slack success
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
-          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
-          RUN_URL: ${{ github.event.workflow_run.html_url || '' }}
         run: |
-          if [ -z "$SLACK_WEBHOOK" ]; then
-            echo "SLACK_ALERTS_WEBHOOK_URL not set"
-            exit 0
-          fi
-          SHORT_SHA="${SHA:0:12}"
-          if [ -z "$RUN_URL" ]; then
-            RUN_URL="https://github.com/pluginmaker-ai/iPlug2/actions"
-          fi
-          TEXT=":white_check_mark: iPlug2 master CMake CI passed on \`$SHORT_SHA\`
-<$RUN_URL|View CI run>
-
-Auto-bump PR on pluginmaker-ai/alexh is being opened..."
-          jq -n --arg text "$TEXT" '{text: $text}' | \
-            curl -sf -X POST "$SLACK_WEBHOOK" \
-              -H "Content-Type: application/json" \
-              -d @-
+          if [ -z "$SLACK_WEBHOOK" ]; then echo skip; exit 0; fi
+          jq -n '{text: ":white_check_mark: success alert test"}' | \
+            curl -sf -X POST "$SLACK_WEBHOOK" -H "Content-Type: application/json" -d @-
