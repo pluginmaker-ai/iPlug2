@@ -5,12 +5,12 @@ name: Bump iPlug2 pin in pluginmaker-ai/alexh
 # the new master tip. Merging that PR triggers the alexh deploy workflow, which
 # rolls the new iPlug2 out to the Mac mini + Windows build workers.
 #
-# Gating on CMake CI means a broken master never propagates — no wasted Mac mini
+# Gating on CMake CI means a broken master never propagates -- no wasted Mac mini
 # deploys, no red smoke-test failures. If CMake CI is skipped (e.g. docs-only
 # change where nothing C++ moved), the bump is also skipped, which is correct:
 # nothing affects plugin builds so there's nothing to deploy.
 #
-# Requires a repository secret ALEXH_PR_TOKEN — a GitHub token with
+# Requires a repository secret ALEXH_PR_TOKEN -- a GitHub token with
 # `contents: write` and `pull-requests: write` scoped to pluginmaker-ai/alexh.
 
 on:
@@ -74,11 +74,11 @@ jobs:
 
             Upstream commit: ${{ steps.meta.outputs.subject }}
             Full SHA: ${{ steps.meta.outputs.sha }}
-          title: "Bump iPlug2 to ${{ steps.meta.outputs.short }} — ${{ steps.meta.outputs.subject }}"
+          title: "Bump iPlug2 to ${{ steps.meta.outputs.short }} -- ${{ steps.meta.outputs.subject }}"
           body: |
             Auto-bump of `backend/services/native-build/iplug2.sha`. iPlug2's
             CMake CI passed on this commit, so the new master tip has already
-            been validated. Auto-merge is enabled — this PR lands as soon as
+            been validated. Auto-merge is enabled -- this PR lands as soon as
             alexh CI passes.
 
             - **New iPlug2 commit:** [`${{ steps.meta.outputs.short }}`](https://github.com/pluginmaker-ai/iPlug2/commit/${{ steps.meta.outputs.sha }})
@@ -117,11 +117,11 @@ jobs:
           SUBJECT: ${{ steps.meta.outputs.subject }}
         run: |
           if [ -z "$SLACK_WEBHOOK" ]; then
-            echo "SLACK_ALERTS_WEBHOOK_URL not set — skipping"
+            echo "SLACK_ALERTS_WEBHOOK_URL not set -- skipping"
             exit 0
           fi
-          TEXT=":robot_face: *iPlug2 auto-bump PR opened* → \`$SHORT\`
-<$PR_URL|PR #$PR_NUMBER> · $SUBJECT
+          TEXT=":robot_face: *iPlug2 auto-bump PR opened* -> \`$SHORT\`
+<$PR_URL|PR #$PR_NUMBER> | $SUBJECT
 Auto-merges once alexh CI passes; native-build deploy follows."
           jq -n --arg text "$TEXT" '{text: $text}' | \
             curl -sf -X POST "$SLACK_WEBHOOK" \
