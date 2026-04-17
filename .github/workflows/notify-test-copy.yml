@@ -1,4 +1,4 @@
-name: Simple steps test
+name: Multi-line text test
 
 on:
   workflow_run:
@@ -7,7 +7,7 @@ on:
     branches: [master]
 
 concurrency:
-  group: simple-steps-test
+  group: multi-line-text-test
   cancel-in-progress: false
 
 jobs:
@@ -23,6 +23,9 @@ jobs:
         run: |
           if [ -z "$SLACK_WEBHOOK" ]; then echo skip; exit 0; fi
           SHORT_SHA="${SHA:0:12}"
-          TEXT=":rotating_light: iPlug2 master broken on \`$SHORT_SHA\` <$RUN_URL|link>"
+          TEXT=":rotating_light: iPlug2 master broken -- CMake CI failed on \`$SHORT_SHA\`
+          <$RUN_URL|View CI run>
+
+          Auto-bump to pluginmaker-ai/alexh is paused until master is green again."
           jq -n --arg text "$TEXT" '{text: $text}' | \
             curl -sf -X POST "$SLACK_WEBHOOK" -H "Content-Type: application/json" -d @-
