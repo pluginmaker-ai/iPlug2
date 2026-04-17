@@ -1,12 +1,5 @@
 name: Alert on CMake CI failure
 
-# Posts a Slack alert when CMake CI fails on master. Master being broken is
-# what pauses the pluginmaker-ai/alexh auto-bump workflow -- without this
-# alert, nobody would know master is red until the next release or build.
-#
-# Requires a repository secret SLACK_ALERTS_WEBHOOK_URL (same name as alexh
-# uses). If the secret isn't set, the workflow logs and exits cleanly.
-
 on:
   workflow_run:
     workflows: ["CMake CI"]
@@ -32,10 +25,10 @@ jobs:
           fi
           SHORT_SHA="${SHA:0:12}"
           SUBJECT=$(printf '%s' "$COMMIT_MSG" | head -1 | cut -c1-120)
-          TEXT=":rotating_light: *iPlug2 master broken* -- CMake CI failed on \`$SHORT_SHA\`
-<$RUN_URL|View CI run> | ${SUBJECT} (by @$AUTHOR)
+          TEXT=":rotating_light: iPlug2 master broken -- CMake CI failed on \`$SHORT_SHA\`
+<$RUN_URL|View CI run> (by @$AUTHOR) - ${SUBJECT}
 
-Auto-bump to pluginmaker-ai/alexh is paused until master is green again. Fix master, then trigger the bump manually via \`gh workflow run bump-alexh-pin.yml\` or by merging a passing commit."
+Auto-bump to pluginmaker-ai/alexh is paused until master is green again."
           jq -n --arg text "$TEXT" '{text: $text}' | \
             curl -sf -X POST "$SLACK_WEBHOOK" \
               -H "Content-Type: application/json" \
