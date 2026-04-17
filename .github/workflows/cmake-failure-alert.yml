@@ -1,11 +1,11 @@
 name: Alert on CMake CI failure
 
 on:
+  workflow_dispatch:
   workflow_run:
     workflows: ["CMake CI"]
     types: [completed]
     branches: [master]
-  workflow_dispatch:
 
 jobs:
   alert:
@@ -26,7 +26,7 @@ jobs:
           fi
           SHORT_SHA="${SHA:0:12}"
           if [ -z "$RUN_URL" ]; then
-            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions"
+            RUN_URL="https://github.com/pluginmaker-ai/iPlug2/actions"
           fi
           TEXT=":rotating_light: iPlug2 master broken -- CMake CI failed on \`$SHORT_SHA\`
 <$RUN_URL|View CI run>
