@@ -33,10 +33,16 @@
 #include "IPlugWebView.h"
 #include "wdl_base64.h"
 #include "json.hpp"
-#include <functional>
-#include <filesystem>
-#include <cstdio>
+#include <atomic>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <random>
+#include <string>
+#include <vector>
 #ifdef OS_WIN
 #include <windows.h>
 #endif
@@ -181,7 +187,95 @@ public:
       IKeyPress keyPress = ConvertToIKeyPress(json["keyCode"].get<uint32_t>(), json["utf8"].get<std::string>().c_str(), json["S"].get<bool>(), json["C"].get<bool>(), json["A"].get<bool>());
       json["isUp"].get<bool>() ? OnKeyUp(keyPress) : OnKeyDown(keyPress); // return value not used
     }
+    else if(json["msg"] == "EXPMI")
+    {
+      // Export MIDI from UI: write the supplied SMF bytes to a temp file
+      // and start an OS-level drag session so the user can drop the file
+      // onto the host (DAW timeline, Finder). Filename comes from JS but
+      // is restricted to a safe charset on this side too — the JS helper
+      // already validates, this is defense in depth.
+      HandleExportMidiDrag(json);
+    }
   }
+
+private:
+  static bool IsValidDragFilenameStem(const std::string& name)
+  {
+    if (name.empty() || name.size() > 64) return false;
+    for (char c : name)
+    {
+      const unsigned char uc = static_cast<unsigned char>(c);
+      if (!(std::isalnum(uc) || c == '-' || c == '_')) return false;
+    }
+    return true;
+  }
+
+  void HandleExportMidiDrag(const nlohmann::json& json)
+  {
+    auto filenameIt = json.find("filename");
+    auto base64It = json.find("base64");
+    if (filenameIt == json.end() || !filenameIt->is_string()) return;
+    if (base64It == json.end() || !base64It->is_string()) return;
+
+    const std::string& filename = filenameIt->get_ref<const std::string&>();
+    if (!IsValidDragFilenameStem(filename)) return;
+
+    const std::string& b64 = base64It->get_ref<const std::string&>();
+    const int b64Size = static_cast<int>(b64.size());
+    if (b64Size == 0 || b64Size > kMaxDragPayloadBase64Bytes) return;
+
+    int numPaddingBytes = 0;
+    if (b64Size >= 2 && b64[b64Size - 2] == '=') numPaddingBytes = 2;
+    else if (b64Size >= 1 && b64[b64Size - 1] == '=') numPaddingBytes = 1;
+    const int decodedSize = (b64Size * 3) / 4 - numPaddingBytes;
+    if (decodedSize <= 0) return;
+
+    std::vector<unsigned char> decoded(decodedSize);
+    wdl_base64decode(b64.c_str(), decoded.data(), decodedSize);
+
+    namespace fs = std::filesystem;
+    // std::filesystem::temp_directory_path() resolves to NSTemporaryDirectory
+    // on macOS and is sandbox-safe in AU/VST3 hosts. The unique subdirectory
+    // keeps each drag's file isolated so concurrent drags can't clobber one
+    // another, and the JS-supplied basename ends up in the host's import
+    // dialog (e.g. "drum-pattern.mid") instead of a UUID.
+    std::error_code ec;
+    fs::path baseDir = fs::temp_directory_path(ec);
+    if (ec || baseDir.empty()) return;
+    fs::path dragDir = baseDir / MakeUniqueDragDirName();
+    fs::create_directories(dragDir, ec);
+    if (ec) return;
+    fs::path file = dragDir / (filename + ".mid");
+
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    if (!out) return;
+    out.write(reinterpret_cast<const char*>(decoded.data()), decodedSize);
+    out.close();
+    if (out.fail()) return;
+
+    InitiateFileDrag(file.string().c_str());
+  }
+
+  static constexpr int kMaxDragPayloadBase64Bytes = 4 * 1024 * 1024; // 4 MB base64 ≈ 3 MB raw
+
+  // 16 hex chars from a fresh random_device + counter. Not a real UUID
+  // (don't need crypto-strength uniqueness — collision risk is one drag
+  // overwriting another within the same plugin instance, which a 64-bit
+  // value rules out for any realistic session length).
+  static std::string MakeUniqueDragDirName()
+  {
+    static std::atomic<uint64_t> counter{0};
+    std::random_device rd;
+    uint64_t hi = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+    uint64_t lo = counter.fetch_add(1, std::memory_order_relaxed);
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "iplug-drag-%016llx-%016llx",
+                  static_cast<unsigned long long>(hi),
+                  static_cast<unsigned long long>(lo));
+    return std::string(buf);
+  }
+
+public:
 
   void Resize(int width, int height);
   

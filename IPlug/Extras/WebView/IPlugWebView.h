@@ -92,6 +92,16 @@ public:
   
   /** Fills the path where web content is being served from, when LoadFile() is used */
   void GetWebRoot(WDL_String& path) const;
+
+  /** Start an OS-level drag session containing the file at `path` so the
+   *  user can drop it onto the host (DAW timeline, Finder, etc). macOS
+   *  only — on iOS/Windows this returns false without doing anything.
+   *  The drag must be initiated synchronously while the user is still
+   *  holding the mouse button after a left-click in the WebView; the
+   *  underlying WKWebView captures the mousedown NSEvent via a local
+   *  monitor and replays it into beginDraggingSessionWithItems. Returns
+   *  true if the session started. */
+  bool InitiateFileDrag(const char* path);
   
   /** Returns the custom URL scheme, if set */
   const char* GetCustomUrlScheme() const { return mCustomUrlScheme.Get(); }

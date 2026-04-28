@@ -68,6 +68,7 @@ public:
   void GetWebRoot(WDL_String& path) const { path.Set(mWebRoot.Get()); }
 
   void GetLocalDownloadPathForFile(const char* fileName, WDL_String& localPath);
+  bool InitiateFileDrag(const char* path);
 
 private:
   IWebView* mIWebView;
@@ -367,6 +368,16 @@ void IWebViewImpl::GetLocalDownloadPathForFile(const char* fileName, WDL_String&
   {
     NSLog(@"Error %@",error);
   }
+}
+
+bool IWebViewImpl::InitiateFileDrag(const char* path)
+{
+  if (!mWKWebView || !path || !*path)
+    return false;
+  NSString* nsPath = [NSString stringWithUTF8String:path];
+  if (!nsPath)
+    return false;
+  return [mWKWebView startFileDragWithPath:nsPath] == YES;
 }
 
 #include "IPlugWebView.cpp"
