@@ -30,15 +30,23 @@
 #pragma once
 
 #import <WebKit/WebKit.h>
+// TargetConditionals defines TARGET_OS_OSX directly from compiler builtins
+// (no dependency on whether IPlugPlatform.h was included first). iPlug2's
+// own OS_MAC macro lives in IPlugPlatform.h, which most call sites import
+// AFTER this header — so a `#ifdef OS_MAC` here would silently skip even
+// on macOS builds. Avoid that footgun by gating on TARGET_OS_OSX, which
+// is set the moment Cocoa.h / TargetConditionals.h is in scope (they're
+// pulled in transitively by <WebKit/WebKit.h> above).
+#include <TargetConditionals.h>
 
-#ifdef OS_MAC
+#if TARGET_OS_OSX
 @interface IPLUG_WKWEBVIEW : WKWebView <NSDraggingSource>
 #else
 @interface IPLUG_WKWEBVIEW : WKWebView
 #endif
 {
   bool mEnableInteraction;
-#ifdef OS_MAC
+#if TARGET_OS_OSX
   // Captured by an NSEvent local monitor so we always have a fresh
   // mousedown to feed into beginDraggingSessionWithItems:event:source:
   // when JS triggers an external file drag (e.g. a drum machine MIDI
@@ -56,7 +64,7 @@
 
 - (void)setEnableInteraction:(bool)enable;
 
-#ifdef OS_MAC
+#if TARGET_OS_OSX
 - (NSView *)hitTest:(NSPoint)point;
 - (void)willOpenMenu:(NSMenu *)menu withEvent:(NSEvent *)event;
 

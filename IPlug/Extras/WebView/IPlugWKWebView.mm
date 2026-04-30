@@ -40,18 +40,18 @@
   if (self)
   {
     mEnableInteraction = true;
-#ifdef OS_MAC
+#if TARGET_OS_OSX
     // Capture the most recent left-mousedown that lands inside our window so
     // beginDraggingSessionWithItems:event:source: has a fresh event when JS
     // requests a file drag. WKWebView's content view eats mouseDown: before
     // this subclass can override it, so a local NSEvent monitor is the only
     // reliable place to capture the original gesture. The monitor returns the
     // event unchanged so WKWebView's own handling is undisturbed.
-    __weak typeof(self) weakSelf = self;
+    __weak __typeof__(self) weakSelf = self;
     mEventMonitor = [NSEvent
       addLocalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown | NSEventMaskLeftMouseUp)
                                    handler:^NSEvent* _Nullable(NSEvent* event) {
-      typeof(self) strongSelf = weakSelf;
+      __typeof__(self) strongSelf = weakSelf;
       if (!strongSelf) return event;
       if (event.window == strongSelf.window)
       {
@@ -67,7 +67,7 @@
   return self;
 }
 
-#ifdef OS_MAC
+#if TARGET_OS_OSX
 - (void)dealloc
 {
   if (mEventMonitor)
@@ -178,7 +178,7 @@
 {
   mEnableInteraction = enable;
   
-#ifdef OS_MAC
+#if TARGET_OS_OSX
   if (!mEnableInteraction)
   {
     for (NSTrackingArea* trackingArea in self.trackingAreas)
@@ -200,7 +200,7 @@
     return NO;
 }
 
-#ifdef OS_MAC
+#if TARGET_OS_OSX
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
     if (([event modifierFlags] & NSEventModifierFlagCommand) && 
         !([event modifierFlags] & NSEventModifierFlagShift) && 
