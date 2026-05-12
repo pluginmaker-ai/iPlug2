@@ -20,9 +20,19 @@
 option(IPLUG_USE_SENTRY "Enable Sentry Native crash/perf telemetry for the plugin" OFF)
 
 if(NOT IPLUG_USE_SENTRY)
-  # Stub target so plugin CMake can unconditionally link iPlug2::Sentry
-  # without `if(IPLUG_USE_SENTRY)` guards everywhere.
-  add_library(iPlug2_Sentry INTERFACE)
+  # Build IPlugSentry.cpp as a tiny static lib so the no-op stub of
+  # iplug::sentry::Init (the #else branch inside IPlugSentry.cpp) is
+  # actually compiled into an object file. IPlugAPIBase.cpp calls Init()
+  # unconditionally; without this static lib the symbol is undefined
+  # and every plugin fails to link.
+  add_library(iPlug2_Sentry STATIC
+    ${CMAKE_CURRENT_LIST_DIR}/IPlugSentry.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/IPlugSentry.h
+  )
+  target_include_directories(iPlug2_Sentry
+    PUBLIC ${CMAKE_CURRENT_LIST_DIR}
+  )
+  set_target_properties(iPlug2_Sentry PROPERTIES FOLDER "iPlug2/Extras")
   add_library(iPlug2::Sentry ALIAS iPlug2_Sentry)
   return()
 endif()
