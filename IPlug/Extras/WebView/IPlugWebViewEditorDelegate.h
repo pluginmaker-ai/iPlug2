@@ -225,7 +225,7 @@ public:
     }
   }
 
-  void SetDpiZoomCompensation(bool needed, const char* hostName = "unknown")
+  void SetDpiZoomCompensation(bool needed, const char* hostName = "unknown") override
   {
     mNeedsDpiZoomCompensation = needed;
   }
