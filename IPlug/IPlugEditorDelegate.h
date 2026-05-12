@@ -347,6 +347,14 @@ public:
    * @param scale The new screen scale*/
   virtual void SetScreenScale(float scale) {}
 
+  /** Tells the editor that DPI zoom compensation is required (e.g. WebView2
+   * under FL Studio which sends logical pixels in onSize). Default is a no-op
+   * so non-WebView editor delegates (IGraphics etc.) compile cleanly when
+   * called from a templated VST3 view. WebViewEditorDelegate overrides this.
+   * @param needed True if the editor should apply DPI zoom compensation
+   * @param hostName Host identifier for telemetry / diagnostics */
+  virtual void SetDpiZoomCompensation(bool needed, const char* hostName = "unknown") {}
+
   friend class IPlugAPP;
   friend class IPlugAAX;
   friend class IPlugVST2;
