@@ -79,6 +79,22 @@ target_compile_definitions(iPlug2_Sentry
   PUBLIC IPLUG_USE_SENTRY
 )
 
+# Forward per-plugin metadata from CMake variables into preprocessor defines
+# so IPlugSentry.cpp's compile-time SENTRY_DSN guard + tag macros pick them up.
+# The build worker passes these via `-DSENTRY_DSN=... -DPLUGIN_ID=... -DPLUGIN_VERSION=...`
+# on the cmake command line; without this forwarding they remain CMake-only
+# variables and never reach the C++ side, so sentry_init silently no-ops even
+# with IPLUG_USE_SENTRY=ON.
+if(DEFINED SENTRY_DSN AND NOT SENTRY_DSN STREQUAL "")
+  target_compile_definitions(iPlug2_Sentry PRIVATE SENTRY_DSN="${SENTRY_DSN}")
+endif()
+if(DEFINED PLUGIN_ID AND NOT PLUGIN_ID STREQUAL "")
+  target_compile_definitions(iPlug2_Sentry PUBLIC PLUGIN_ID="${PLUGIN_ID}")
+endif()
+if(DEFINED PLUGIN_VERSION AND NOT PLUGIN_VERSION STREQUAL "")
+  target_compile_definitions(iPlug2_Sentry PUBLIC PLUGIN_VERSION="${PLUGIN_VERSION}")
+endif()
+
 target_link_libraries(iPlug2_Sentry
   PUBLIC sentry
 )
