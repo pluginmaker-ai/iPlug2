@@ -62,8 +62,19 @@ namespace sentry
    *                        Used as a Sentry tag + part of the release.
    *  @param pluginVersion  Plugin version string ("83", "2.10.1", etc.).
    *                        Used as a Sentry tag + part of the release.
+   *
+   *  When IPLUG_USE_SENTRY is not defined the function is declared inline
+   *  with an empty body so every translation unit that includes this
+   *  header gets a definition locally. That removes the requirement on
+   *  consumers (e.g. legacy .vcxproj MSBuild targets) to compile and link
+   *  IPlugSentry.cpp — they call an inline no-op instead of an external
+   *  symbol that nobody provides.
    */
+#ifdef IPLUG_USE_SENTRY
   void Init(const char* pluginId, const char* pluginVersion);
+#else
+  inline void Init(const char* /*pluginId*/, const char* /*pluginVersion*/) {}
+#endif
 
 } // namespace sentry
 } // namespace iplug
