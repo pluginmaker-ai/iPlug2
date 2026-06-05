@@ -23,8 +23,15 @@
 
   #include <sentry.h>
 
+  #include "IPlugSentryEventRing.h"
   #include "IPlugSentryPendingDump.h"
   #include "IPlugSentryWatchdog.h"
+
+  // Forward decl of the probe-seam anchor — implemented in
+  // IPlugSentryProbeSeam.cpp. Called once from Init() to force the static
+  // archive to pull that TU's strong override of
+  // iplug_sentry_probe_on_stage_event into the plugin DLL.
+  extern "C" void iplug_sentry_probe_seam_anchor();
 
   #if defined(_WIN32)
     #include <windows.h>
@@ -310,6 +317,31 @@ namespace
   #endif
   }
 
+  // A-6 — the SPSC drain thread writes the rendered text into a single
+  // file under the sentry-db dir. We register that path with sentry-native
+  // as a regular attachment at init time so EVERY outgoing event (crash,
+  // hang, custom captureEvent) carries the current audio_events.log
+  // tail. The drain thread refreshes the file on a 1s cadence + on stop,
+  // so the file on disk lags real-time by at most a second — plenty for
+  // forensics. The path-based attachment API works on sentry-native
+  // 0.7.16 across Crashpad (Win) and Breakpad (mac) backends; the
+  // byte-buffer attachment APIs are inconsistent between backends, so
+  // path-based is the portable choice. Side benefit: the existing
+  // CaptureStall_macOS + CaptureStall_Windows code in IPlugSentryWatchdog
+  // needs ZERO changes — every captured event automatically inherits the
+  // attachment without us threading a buffer through their hot paths.
+  std::string AudioEventsLogPath(const std::string& dbPath)
+  {
+    if (dbPath.empty()) return "";
+    std::string p = dbPath;
+  #if defined(_WIN32)
+    p += "\\audio_events.log";
+  #else
+    p += "/audio_events.log";
+  #endif
+    return p;
+  }
+
 } // anonymous namespace
 
 void Init(const char* pluginId, const char* pluginVersion)
@@ -339,6 +371,16 @@ void Init(const char* pluginId, const char* pluginVersion)
     const std::string dbPath = DatabasePath(pluginId);
     if (!dbPath.empty())
       sentry_options_set_database_path(options, dbPath.c_str());
+
+    // A-6 — register the audio_events.log attachment BEFORE sentry_init
+    // so it covers crash events too (Crashpad reads the attachment list
+    // at init time and includes them in its minidump submissions). The
+    // file may not yet exist at this point — sentry-native tolerates a
+    // missing attachment path and skips it on a per-event basis until
+    // the drain thread creates it.
+    const std::string audioEventsPath = AudioEventsLogPath(dbPath);
+    if (!audioEventsPath.empty())
+      sentry_options_add_attachment(options, audioEventsPath.c_str());
 
     std::string release;
     release += (pluginId && *pluginId) ? pluginId : "unknown";
@@ -383,6 +425,22 @@ void Init(const char* pluginId, const char* pluginVersion)
     // is missing because this whole lambda has already returned by then.
     iplug::sentry::pendingdump::ScanAndUploadPendingDumps();
     iplug::sentry::watchdog::Start();
+    // A-6 — drain thread comes up last. Ordering matters: the watchdog
+    // and crash hooks both attach the audio_events.log file, which the
+    // drain thread owns. Starting it after watchdog::Start() means the
+    // first window of plugin activity has a brief grace period with no
+    // file yet (sentry-native silently skips a missing attachment), and
+    // by the time any real hang fires the drain has populated it.
+    iplug::sentry::eventring::StartDrainThread();
+
+    // A-6 probe seam anchor — IPlugSentryProbeSeam.cpp lives in a static
+    // archive. Without a reference from a TU we actually pull in, neither
+    // macOS ld64 nor MSVC link.exe drags the seam's .o into the plugin DLL
+    // when eve's weakly-defined stub already resolves the symbol from
+    // Plugin.cpp.o. Calling the dummy anchor here forces the linker to
+    // pull the TU, which in turn drags the strong override of
+    // `iplug_sentry_probe_on_stage_event` that wins over the weak stub.
+    iplug_sentry_probe_seam_anchor();
   });
 }
 

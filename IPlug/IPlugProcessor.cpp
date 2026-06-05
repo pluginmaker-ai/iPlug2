@@ -27,6 +27,11 @@
   #include <cstdint>
   #include <cstring>
   #include "Extras/Sentry/IPlugSentryWatchdog.h"
+  // A-6 — audio-thread edge detectors. Wraps the ProcessBlock call site
+  // below with Begin/End hooks that time the block, scan for NaN/Inf in
+  // the output buffers, and push records into the SPSC ring on edge
+  // events. Reuses the watchdog's SlotHandle for zero extra bookkeeping.
+  #include "Extras/Sentry/IPlugSentryAudioDetectors.h"
 #endif
 
 using namespace iplug;
@@ -541,8 +546,37 @@ void IPlugProcessor::ProcessBuffers(PLUG_SAMPLE_DST type, int nFrames)
     snapBlockSize,
     snapSampleRate,
     snapRenderingOffline);
+
+  // A-6 — wrap the ProcessBlock call with the audio detectors. Begin
+  // snapshots a monotonic timestamp; End computes elapsed_ns, runs the
+  // CPU-over-80 edge detector, and (cheap fast-path then full scan on
+  // hit) checks the output buffers for NaN/Inf. Real-time safe in steady
+  // state: 1 timer read on Begin, 1 timer read + arithmetic + <=96 sample
+  // reads on End, no allocations, no locks, no syscalls. Detector events
+  // push into the SPSC ring but never directly emit Sentry events — the
+  // ring is only attached to outgoing crash/hang events as a forensic
+  // breadcrumb trail, so an offline-render-induced false positive is
+  // harmless noise that never escapes the audio_events.log attachment.
+  const iplug::sentry::watchdog::SlotHandle detHandle =
+    UnpackSlotHandle(mWatchdogSlot);
+  iplug::sentry::audiodetectors::ProcessBlockBegin(detHandle);
 #endif
   ProcessBlock(mScratchData[ERoute::kInput].Get(), mScratchData[ERoute::kOutput].Get(), nFrames);
+#ifdef IPLUG_USE_SENTRY
+  // PLUG_SAMPLE_DST is the templated sample type (float or double); the
+  // audio detector has matching overloads so the correct path picks up
+  // at compile time. nChannels comes from the connected output channel
+  // count — the scratch buffer carries MaxNChannels but ProcessBlock
+  // writes into mChannelData[kOutput].GetSize(); pass that to bound the
+  // scan to real samples and skip the disconnected tail.
+  iplug::sentry::audiodetectors::ProcessBlockEnd(
+    detHandle,
+    mScratchData[ERoute::kOutput].Get(),
+    (int32_t) mChannelData[ERoute::kOutput].GetSize(),
+    (int32_t) nFrames,
+    (int32_t) snapBlockSize,
+    snapSampleRate);
+#endif
 }
 
 void IPlugProcessor::ProcessBuffers(PLUG_SAMPLE_SRC type, int nFrames)

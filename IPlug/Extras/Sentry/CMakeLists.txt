@@ -41,6 +41,17 @@ set(_iplug_sentry_common_sources
   ${CMAKE_CURRENT_LIST_DIR}/IPlugSentryWatchdog.h
   ${CMAKE_CURRENT_LIST_DIR}/IPlugSentryPendingDump.cpp
   ${CMAKE_CURRENT_LIST_DIR}/IPlugSentryPendingDump.h
+  # A-6 — SPSC event ring + edge-triggered audio detectors + Stream G
+  # probe seam. New TUs:
+  #   IPlugSentryEventRing.{h,cpp}        per-DLL ring + drain thread
+  #   IPlugSentryAudioDetectors.{h,cpp}   CPU + NaN/Inf edge detectors
+  #   IPlugSentryProbeSeam.cpp            extern "C" strong def for the
+  #                                       Faust per-stage probe (Stream G)
+  ${CMAKE_CURRENT_LIST_DIR}/IPlugSentryEventRing.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/IPlugSentryEventRing.h
+  ${CMAKE_CURRENT_LIST_DIR}/IPlugSentryAudioDetectors.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/IPlugSentryAudioDetectors.h
+  ${CMAKE_CURRENT_LIST_DIR}/IPlugSentryProbeSeam.cpp
 )
 
 if(APPLE)
@@ -54,6 +65,14 @@ if(NOT IPLUG_USE_SENTRY)
   # #else branches provide inline no-op definitions, so IPlugProcessor.cpp
   # and IPlugAPIBase.cpp can include the headers and call into the API
   # without linking any symbol — nothing to compile, nothing to link.
+  #
+  # A-6 — the Faust per-stage probe seam (Stream G) is handled cleanly
+  # in OFF builds without us linking anything here: eve's codegen always
+  # emits a weak `iplug_sentry_probe_on_stage_event` stub in Plugin.cpp.
+  # With IPLUG_USE_SENTRY=OFF the strong def in IPlugSentryProbeSeam.cpp
+  # is never compiled, so the weak stub wins at link time and probes
+  # compile to a no-op. ON builds compile the strong def into the
+  # static target below and it overrides the weak stub.
   add_library(iPlug2_Sentry INTERFACE)
   target_include_directories(iPlug2_Sentry
     INTERFACE ${CMAKE_CURRENT_LIST_DIR}
