@@ -357,14 +357,15 @@ void Init(const char* pluginId, const char* pluginVersion)
 } // namespace sentry
 } // namespace iplug
 
-#else // !IPLUG_USE_SENTRY — emit a single no-op symbol
+#else // !IPLUG_USE_SENTRY
 
-namespace iplug
-{
-namespace sentry
-{
-  void Init(const char* /*pluginId*/, const char* /*pluginVersion*/) {}
-} // namespace sentry
-} // namespace iplug
+// Intentionally empty. The no-op stub for iplug::sentry::Init lives in
+// IPlugSentry.h as an `inline` definition in the matching #else branch,
+// so every translation unit that includes the header — including this
+// one and the MSBuild paths that never compile this .cpp — already has
+// a usable definition. Re-defining it here non-inline triggered a
+// redefinition error when CMake builds this .cpp as a static lib with
+// IPLUG_USE_SENTRY=OFF (the default), which broke FindiPlug2.cmake's
+// unconditional `add_subdirectory(IPlug/Extras/Sentry)`.
 
 #endif // IPLUG_USE_SENTRY
