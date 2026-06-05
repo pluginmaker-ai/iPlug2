@@ -94,6 +94,32 @@ endif()
 if(DEFINED PLUGIN_VERSION AND NOT PLUGIN_VERSION STREQUAL "")
   target_compile_definitions(iPlug2_Sentry PUBLIC PLUGIN_VERSION="${PLUGIN_VERSION}")
 endif()
+# A-8 tag scheme — see IPlugSentry.cpp's `sentry_set_tag("brandSlug", ...)`
+# and `("generatedByPrompt", ...)` blocks. The build worker bakes both via
+# brand.json (BRAND_SLUG) and the backend (GENERATED_BY_PROMPT). Skipping
+# the define when the var is unset/empty means the corresponding tag never
+# gets set, instead of getting "(null)" / "" — keeps Sentry's Discover
+# queries clean.
+#
+# Length caps are defense-in-depth: the alexh worker's safeCmakeDefineValue
+# already gates allowed chars + length, but a runaway value would bloat
+# every shipped binary (each tag is baked as a string literal) AND every
+# Sentry event payload. Hard-fail at CMake time if a caller bypasses the
+# worker validation — better than silently shipping a 10 KiB tag.
+if(DEFINED BRAND_SLUG AND NOT BRAND_SLUG STREQUAL "")
+  string(LENGTH "${BRAND_SLUG}" _brand_slug_len)
+  if(_brand_slug_len GREATER 64)
+    message(FATAL_ERROR "BRAND_SLUG too long (${_brand_slug_len} chars; max 64). Validate at the build worker, not here.")
+  endif()
+  target_compile_definitions(iPlug2_Sentry PUBLIC BRAND_SLUG="${BRAND_SLUG}")
+endif()
+if(DEFINED GENERATED_BY_PROMPT AND NOT GENERATED_BY_PROMPT STREQUAL "")
+  string(LENGTH "${GENERATED_BY_PROMPT}" _gen_by_prompt_len)
+  if(_gen_by_prompt_len GREATER 64)
+    message(FATAL_ERROR "GENERATED_BY_PROMPT too long (${_gen_by_prompt_len} chars; max 64). The backend bakes a 12-char sha256 prefix — anything longer is a misconfiguration.")
+  endif()
+  target_compile_definitions(iPlug2_Sentry PUBLIC GENERATED_BY_PROMPT="${GENERATED_BY_PROMPT}")
+endif()
 
 target_link_libraries(iPlug2_Sentry
   PUBLIC sentry
