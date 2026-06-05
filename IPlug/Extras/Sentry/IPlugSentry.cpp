@@ -50,15 +50,35 @@ namespace
 
   // Cap reads at 4 KiB. Sentinel is ~150 bytes in practice; anything larger
   // is either corrupt or hostile and would block plugin construction.
+  // Matches consentSentinel.ts:MAX_SENTINEL_BYTES.
   constexpr size_t kMaxSentinelBytes = 4096;
 
+  // Schema version recognised here. Anything > this is trusted forward; <
+  // means scope likely expanded since the user decided, so we re-prompt
+  // (i.e. treat as unset → init never fires). Matches consentSentinel.ts:
+  // SENTINEL_VERSION.
+  constexpr int kSentinelVersion = 1;
+
+  // Sentinel path (single, vendor-wide).
+  //
+  // Sandboxed AU hosts (Logic Pro, GarageBand) are a known gap: inside the
+  // sandbox $HOME is rewritten to point at the per-host appex container,
+  // so neither this path nor any naive computation can reach the installer's
+  // global Application Support file. Resolving that requires either (a) an
+  // app-group entitlement shared between the installer and every supported
+  // AU host, or (b) the installer writing per-host container copies. Both
+  // are installer + ops work, not framework work. Until then the consent
+  // gate returns false inside sandboxed AUs and Sentry stays off there —
+  // safe-by-default, exactly the behavior we want when consent is unknown.
   std::string SentinelPath()
   {
   #if defined(_WIN32)
     PWSTR appData = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData)))
-      return "";
-    // Convert wide → narrow UTF-8 for fopen.
+    HRESULT hr = SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData);
+    // CoTaskMemFree accepts nullptr per MSDN — unconditional free is the
+    // safest pattern even though the API contract says no allocation on
+    // failure. Defends against pre-Vista quirks + future regressions.
+    if (FAILED(hr)) { CoTaskMemFree(appData); return ""; }
     char buf[MAX_PATH] = {0};
     WideCharToMultiByte(CP_UTF8, 0, appData, -1, buf, MAX_PATH, nullptr, nullptr);
     CoTaskMemFree(appData);
@@ -114,35 +134,98 @@ namespace
   #endif
   }
 
-  // Substring search helper — returns the position of `key`'s end + colon
-  // skipping, or std::string::npos. The sentinel is a tiny well-formed
-  // JSON written by us; we do not link a full parser to avoid pulling in
-  // a dependency just for one boolean. Match `"key"` then skip whitespace
-  // and colon, then read either `true` or `false`.
-  bool ParseAcceptedTrue(const std::string& json)
+  // Hand-rolled minimal parser. The sentinel is a fixed-shape ~150-byte
+  // JSON written by consentSentinel.ts; only three keys ever matter
+  // (`version`, `accepted`, `telemetry` for the legacy shape). We do not
+  // link a full JSON parser to avoid a dependency for one boolean.
+  //
+  // Mirrors consentSentinel.ts:parseSentinel semantics — including the
+  // GDPR-aware legacy migration: legacy `telemetry:false` is preserved
+  // as Declined, but legacy `telemetry:true` returns Unset (re-prompt
+  // under the broader new scope, per EDPB Guidelines 5/2020 on consent
+  // specificity).
+  enum class ConsentDecision { Unset, Accepted, Declined };
+
+  // Skip whitespace (space, tab, newline, CR) starting at `pos`.
+  void SkipWs(const std::string& s, size_t& pos)
   {
-    // Look for "version":1 — must be the v1 shape we wrote.
-    if (json.find("\"version\"") == std::string::npos) return false;
-    // The "accepted":<bool> field. Find "accepted", skip to `:`, skip
-    // whitespace, check the first 4 chars for "true".
-    const char* needle = "\"accepted\"";
-    auto pos = json.find(needle);
-    if (pos == std::string::npos) return false;
-    pos += std::strlen(needle);
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
-    if (pos >= json.size() || json[pos] != ':') return false;
-    pos++;
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
-    if (pos + 4 > json.size()) return false;
-    return json.compare(pos, 4, "true") == 0;
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' || s[pos] == '\r'))
+      ++pos;
+  }
+
+  // Locate `"key"` then `:` then skip whitespace. Returns the index of the
+  // first non-whitespace char after the colon, or npos if not found.
+  size_t FindValueStart(const std::string& s, const char* key)
+  {
+    std::string needle("\"");
+    needle += key;
+    needle += "\"";
+    size_t k = s.find(needle);
+    if (k == std::string::npos) return std::string::npos;
+    size_t colon = s.find(':', k + needle.size());
+    if (colon == std::string::npos) return std::string::npos;
+    size_t pos = colon + 1;
+    SkipWs(s, pos);
+    return pos;
+  }
+
+  bool ReadBoolAt(const std::string& s, size_t pos, bool& out)
+  {
+    if (pos == std::string::npos || pos >= s.size()) return false;
+    if (s.compare(pos, 4, "true") == 0)  { out = true;  return true; }
+    if (s.compare(pos, 5, "false") == 0) { out = false; return true; }
+    return false;
+  }
+
+  bool ReadIntAt(const std::string& s, size_t pos, long& out)
+  {
+    if (pos == std::string::npos || pos >= s.size()) return false;
+    char* end = nullptr;
+    long v = std::strtol(s.c_str() + pos, &end, 10);
+    if (end == s.c_str() + pos) return false;
+    out = v;
+    return true;
+  }
+
+  ConsentDecision ParseSentinelDecision(const std::string& raw)
+  {
+    if (raw.empty()) return ConsentDecision::Unset;
+
+    long version = 0;
+    bool accepted = false;
+    bool hasV1 = ReadIntAt(raw, FindValueStart(raw, "version"), version)
+              && ReadBoolAt(raw, FindValueStart(raw, "accepted"), accepted);
+
+    if (hasV1)
+    {
+      // Newer than us — trust the decision but don't rewrite. Mirrors
+      // consentSentinel.ts:128-134 (no-downgrade-flip-flop protection).
+      if (version > kSentinelVersion)
+        return accepted ? ConsentDecision::Accepted : ConsentDecision::Declined;
+      // Older — scope likely expanded since the user decided.
+      if (version < kSentinelVersion)
+        return ConsentDecision::Unset;
+      // Current — trust as written.
+      return accepted ? ConsentDecision::Accepted : ConsentDecision::Declined;
+    }
+
+    // Legacy `{telemetry: bool}` — asymmetric migration.
+    bool legacy = false;
+    if (ReadBoolAt(raw, FindValueStart(raw, "telemetry"), legacy))
+    {
+      // Legacy false: preserved-no (consentSentinel.ts:161-163).
+      // Legacy true:  Unset → re-prompt under broader scope (lines 154-159).
+      return legacy ? ConsentDecision::Unset : ConsentDecision::Declined;
+    }
+
+    return ConsentDecision::Unset;
   }
 
   bool ConsentGranted()
   {
-    const std::string path = SentinelPath();
-    const std::string raw = ReadSentinelSafe(path);
-    if (raw.empty()) return false;
-    return ParseAcceptedTrue(raw);
+    const std::string raw = ReadSentinelSafe(SentinelPath());
+    if (raw.empty()) return false;             // missing / oversized / unreadable
+    return ParseSentinelDecision(raw) == ConsentDecision::Accepted;
   }
 
   // ---------------------------------------------------------------------------
@@ -348,9 +431,35 @@ void Init(const char* pluginId, const char* pluginVersion)
 
     // Tags. Plugins flow through the module-address filter, so we know
     // every event with these tags genuinely came from us.
+    //
+    // Two come from the runtime args (pluginId, pluginVersion). The other
+    // two come from compile-time -D flags baked at build time:
+    //   -DBRAND_SLUG="<slug>"          from brand.json (or "pluginmaker"
+    //                                  for the consumer flow per the
+    //                                  alexh worker's safeCmakeDefineValue)
+    //   -DGENERATED_BY_PROMPT="<hash>" 12-char sha256 prefix; backend bakes
+    //                                  it so we never ship the prompt text
+    //                                  verbatim through Sentry.
+    // Both are gated on macro existence + non-empty content so older
+    // pipelines that don't define them just skip the tag instead of
+    // sending "(null)" / "".
     sentry_set_tag("pluginId", (pluginId && *pluginId) ? pluginId : "unknown");
     sentry_set_tag("pluginVersion",
                    (pluginVersion && *pluginVersion) ? pluginVersion : "0");
+  #ifdef BRAND_SLUG
+    {
+      constexpr const char* kBrandSlug = BRAND_SLUG;
+      if (kBrandSlug && *kBrandSlug)
+        sentry_set_tag("brandSlug", kBrandSlug);
+    }
+  #endif
+  #ifdef GENERATED_BY_PROMPT
+    {
+      constexpr const char* kGeneratedByPrompt = GENERATED_BY_PROMPT;
+      if (kGeneratedByPrompt && *kGeneratedByPrompt)
+        sentry_set_tag("generatedByPrompt", kGeneratedByPrompt);
+    }
+  #endif
   });
 }
 

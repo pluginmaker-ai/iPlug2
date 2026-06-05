@@ -34,14 +34,37 @@
  *   - Windows: %APPDATA%\PluginMaker\telemetry_consent.json
  *   - macOS:   ~/Library/Application Support/PluginMaker/telemetry_consent.json
  *   - File shape (v1): {"version":1,"accepted":true,...}
+ *   - Schema is versioned: newer versions are trusted forward (no
+ *     downgrade flip-flop), older versions return "unset" so the user
+ *     re-consents under the broader scope. Legacy {"telemetry":bool}
+ *     is honored asymmetrically — `false` is preserved as declined,
+ *     `true` returns "unset" (re-prompt under broader scope, per EDPB
+ *     Guidelines 5/2020 on consent specificity).
  *   - Sentinel is written by the installer (see installer-electron) and
  *     covers both installer + every PluginMaker plugin under one decision.
+ *
+ * Known gap — sandboxed AUs (Logic Pro, GarageBand):
+ *   Inside a sandboxed AU host $HOME is rewritten to the per-host appex
+ *   container, so the path above cannot reach the installer's global
+ *   Application Support file. Resolving this requires either (a) an
+ *   app-group entitlement shared between the installer and every
+ *   supported AU host, or (b) the installer writing per-host container
+ *   copies. Both are installer + ops work. Until that lands, the gate
+ *   safely returns "no consent" inside sandboxed AUs and Sentry stays
+ *   off there — the right default when consent is unknown.
  *
  * Threading:
  *   - Init() is safe to call from any thread but must NOT be called from
  *     the audio thread (sentry_init does allocations + opens files).
- *   - Internally guarded by std::call_once so multi-instance plugins
- *     hosted in the same DAW process initialise exactly once.
+ *   - Internally guarded by std::call_once. The once_flag is per-DLL: a
+ *     single PluginMaker plugin with 32 instances in one project calls
+ *     sentry_init exactly once. Two DISTINCT PluginMaker plugins loaded
+ *     into the same DAW process each have their own once_flag and each
+ *     call sentry_init separately — sentry-native's own re-init guard
+ *     handles the second call (the second init's options are ignored;
+ *     the first plugin's DSN + database path win). Per-process dedupe
+ *     across distinct plugins would need a named-semaphore or env-var
+ *     sentinel; tracked as a separate hardening item.
  */
 
 namespace iplug
