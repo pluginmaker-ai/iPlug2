@@ -315,6 +315,14 @@ private:
   WDL_PtrList<IChannelData<>> mChannelData[2];
   /** A multi-channel delay line used to delay the bypassed signal when a plug-in with latency is bypassed. */
   std::unique_ptr<NChanDelayLine<sample>> mLatencyDelay = nullptr;
+  /** A-5 audio-thread watchdog slot handle. Opaque to IPlugProcessor — the
+   *  watchdog's SlotHandle is 32-bit so it bit-casts into the lower bits of
+   *  this void*. Stored here so the layout cost is paid in both ON and OFF
+   *  builds (8 bytes of unused storage when Sentry is off) and the .cpp
+   *  can stay ifdef-free on the class layout. The watchdog header lives
+   *  in IPlug/Extras/Sentry and is not included here to avoid pulling
+   *  <atomic>/<chrono> into every plugin TU. */
+  void* mWatchdogSlot = nullptr;
 protected: // protected because it needs to be access by the API classes, and don't want a setter/getter
   /** Contains detailed information about the transport state */
   ITimeInfo mTimeInfo;
