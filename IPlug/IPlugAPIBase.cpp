@@ -19,12 +19,32 @@
 #include <cassert>
 
 #include "IPlugAPIBase.h"
+#include "Extras/Sentry/IPlugSentry.h"
 
 using namespace iplug;
+
+// PLUGIN_ID / PLUGIN_VERSION are injected by the build pipeline via
+// `-DPLUGIN_ID="..." -DPLUGIN_VERSION="..."` on plugins that opt in to
+// Sentry telemetry. Fall back to placeholders so non-opted-in plugins
+// still compile and the Sentry path silently no-ops (DSN is empty too).
+#ifndef PLUGIN_ID
+  #define PLUGIN_ID ""
+#endif
+#ifndef PLUGIN_VERSION
+  #define PLUGIN_VERSION ""
+#endif
 
 IPlugAPIBase::IPlugAPIBase(Config c, EAPI plugAPI)
   : IPluginBase(c.nParams, c.nPresets)
 {
+  // Initialise Sentry Native at the very top of the constructor, before
+  // any plugin-specific allocations. Internally guarded by std::call_once
+  // so multi-instance plugins (e.g. 32 copies of the same VST3 in one
+  // DAW project) initialise exactly once. When IPLUG_USE_SENTRY is not
+  // defined at compile time this is a single no-op symbol — no overhead,
+  // no behaviour change.
+  iplug::sentry::Init(PLUGIN_ID, PLUGIN_VERSION);
+
   mUniqueID = c.uniqueID;
   mMfrID = c.mfrID;
   mVersion = c.vendorVersion;
@@ -41,7 +61,7 @@ IPlugAPIBase::IPlugAPIBase(Config c, EAPI plugAPI)
   mAppGroupID.Set(c.appGroupID);
 
   Trace(TRACELOC, "%s:%s", c.pluginName, CurrentTime());
-  
+
   mParamDisplayStr.Set("", MAX_PARAM_DISPLAY_LEN);
 }
 

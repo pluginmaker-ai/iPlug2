@@ -48,6 +48,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   include(${CMAKE_CURRENT_LIST_DIR}/WasmDist.cmake)
 endif()
 
+# Sentry Native (optional crash/perf telemetry — off by default).
+# Always include so the iPlug2::Sentry target exists; when IPLUG_USE_SENTRY
+# is OFF the target is an empty INTERFACE library, so plugin CMake can
+# unconditionally link to it without `if(IPLUG_USE_SENTRY)` guards.
+if(NOT TARGET iPlug2::Sentry)
+  add_subdirectory(${IPLUG2_DIR}/IPlug/Extras/Sentry
+                   ${CMAKE_BINARY_DIR}/_iplug2_sentry)
+endif()
+
 # Include the plugin helper macro (iplug_add_plugin)
 include(${CMAKE_CURRENT_LIST_DIR}/IPlugPlugin.cmake)
 
@@ -196,6 +205,12 @@ function(iplug_configure_target target target_type project_name)
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF
   )
+
+  # Link the optional Sentry telemetry module. iPlug2::Sentry is an empty
+  # INTERFACE library when IPLUG_USE_SENTRY is OFF (the default), so this
+  # is a no-op for plugins that don't opt in. When ON, it pulls in
+  # sentry-native + IPlugSentry.cpp and exposes IPLUG_USE_SENTRY define.
+  target_link_libraries(${target} PRIVATE iPlug2::Sentry)
 
   # Set unique OBJC_PREFIX per target to avoid namespace conflicts when
   # a DAW loads multiple plugin formats of the same plugin simultaneously.
