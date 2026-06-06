@@ -27,39 +27,30 @@
   #include <cstdint>
   #include <cstring>
   #include "Extras/Sentry/IPlugSentryWatchdog.h"
+  // A-6 — audio-thread edge detectors. Wraps the ProcessBlock call site
+  // below with Begin/End hooks that time the block, scan for NaN/Inf in
+  // the output buffers, and push records into the SPSC ring on edge
+  // events. Reuses the watchdog's SlotHandle for zero extra bookkeeping.
+  #include "Extras/Sentry/IPlugSentryAudioDetectors.h"
 #endif
 
 using namespace iplug;
 
+
 #ifdef IPLUG_USE_SENTRY
 namespace
 {
-  // Pack/unpack a watchdog::SlotHandle into the void* mWatchdogSlot member.
-  // SlotHandle is 32 bits (two uint16_t) so it fits comfortably in the low
-  // half of any 64-bit pointer slot. memcpy dodges strict-aliasing concerns;
-  // the encoded value is opaque to anyone other than the watchdog itself.
   static_assert(sizeof(iplug::sentry::watchdog::SlotHandle) <= sizeof(void*),
                 "SlotHandle must fit inside void*");
   static_assert(sizeof(iplug::sentry::watchdog::SlotHandle) == 4,
                 "SlotHandle layout assumed to be {uint16_t,uint16_t}");
-
   void* PackSlotHandle(iplug::sentry::watchdog::SlotHandle h)
-  {
-    uintptr_t bits = 0;
-    std::memcpy(&bits, &h, sizeof(h));
-    return reinterpret_cast<void*>(bits);
-  }
-
+  { uintptr_t bits = 0; std::memcpy(&bits, &h, sizeof(h)); return reinterpret_cast<void*>(bits); }
   iplug::sentry::watchdog::SlotHandle UnpackSlotHandle(void* p)
-  {
-    iplug::sentry::watchdog::SlotHandle h{0, 0};
-    if (!p) return h;
-    const uintptr_t bits = reinterpret_cast<uintptr_t>(p);
-    std::memcpy(&h, &bits, sizeof(h));
-    return h;
-  }
+  { iplug::sentry::watchdog::SlotHandle h{0,0}; if (!p) return h;
+    const uintptr_t bits = reinterpret_cast<uintptr_t>(p); std::memcpy(&h,&bits,sizeof(h)); return h; }
 }
-#endif // IPLUG_USE_SENTRY
+#endif
 
 IPlugProcessor::IPlugProcessor(const Config& config, EAPI plugAPI)
 : mPlugType((EIPlugPluginType) config.plugType)
@@ -98,10 +89,6 @@ IPlugProcessor::IPlugProcessor(const Config& config, EAPI plugAPI)
   }
 
 #ifdef IPLUG_USE_SENTRY
-  // A-5 — claim a heartbeat slot for this instance. Register runs on the
-  // host thread (slow path; mutex inside the watchdog). A zero-handle return
-  // (table full) is silently tolerated: Tick on a zero handle is a no-op, so
-  // the plugin still runs without watchdog coverage on the overflow instance.
   mWatchdogSlot = PackSlotHandle(iplug::sentry::watchdog::Register());
 #endif
 }
@@ -111,12 +98,10 @@ IPlugProcessor::~IPlugProcessor()
   TRACE
 
 #ifdef IPLUG_USE_SENTRY
-  // Symmetric with the ctor. Unregister is host-thread + slow-path; it
-  // bumps the slot's generation counter so any in-flight Tick from a
-  // racing audio thread fails its gen cross-check and becomes a no-op.
   iplug::sentry::watchdog::Unregister(UnpackSlotHandle(mWatchdogSlot));
   mWatchdogSlot = nullptr;
 #endif
+
 
   mChannelData[ERoute::kInput].Empty(true);
   mChannelData[ERoute::kOutput].Empty(true);
@@ -183,13 +168,13 @@ void IPlugProcessor::GetBusName(ERoute direction, int busIdx, int nBuses, WDL_St
     else if(nBuses == 2)
     {
       if(busIdx == 0)
-        str.Set("Main Input");
+        str.Set("Main");
       else
-        str.Set("Aux Input");
+        str.Set("Aux");
     }
     else
     {
-      str.SetFormatted(MAX_BUS_NAME_LEN, "Input %i", busIdx + 1);
+      str.SetFormatted(MAX_BUS_NAME_LEN, "Input %i", busIdx);
     }
   }
   else
@@ -200,60 +185,25 @@ void IPlugProcessor::GetBusName(ERoute direction, int busIdx, int nBuses, WDL_St
     }
     else
     {
-      str.SetFormatted(MAX_BUS_NAME_LEN, "Output %i", busIdx + 1);
+      str.SetFormatted(MAX_BUS_NAME_LEN, "Output %i", busIdx);
     }
   }
-}
-
-int IPlugProcessor::GetIOConfigWithChanCounts(std::vector<int>& inputBuses, std::vector<int>& outputBuses)
-{
-  for (auto configIdx = 0; configIdx < NIOConfigs(); configIdx++)
-  {
-    const IOConfig* pConfig = GetIOConfig(configIdx);
-    int configNInputBuses = pConfig->NBuses(ERoute::kInput);
-    int configNOutputBuses = pConfig->NBuses(ERoute::kOutput);
-    
-    if (configNInputBuses == static_cast<int>(inputBuses.size()) &&
-        configNOutputBuses == static_cast<int>(outputBuses.size()))
-    {
-      bool match = true;
-      for (auto inputBusIdx = 0; inputBusIdx < configNInputBuses && match; inputBusIdx++)
-      {
-        if (pConfig->NChansOnBusSAFE(ERoute::kInput, inputBusIdx) != inputBuses[inputBusIdx])
-          match = false;
-      }
-      for (auto outputBusIdx = 0; outputBusIdx < configNOutputBuses && match; outputBusIdx++)
-      {
-        if (pConfig->NChansOnBusSAFE(ERoute::kOutput, outputBusIdx) != outputBuses[outputBusIdx])
-          match = false;
-      }
-      if (match)
-        return configIdx;
-    }
-  }
-  return -1;
 }
 
 int IPlugProcessor::MaxNBuses(ERoute direction, int* pConfigIdxWithTheMostBuses) const
 {
   int maxNBuses = 0;
   int configWithMostBuses = 0;
-  int maxChans = 0;
-  
-  for (auto i = 0; i < NIOConfigs(); i++)
+
+  for (auto configIdx = 0; configIdx < NIOConfigs(); configIdx++)
   {
-    auto thisIOConfigNBuses = GetIOConfig(i)->NBuses(direction);
-    if(thisIOConfigNBuses >= maxNBuses)
+    IOConfig* pIConfig = mIOConfigs.Get(configIdx);
+    int nBuses = pIConfig->NBuses(direction);
+    
+    if(nBuses >= maxNBuses)
     {
-      maxNBuses = thisIOConfigNBuses;
-      
-      auto thisIOConfigNChans = GetIOConfig(i)->GetTotalNChannels(direction);
-      
-      if(thisIOConfigNChans > maxChans)
-      {
-        maxChans = thisIOConfigNChans;
-        configWithMostBuses = i;
-      }
+      maxNBuses = nBuses;
+      configWithMostBuses = configIdx;
     }
   }
   
@@ -263,18 +213,55 @@ int IPlugProcessor::MaxNBuses(ERoute direction, int* pConfigIdxWithTheMostBuses)
   return maxNBuses;
 }
 
+int IPlugProcessor::GetIOConfigWithChanCounts(std::vector<int>& inputBuses, std::vector<int>& outputBuses)
+{
+  int nInputBuses = static_cast<int>(inputBuses.size());
+  int nOutputBuses = static_cast<int>(outputBuses.size());
+
+  for (auto configIdx = 0; configIdx < NIOConfigs(); configIdx++)
+  {
+    const IOConfig* pConfig = GetIOConfig(configIdx);
+    
+    if(pConfig->NBuses(ERoute::kInput) == nInputBuses && pConfig->NBuses(ERoute::kOutput) == nOutputBuses)
+    {
+      bool match = true;
+      
+      for (int inputBusIdx = 0; inputBusIdx < nInputBuses; inputBusIdx++)
+      {
+        match &= inputBuses[inputBusIdx] == pConfig->GetBusInfo(ERoute::kInput, inputBusIdx)->NChans();
+      }
+      
+      if(match)
+      {
+        for (int outputBusIdx = 0; outputBusIdx < nOutputBuses; outputBusIdx++)
+        {
+          match &= outputBuses[outputBusIdx] == pConfig->GetBusInfo(ERoute::kOutput, outputBusIdx)->NChans();
+        }
+      }
+      
+      if(match)
+        return configIdx;
+    }
+  }
+  
+  return -1;
+}
+
 int IPlugProcessor::MaxNChannelsForBus(ERoute direction, int busIdx) const
 {
+  if(HasWildcardBus(direction))
+    return -1;
+
   const int maxNBuses = MaxNBuses(direction);
   std::vector<int> maxChansOnBuses;
   maxChansOnBuses.resize(maxNBuses);
 
-  // find the maximum channel count for each bus
+  //find the maximum channel count for each input or output bus
   for (auto configIdx = 0; configIdx < NIOConfigs(); configIdx++)
   {
     const IOConfig* pIOConfig = GetIOConfig(configIdx);
-    
-    for (auto bus = 0; bus < maxNBuses; bus++)
+
+    for (int bus = 0; bus < maxNBuses; bus++)
       maxChansOnBuses[bus] = std::max(pIOConfig->NChansOnBusSAFE(direction, bus), maxChansOnBuses[bus]);
   }
 
@@ -286,7 +273,7 @@ int IPlugProcessor::NChannelsConnected(ERoute direction) const
   const WDL_PtrList<IChannelData<>>& channelData = mChannelData[direction];
 
   int count = 0;
-  for (auto i = 0; i < channelData.GetSize(); i++)
+  for (auto i = 0; i<channelData.GetSize(); i++)
   {
     count += (int) IsChannelConnected(direction, i);
   }
@@ -304,6 +291,7 @@ bool IPlugProcessor::LegalIO(int NInputChans, int NOutputChans) const
     legal = ((NInputChans < 0 || NInputChans == pIO->GetTotalNChannels(ERoute::kInput)) && (NOutputChans < 0 || NOutputChans == pIO->GetTotalNChannels(ERoute::kOutput)));
   }
 
+  Trace(TRACELOC, "%d:%d:%s", NInputChans, NOutputChans, (legal ? "legal" : "illegal"));
   return legal;
 }
 
@@ -313,13 +301,13 @@ void IPlugProcessor::LimitToStereoIO()
     SetChannelConnections(ERoute::kInput, 2, MaxNChannels(ERoute::kInput) - 2, false);
 
   if (MaxNChannels(ERoute::kOutput) > 2)
-    SetChannelConnections(ERoute::kOutput, 2, MaxNChannels(ERoute::kOutput) - 2, false);
+    SetChannelConnections(ERoute::kOutput, 2, MaxNChannels(ERoute::kOutput) - 2, true);
 }
 
 void IPlugProcessor::SetChannelLabel(ERoute direction, int idx, const char* formatStr, bool zeroBased)
 {
   if (idx >= 0 && idx < MaxNChannels(direction))
-    mChannelData[direction].Get(idx)->mLabel.SetFormatted(MAX_CHAN_NAME_LEN, formatStr, idx+(zeroBased?0:1));
+    mChannelData[direction].Get(idx)->mLabel.SetFormatted(MAX_CHAN_NAME_LEN, formatStr, idx+(!zeroBased));
 }
 
 void IPlugProcessor::SetLatency(int samples)
@@ -327,92 +315,129 @@ void IPlugProcessor::SetLatency(int samples)
   mLatency = samples;
 
   if (mLatencyDelay)
-    mLatencyDelay->SetDelayTime(samples);
+    mLatencyDelay->SetDelayTime(mLatency);
 }
 
-// static
+//static
 int IPlugProcessor::ParseChannelIOStr(const char* IOStr, WDL_PtrList<IOConfig>& channelIOList, int& totalNInChans, int& totalNOutChans, int& totalNInBuses, int& totalNOutBuses)
 {
   bool foundAWildcard = false;
   int IOConfigIndex = 0;
-  
-  DBGMSG("Channel I/O string: \"%s\"\n", IOStr);
 
-  char* IOStrlocal = strdup(IOStr);
-  char* pChannelIOStr = strtok_r(IOStrlocal, " ", &IOStrlocal);
-
-  while (pChannelIOStr)
+  DBGMSG("\nBEGIN IPLUG CHANNEL IO PARSER --------------------------------------------------\n");
+  // lamda function to iterate through the period separated buses and check that none have 0 channel count
+  auto ParseBusToken = [&foundAWildcard, &IOConfigIndex](ERoute busDir, char* pBusStr, char* pBusStrEnd, int& NBuses, int& NChans, IOConfig* pConfig)
   {
+    while (pBusStr != NULL)
+    {
+      auto NChanOnBus = 0;
+
+      if(strcmp(pBusStr, "*") == 0)
+      {
+        foundAWildcard = true;
+        NChanOnBus = -MAX_BUS_CHANS; // we put a negative number in here which will be picked up in the api classes in order to deal with NxN or NxM routings
+      }
+      else if (sscanf(pBusStr, "%d", &NChanOnBus) == 1)
+        ; //don't do anything
+      else
+      {
+        DBGMSG("Error: something wrong in the %s part of this io string: %s.\n", RoutingDirStrs[busDir], pBusStr);
+        assert(0);
+      }
+      NChans += NChanOnBus;
+
+      pBusStr = strtok_r(NULL, ".", &pBusStrEnd);
+
+      if(NChanOnBus)
+      {
+        pConfig->AddBusInfo(busDir, NChanOnBus);
+        NBuses++;
+      }
+      else if(NBuses > 0)
+      {
+        DBGMSG("Error: with multiple %s buses you can't define one with no channels!\n", RoutingDirStrs[busDir]);
+        assert(NChanOnBus > 0);
+      }
+    }
+  };
+
+  totalNInChans = 0; totalNOutChans = 0;
+  totalNInBuses = 0; totalNOutBuses = 0;
+
+  char* pChannelIOStr = strdup(IOStr);
+
+  char* pIOStrEnd;
+  char* pIOStr = strtok_r(pChannelIOStr, " ", &pIOStrEnd); // a single IO string
+
+  WDL_PtrList<WDL_String> IOStrlist;
+
+  // iterate through the space separated IO configs
+  while (pIOStr != NULL)
+  {
+    IOConfig* pConfig = new IOConfig();
+
     int NInChans = 0, NOutChans = 0;
     int NInBuses = 0, NOutBuses = 0;
 
-    // Build a temporary IOConfig, in case the string is invalid
-    IOConfig* pConfig = new IOConfig();
+    char* pIStr = strtok(pIOStr, "-"); // Input buses part of string
+    char* pOStr = strtok(NULL, "-");   // Output buses part of string
 
-    char* pIOStr = strtok_r(pChannelIOStr, "-", &pChannelIOStr); // Don't write directly into IOStr, since strtok will modify it
+    WDL_String* thisIOStr  = new WDL_String();
+    thisIOStr->SetFormatted(256, "%s-%s", pIStr, pOStr);
 
-    while (pIOStr != nullptr)
+    for (auto str = 0; str < IOStrlist.GetSize(); str++)
     {
-      WDL_String tempStr(pIOStr);
-      ERoute dir = (ERoute) (NInBuses > 0); // 2nd time around the loop, this will be the output
-      
-      if (CStringHasContents(tempStr.Get()))
+      if(strcmp(IOStrlist.Get(str)->Get(), thisIOStr->Get()) == 0)
       {
-        char* pBusStr = strtok_r(tempStr.Get(), ".", &(pIOStr));
-
-        while (pBusStr != nullptr)
-        {
-          int NChans = 0;
-          
-          if (strcmp(pBusStr, "*") == 0)
-          {
-            foundAWildcard = true;
-            NChans = MAX_BUS_CHANS; // for wildcard bus pretend MAX_BUS_CHANS channels are present
-          }
-          else
-          {
-            NChans = atoi(pBusStr);
-          }
-          
-          pConfig->AddBusInfo(dir, NChans);
-
-          if(dir == ERoute::kInput)
-          {
-            NInChans += NChans;
-            NInBuses++;
-          }
-          else
-          {
-            NOutChans += NChans;
-            NOutBuses++;
-          }
-          
-          pBusStr = strtok_r(nullptr, ".", &(pIOStr));
-        }
+        DBGMSG("Error: Duplicate IO string. %s\n", thisIOStr->Get());
+        assert(0);
       }
-      
-      pIOStr = strtok_r(pChannelIOStr, "-", &pChannelIOStr); // Don't write directly into IOStr, since strtok will modify it
     }
 
-    channelIOList.Add(pConfig);
+    IOStrlist.Add(thisIOStr);
 
-    DBGMSG("Channel I/O #%i - input bus count: %i, output bus count %i\n", IOConfigIndex + 1, NInBuses, NOutBuses);
-    DBGMSG("Channel I/O #%i - input channel count: %i, output channel count %i\n\n", IOConfigIndex + 1, NInChans, NOutChans);
+    char* pIBusStrEnd;
+    char* pIBusStr = strtok_r(pIStr, ".", &pIBusStrEnd); // a single input bus
+
+    ParseBusToken(ERoute::kInput, pIBusStr, pIBusStrEnd, NInBuses, NInChans, pConfig);
+
+    char* pOBusStrEnd;
+    char* pOBusStr = strtok_r(pOStr, ".", &pOBusStrEnd);
+
+    ParseBusToken(ERoute::kOutput, pOBusStr, pOBusStrEnd, NOutBuses, NOutChans, pConfig);
+
+    if(foundAWildcard == true && IOConfigIndex > 0)
+    {
+      DBGMSG("Error: You can only have a single IO config when using wild cards.\n");
+      assert(0);
+    }
+
+    DBGMSG("Channel I/O #%i - %s\n", IOConfigIndex + 1, thisIOStr->Get());
+    DBGMSG("               - input bus count: %i, output bus count %i\n", NInBuses, NOutBuses);
+    for (auto i = 0; i < NInBuses; i++)
+      DBGMSG("               - channel count on input bus %i: %i\n", i + 1, pConfig->NChansOnBusSAFE(ERoute::kInput, i));
+    for (auto i = 0; i < NOutBuses; i++)
+      DBGMSG("               - channel count on output bus %i: %i\n", i + 1, pConfig->NChansOnBusSAFE(ERoute::kOutput, i));
+    DBGMSG("               - input channel count across all buses: %i, output channel count across all buses %i\n\n", NInChans, NOutChans);
 
     totalNInChans = std::max(totalNInChans, NInChans);
     totalNOutChans = std::max(totalNOutChans, NOutChans);
     totalNInBuses = std::max(totalNInBuses, NInBuses);
     totalNOutBuses = std::max(totalNOutBuses, NOutBuses);
 
+    channelIOList.Add(pConfig);
+
     IOConfigIndex++;
 
-    pChannelIOStr = strtok_r(nullptr, " ", &IOStrlocal);
+    pIOStr = strtok_r(NULL, " ", &pIOStrEnd); // go to next io string
   }
 
-  free(IOStrlocal);
-  
-  assert(foundAWildcard == false || (foundAWildcard == true && IOConfigIndex == 1)); // an association of a wildcard channel I/O config with others is incorrect
-  
+  free(pChannelIOStr);
+  IOStrlist.Empty(true);
+  DBGMSG("%i I/O configs detected\n", IOConfigIndex);
+  DBGMSG("Total # in chans: %i, Total # out chans: %i \n\n", totalNInChans, totalNOutChans);
+  DBGMSG("END IPLUG CHANNEL IO PARSER --------------------------------------------------\n");
+
   return IOConfigIndex;
 }
 
@@ -433,43 +458,51 @@ int IPlugProcessor::GetAUPluginType() const
   {
     return 'aumi';
   }
+  else if (mPlugType == EIPlugPluginType::kGenerator)
+  {
+    return 'augn';
+  }
   else
     return 'aufx';
 }
 
-void IPlugProcessor::InitLatencyDelay()
-{
-  if (mLatency && mLatencyDelay == nullptr)
-  {
-    mLatencyDelay = std::make_unique<NChanDelayLine<sample>>(MaxNChannels(ERoute::kInput), MaxNChannels(ERoute::kOutput));
-    mLatencyDelay->SetDelayTime(mLatency);
-  }
-}
+#pragma mark -
 
 void IPlugProcessor::SetChannelConnections(ERoute direction, int idx, int n, bool connected)
 {
   WDL_PtrList<IChannelData<>>& channelData = mChannelData[direction];
-  
-  for (auto i = idx; i < idx + n; ++i)
+
+  const auto endIdx = std::min(idx + n, channelData.GetSize());
+
+  for (auto i = idx; i < endIdx; ++i)
   {
-    if (i < channelData.GetSize())
-    {
-      IChannelData<>* pChannel = channelData.Get(i);
-      pChannel->mConnected = connected;
-      
-      if (!connected)
-        *(pChannel->mData) = pChannel->mScratchBuf.Get();
-    }
+    IChannelData<>* pChannel = channelData.Get(i);
+    pChannel->mConnected = connected;
+
+    if (!connected)
+      *(pChannel->mData) = pChannel->mScratchBuf.Get();
   }
 }
 
-void IPlugProcessor::AttachBuffers(ERoute direction, int idx, int n, PLUG_SAMPLE_DST** ppData, int nFrames)
+void IPlugProcessor::InitLatencyDelay()
+{
+  if (MaxNChannels(ERoute::kInput))
+  {
+    mLatencyDelay = std::unique_ptr<NChanDelayLine<PLUG_SAMPLE_DST>>(new NChanDelayLine<PLUG_SAMPLE_DST>(MaxNChannels(ERoute::kInput), MaxNChannels(ERoute::kOutput)));
+    mLatencyDelay->SetDelayTime(GetLatency());
+  }
+}
+
+void IPlugProcessor::AttachBuffers(ERoute direction, int idx, int n, PLUG_SAMPLE_DST** ppData, int)
 {
   WDL_PtrList<IChannelData<>>& channelData = mChannelData[direction];
-  
-  for (auto i = idx; i < idx + n; ++i)
+
+  const auto endIdx = std::min(idx + n, channelData.GetSize());
+
+  for (auto i = idx; i < endIdx; ++i)
   {
     IChannelData<>* pChannel = channelData.Get(i);
+
     if (pChannel->mConnected)
       *(pChannel->mData) = *(ppData++);
   }
@@ -478,24 +511,33 @@ void IPlugProcessor::AttachBuffers(ERoute direction, int idx, int n, PLUG_SAMPLE
 void IPlugProcessor::AttachBuffers(ERoute direction, int idx, int n, PLUG_SAMPLE_SRC** ppData, int nFrames)
 {
   WDL_PtrList<IChannelData<>>& channelData = mChannelData[direction];
-  
-  for (auto i = idx; i < idx + n; ++i)
+
+  const auto endIdx = std::min(idx + n, channelData.GetSize());
+
+  for (auto i = idx; i < endIdx; ++i)
   {
     IChannelData<>* pChannel = channelData.Get(i);
+
     if (pChannel->mConnected)
     {
-      if (sizeof(PLUG_SAMPLE_DST) == 8 && sizeof(PLUG_SAMPLE_SRC) == 8)
-        *(pChannel->mData) = (PLUG_SAMPLE_DST*) *ppData;
-        
-      pChannel->mIncomingData = *ppData;
-      ppData++;
+      if (direction == ERoute::kInput)
+      {
+        PLUG_SAMPLE_DST* pScratch = pChannel->mScratchBuf.Get();
+        CastCopy(pScratch, *(ppData++), nFrames);
+        *(pChannel->mData) = pScratch;
+      }
+      else // output
+      {
+        *(pChannel->mData) = pChannel->mScratchBuf.Get();
+        pChannel->mIncomingData = *(ppData++);
+      }
     }
   }
 }
 
 void IPlugProcessor::PassThroughBuffers(PLUG_SAMPLE_DST type, int nFrames)
 {
-  if (mLatencyDelay)
+  if (mLatency && mLatencyDelay)
     mLatencyDelay->ProcessBlock(mScratchData[ERoute::kInput].Get(), mScratchData[ERoute::kOutput].Get(), nFrames);
   else
     IPlugProcessor::ProcessBlock(mScratchData[ERoute::kInput].Get(), mScratchData[ERoute::kOutput].Get(), nFrames);
@@ -522,27 +564,26 @@ void IPlugProcessor::PassThroughBuffers(PLUG_SAMPLE_SRC type, int nFrames)
 void IPlugProcessor::ProcessBuffers(PLUG_SAMPLE_DST type, int nFrames)
 {
 #ifdef IPLUG_USE_SENTRY
-  // A-5 watchdog tick. Real-time-safe: one relaxed load+compare (gen check
-  // inside Tick), one fetch_add, two relaxed stores, one release store.
-  // No allocations, no locks, no syscalls. Inlines to nothing in the OFF
-  // build (header gives an inline empty stub, but the #ifdef guard means
-  // we don't even reach the include there). On a zero handle (table full
-  // at registration time) the call returns after a single compare-against-
-  // zero, so the overflow case is also wait-free.
-  //
-  // Snapshot the three host-thread-written values into locals for the call
-  // — the compiler likely already does this, but make it explicit so
-  // there is no question about which value the watchdog observes.
-  const int    snapBlockSize = mBlockSize;
-  const double snapSampleRate = mSampleRate;
+  const int    snapBlockSize       = mBlockSize;
+  const double snapSampleRate      = mSampleRate;
   const bool   snapRenderingOffline = mRenderingOffline;
   iplug::sentry::watchdog::Tick(
     UnpackSlotHandle(mWatchdogSlot),
-    snapBlockSize,
-    snapSampleRate,
-    snapRenderingOffline);
+    snapBlockSize, snapSampleRate, snapRenderingOffline);
+  const iplug::sentry::watchdog::SlotHandle detHandle =
+    UnpackSlotHandle(mWatchdogSlot);
+  iplug::sentry::audiodetectors::ProcessBlockBegin(detHandle);
 #endif
   ProcessBlock(mScratchData[ERoute::kInput].Get(), mScratchData[ERoute::kOutput].Get(), nFrames);
+#ifdef IPLUG_USE_SENTRY
+  iplug::sentry::audiodetectors::ProcessBlockEnd(
+    detHandle,
+    mScratchData[ERoute::kOutput].Get(),
+    (int32_t) mChannelData[ERoute::kOutput].GetSize(),
+    (int32_t) nFrames,
+    (int32_t) snapBlockSize,
+    snapSampleRate);
+#endif
 }
 
 void IPlugProcessor::ProcessBuffers(PLUG_SAMPLE_SRC type, int nFrames)
