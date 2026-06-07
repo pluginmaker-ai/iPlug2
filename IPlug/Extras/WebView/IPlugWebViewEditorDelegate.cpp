@@ -147,7 +147,27 @@ bool WebViewEditorDelegate::OnKeyDown(const IKeyPress& key)
   #ifdef OS_WIN
   if (key.VK == VK_SPACE)
   {
-    PostMessage((HWND)mView, WM_KEYDOWN, VK_SPACE, 0);
+    // Forward spacebar to the DAW so transport (play/stop) still works while the
+    // WebView is focused. CRITICAL: post to the host's TOP-LEVEL window (GA_ROOT),
+    // never to mView. mView is the WebView's own parent HWND, so a synthetic key
+    // sent there is routed back into the focused WebView, whose injected JS
+    // re-reports it via SKPFUI -> OnKeyDown -> here = an infinite key-echo loop
+    // that hangs the host UI thread (Windows-only; macOS bubbles via the responder
+    // chain and cannot loop). GA_ROOT reaches the DAW's own WndProc instead, which
+    // cannot re-enter the WebView. The short time-guard is belt-and-suspenders
+    // against any host that reflects the synthetic key back to its focused child.
+    const unsigned int nowMs = (unsigned int) GetTickCount();
+    if (nowMs - mLastSpaceForwardMs >= 60)
+    {
+      mLastSpaceForwardMs = nowMs;
+      HWND root = GetAncestor((HWND) mView, GA_ROOT);
+      if (root)
+      {
+        const LPARAM scan = (LPARAM) MapVirtualKey(VK_SPACE, MAPVK_VK_TO_VSC);
+        PostMessage(root, WM_KEYDOWN, VK_SPACE, (scan << 16) | 0x00000001);
+        PostMessage(root, WM_KEYUP,   VK_SPACE, (scan << 16) | 0xC0000001);
+      }
+    }
     return true;
   }
   #endif

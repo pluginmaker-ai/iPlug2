@@ -366,12 +366,12 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
 
             // this script receives global key down events and forwards them to the C++ side
             mCoreWebView->AddScriptToExecuteOnDocumentCreated(
-              L"document.addEventListener('keydown', function(e) { if(document.activeElement.type != \"text\") { IPlugSendMsg({'msg': 'SKPFUI', 'keyCode': e.keyCode, 'utf8': e.key, 'S': e.shiftKey, 'C': e.ctrlKey, 'A': e.altKey, 'isUp': false}); }});",
+              L"document.addEventListener('keydown', function(e) { var a=document.activeElement, ed=a&&(a.isContentEditable||a.tagName=='TEXTAREA'||(a.tagName=='INPUT'&&/^(text|search|email|url|tel|password|number)$/i.test(a.type||'text'))); if(!ed){ IPlugSendMsg({'msg': 'SKPFUI', 'keyCode': e.keyCode, 'utf8': e.key, 'S': e.shiftKey, 'C': e.ctrlKey, 'A': e.altKey, 'isUp': false}); if(e.keyCode==32){ e.preventDefault(); } } });",
               Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>([this](HRESULT error, PCWSTR id) -> HRESULT { return S_OK; }).Get());
 
             // this script receives global key up events and forwards them to the C++ side
             mCoreWebView->AddScriptToExecuteOnDocumentCreated(
-              L"document.addEventListener('keyup', function(e) { if(document.activeElement.type != \"text\") { IPlugSendMsg({'msg': 'SKPFUI', 'keyCode': e.keyCode, 'utf8': e.key, 'S': e.shiftKey, 'C': e.ctrlKey, 'A': e.altKey, 'isUp': true}); }});",
+              L"document.addEventListener('keyup', function(e) { var a=document.activeElement, ed=a&&(a.isContentEditable||a.tagName=='TEXTAREA'||(a.tagName=='INPUT'&&/^(text|search|email|url|tel|password|number)$/i.test(a.type||'text'))); if(!ed){ IPlugSendMsg({'msg': 'SKPFUI', 'keyCode': e.keyCode, 'utf8': e.key, 'S': e.shiftKey, 'C': e.ctrlKey, 'A': e.altKey, 'isUp': true}); if(e.keyCode==32){ e.preventDefault(); } } });",
               Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>([this](HRESULT error, PCWSTR id) -> HRESULT { return S_OK; }).Get());
 
             mCoreWebView->add_WebMessageReceived(
