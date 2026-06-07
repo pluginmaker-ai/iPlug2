@@ -364,14 +364,55 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
                 return S_OK;
               }).Get());
 
-            // this script receives global key down events and forwards them to the C++ side
-            mCoreWebView->AddScriptToExecuteOnDocumentCreated(
-              L"document.addEventListener('keydown', function(e) { var a=document.activeElement, ed=a&&(a.isContentEditable||a.tagName=='TEXTAREA'||(a.tagName=='INPUT'&&/^(text|search|email|url|tel|password|number)$/i.test(a.type||'text'))); if(!ed){ IPlugSendMsg({'msg': 'SKPFUI', 'keyCode': e.keyCode, 'utf8': e.key, 'S': e.shiftKey, 'C': e.ctrlKey, 'A': e.altKey, 'isUp': false}); if(e.keyCode==32){ e.preventDefault(); } } });",
-              Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>([this](HRESULT error, PCWSTR id) -> HRESULT { return S_OK; }).Get());
+            // Forward keydown / keyup from the WebView to the C++ side. The
+            // editable check is intentionally aggressive: any focused element
+            // that could plausibly accept typed text (including shadow-DOM
+            // hosts, contenteditable regions, ARIA role=textbox/searchbox/
+            // combobox/spinbutton, and IME composition) is treated as
+            // "typing in the plugin UI" and we let the WebView default
+            // handle the key — so space types a space character. For
+            // anything else, we forward SPACE to the host via SKPFUI so
+            // OnKeyDown can post WM_KEYDOWN to GA_ROOT for DAW transport.
+            //
+            // Capture-phase listener (3rd arg true) so plugin UI frameworks
+            // (React, Vue, lit-html) can't stopPropagation() and prevent us
+            // from seeing the key. Only SPACE is forwarded to the host
+            // today — other keys are left for the WebView to handle.
+            const wchar_t* kForwardKeysScript =
+              L"(function(){"
+              L"function isEditableTarget(e){"
+              L"  if(e.isComposing||e.keyCode===229) return true;"
+              L"  var path=(typeof e.composedPath==='function')?e.composedPath():[];"
+              L"  var candidates=path.length?path:[document.activeElement];"
+              L"  for(var i=0;i<candidates.length;i++){"
+              L"    var n=candidates[i];"
+              L"    if(!n||n===document||n===window||!n.tagName) continue;"
+              L"    var tag=n.tagName.toUpperCase();"
+              L"    if(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT') return true;"
+              L"    if(n.isContentEditable===true) return true;"
+              L"    if(n.getAttribute){"
+              L"      var role=n.getAttribute('role');"
+              L"      if(role==='textbox'||role==='searchbox'||role==='combobox'||role==='spinbutton') return true;"
+              L"    }"
+              L"  }"
+              L"  return false;"
+              L"}"
+              L"document.addEventListener('keydown',function(e){"
+              L"  if(e.keyCode!==32) return;"
+              L"  if(isEditableTarget(e)) return;"
+              L"  e.preventDefault();"
+              L"  IPlugSendMsg({msg:'SKPFUI',keyCode:e.keyCode,utf8:e.key,S:e.shiftKey,C:e.ctrlKey,A:e.altKey,isUp:false});"
+              L"},true);"
+              L"document.addEventListener('keyup',function(e){"
+              L"  if(e.keyCode!==32) return;"
+              L"  if(isEditableTarget(e)) return;"
+              L"  e.preventDefault();"
+              L"  IPlugSendMsg({msg:'SKPFUI',keyCode:e.keyCode,utf8:e.key,S:e.shiftKey,C:e.ctrlKey,A:e.altKey,isUp:true});"
+              L"},true);"
+              L"})();";
 
-            // this script receives global key up events and forwards them to the C++ side
             mCoreWebView->AddScriptToExecuteOnDocumentCreated(
-              L"document.addEventListener('keyup', function(e) { var a=document.activeElement, ed=a&&(a.isContentEditable||a.tagName=='TEXTAREA'||(a.tagName=='INPUT'&&/^(text|search|email|url|tel|password|number)$/i.test(a.type||'text'))); if(!ed){ IPlugSendMsg({'msg': 'SKPFUI', 'keyCode': e.keyCode, 'utf8': e.key, 'S': e.shiftKey, 'C': e.ctrlKey, 'A': e.altKey, 'isUp': true}); if(e.keyCode==32){ e.preventDefault(); } } });",
+              kForwardKeysScript,
               Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>([this](HRESULT error, PCWSTR id) -> HRESULT { return S_OK; }).Get());
 
             mCoreWebView->add_WebMessageReceived(
