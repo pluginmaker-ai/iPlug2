@@ -290,6 +290,9 @@ protected:
   int mMaxJSStringLength = kDefaultMaxJSStringLength;
   std::function<void()> mEditorInitFunc = nullptr;
   void* mView = nullptr;
+#ifdef OS_WIN
+  unsigned int mLastSpaceForwardMs = 0; // tick of last spacebar->host forward (key-echo guard)
+#endif
   int mDesignWidth = 0;  // Initial PLUG_WIDTH, used for pageZoom scaling on resize
   int mDesignHeight = 0;
   float mScreenScale = 1.f;
