@@ -163,6 +163,21 @@ bool WebViewEditorDelegate::OnKeyDown(const IKeyPress& key)
       HWND root = GetAncestor((HWND) mView, GA_ROOT);
       if (root)
       {
+        // 1) Send a media-key APPCOMMAND. This is the standard Windows
+        //    mechanism for telling the foreground app to play/pause
+        //    (what hardware media keys, Spotify keyboards, and
+        //    presentation remotes send). Many DAWs (Reaper, Cubase,
+        //    Studio One) handle WM_APPCOMMAND for transport even when
+        //    they ignore a synthetic WM_KEYDOWN reaching a non-focused
+        //    window. Hosts that don't handle it just no-op silently.
+        PostMessage(root, WM_APPCOMMAND, (WPARAM) root,
+                    MAKELPARAM(0, FAPPCOMMAND_KEY | APPCOMMAND_MEDIA_PLAY_PAUSE));
+
+        // 2) Also forward as a synthetic WM_KEYDOWN/WM_KEYUP for hosts
+        //    whose transport binding is in their accelerator table or
+        //    main WndProc keyboard handler rather than WM_APPCOMMAND.
+        //    lParam carries a real scan code so input filters that
+        //    reject lParam=0 as injected (e.g. FL Studio) accept it.
         const LPARAM scan = (LPARAM) MapVirtualKey(VK_SPACE, MAPVK_VK_TO_VSC);
         PostMessage(root, WM_KEYDOWN, VK_SPACE, (scan << 16) | 0x00000001);
         PostMessage(root, WM_KEYUP,   VK_SPACE, (scan << 16) | 0xC0000001);
