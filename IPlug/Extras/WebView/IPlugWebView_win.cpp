@@ -1009,11 +1009,24 @@ void IWebViewImpl::ApplyWebViewBounds()
 
       if (uniform && nonTrivial && sane)
       {
+        // WebView2 renders CSS pixels at RasterizationScale x ZoomFactor
+        // physical pixels. RasterizationScale tracks the MONITOR scale of
+        // the top-level window (ShouldDetectMonitorScaleChanges defaults to
+        // true), not the parent HWND's DPI context — so on a 125% display it
+        // is typically already 1.25 even though GetDpiForWindow(parent) says
+        // 96. Dividing by it makes the design (w CSS px wide) exactly fill
+        // the reconciled client rect instead of double-scaling into a crop.
+        double rasterizationScale = 1.0;
+        if (auto controller3 = mWebViewCtrlr.try_query<ICoreWebView2Controller3>())
+          controller3->get_RasterizationScale(&rasterizationScale);
+        if (rasterizationScale <= 0.0)
+          rasterizationScale = 1.0;
+
         mWebViewBounds = clientRect;
-        zoom *= fx;
+        zoom *= fx / static_cast<float>(rasterizationScale);
         ::WebViewInitLog("SetWebViewBounds:reconciled", S_OK,
-                         "f=%.3f client=%ldx%ld requested=%ldx%ld zoom=%.3f",
-                         fx, clientW, clientH, boundsW, boundsH, zoom);
+                         "f=%.3f rs=%.3f client=%ldx%ld requested=%ldx%ld zoom=%.3f",
+                         fx, rasterizationScale, clientW, clientH, boundsW, boundsH, zoom);
       }
     }
   }
