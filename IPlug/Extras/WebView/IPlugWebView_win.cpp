@@ -993,16 +993,22 @@ void IWebViewImpl::ApplyWebViewBounds()
     // (-2) branches are intentionally not reconciled: FL virtualizes the
     // client rect to logical units, so a mismatch there is expected.
     //
-    // CRITICAL: read the client rect in the PARENT WINDOW'S OWN DPI context.
-    // Ableton 12.4 hosts the plugin window subtree DPI-UNAWARE (that is what
-    // Auto-Scale is: DWM bitmap-stretches the subtree), and a GetClientRect
-    // from a differently-aware calling thread gets DPI-virtualized
-    // coordinates — measured 1500x1000 for a window whose true client (in
-    // the units put_Bounds/SetBoundsAndZoomFactor actually consume) is
-    // 1200x800. Sizing the WebView from the virtualized number makes it
-    // overflow its parent and get clipped. Switching the thread context to
-    // the window's own context for the read returns untranslated units.
-    RECT clientRect = {};
+    // CRITICAL: measure the parent client rect TWICE, in two thread DPI
+    // contexts (probed empirically on Ableton 12.4 / 125%):
+    //  - physicalRect, read under PER_MONITOR_AWARE_V2: physical pixels —
+    //    the units SetBoundsAndZoomFactor actually consumes (the WebView's
+    //    clip window lands at exactly the bounds we pass, in these units).
+    //  - internalRect, read under the parent window's own context: the
+    //    window's internal, possibly DPI-virtualized units.
+    // Ableton's Auto-Scale hosts the plugin window DPI-UNAWARE and lets DWM
+    // stretch it (internal 1200x800 displayed as 1500x1000 physical), while
+    // Chromium's render surface is sized bounds x monitorScale even though
+    // every DPI API in reach lies (GetDpiForWindow says 96, WebView2's
+    // RasterizationScale API reports 1.0). The ratio of the two reads is
+    // the real virtualization scale, measured rather than queried — 1.0 on
+    // every host that doesn't play this game.
+    RECT physicalRect = {};
+    RECT internalRect = {};
     {
       using GetWindowDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(HWND);
       using SetThreadDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
@@ -1017,17 +1023,22 @@ void IWebViewImpl::ApplyWebViewBounds()
 
       if (pGetWindowDpiCtx && pSetThreadDpiCtx)
       {
-        DPI_AWARENESS_CONTEXT prev = pSetThreadDpiCtx(pGetWindowDpiCtx(mParentWnd));
-        GetClientRect(mParentWnd, &clientRect);
+        DPI_AWARENESS_CONTEXT prev = pSetThreadDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        GetClientRect(mParentWnd, &physicalRect);
+        pSetThreadDpiCtx(pGetWindowDpiCtx(mParentWnd));
+        GetClientRect(mParentWnd, &internalRect);
         pSetThreadDpiCtx(prev);
       }
       else
       {
-        GetClientRect(mParentWnd, &clientRect); // pre-1607 Windows: no virtualization APIs, no lie
+        // pre-1607 Windows: no per-window contexts, no virtualization games
+        GetClientRect(mParentWnd, &physicalRect);
+        internalRect = physicalRect;
       }
     }
-    const LONG clientW = clientRect.right - clientRect.left;
-    const LONG clientH = clientRect.bottom - clientRect.top;
+    const LONG clientW = physicalRect.right - physicalRect.left;
+    const LONG clientH = physicalRect.bottom - physicalRect.top;
+    const LONG internalW = internalRect.right - internalRect.left;
     const LONG boundsW = mWebViewBounds.right - mWebViewBounds.left;
     const LONG boundsH = mWebViewBounds.bottom - mWebViewBounds.top;
 
@@ -1041,24 +1052,23 @@ void IWebViewImpl::ApplyWebViewBounds()
 
       if (uniform && nonTrivial && sane)
       {
-        // WebView2 renders CSS pixels at RasterizationScale x ZoomFactor
-        // physical pixels. RasterizationScale tracks the MONITOR scale of
-        // the top-level window (ShouldDetectMonitorScaleChanges defaults to
-        // true), not the parent HWND's DPI context — so on a 125% display it
-        // is typically already 1.25 even though GetDpiForWindow(parent) says
-        // 96. Dividing by it makes the design (w CSS px wide) exactly fill
-        // the reconciled client rect instead of double-scaling into a crop.
-        double rasterizationScale = 1.0;
-        if (auto controller3 = mWebViewCtrlr.try_query<ICoreWebView2Controller3>())
-          controller3->get_RasterizationScale(&rasterizationScale);
-        if (rasterizationScale <= 0.0)
-          rasterizationScale = 1.0;
+        float monitorScale = (internalW > 0) ? static_cast<float>(clientW) / static_cast<float>(internalW) : 1.f;
+        if (!(monitorScale > 0.5f && monitorScale < 4.f))
+          monitorScale = 1.f;
 
-        mWebViewBounds = clientRect;
-        zoom *= fx / static_cast<float>(rasterizationScale);
+        // Fill the parent's physical client rect, and counter Chromium's
+        // hidden monitorScale rasterization so the design ends up displayed
+        // edge-to-edge: effective on-screen CSS pixel = monitorScale x zoom,
+        // so zoom = f / monitorScale makes design x cssScale x monitorScale
+        // x zoom == physical client. On Ableton 12.4 @125% that is
+        // 1.249 / 1.25 ~= 1.0; verified against three observed states
+        // (margins, overzoomed crop, and a hand-corrected perfect render).
+        mWebViewBounds = physicalRect;
+        zoom *= fx / monitorScale;
         ::WebViewInitLog("SetWebViewBounds:reconciled", S_OK,
-                         "f=%.3f rs=%.3f client=%ldx%ld requested=%ldx%ld zoom=%.3f",
-                         fx, rasterizationScale, clientW, clientH, boundsW, boundsH, zoom);
+                         "f=%.3f monitorScale=%.3f clientPhys=%ldx%ld internal=%ldx%ld requested=%ldx%ld zoom=%.3f",
+                         fx, monitorScale, clientW, clientH, internalW,
+                         internalRect.bottom - internalRect.top, boundsW, boundsH, zoom);
       }
     }
   }
