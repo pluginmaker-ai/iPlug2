@@ -160,6 +160,7 @@ private:
   EventRegistrationToken mStateChangedToken;
   bool mShowOnLoad = true;
   WDL_String mWebRoot;
+  WDL_String mVirtualHost; // per-instance WebView2 virtual host (see LoadFile); avoids same-host mapping collisions across instances
   RECT mWebViewBounds;
 };
 
@@ -542,11 +543,23 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
             mCoreWebView->add_NavigationCompleted(
               Callback<ICoreWebView2NavigationCompletedEventHandler>(
                 [this](ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
-                  BOOL success;
+                  BOOL success = FALSE;
                   args->get_IsSuccess(&success);
                   if (success)
                   {
+                    ::WebViewInitLog("NavigationCompleted:ok", S_OK, nullptr);
                     mIWebView->OnWebContentLoaded();
+                  }
+                  else
+                  {
+                    // The smoking gun for the virtual-host no-op: if the mapping
+                    // silently didn't attach, the Navigate escaped to real DNS and
+                    // lands here with HostNameResolved / ConnectionAborted -- the
+                    // failure that previously showed the user the Edge error page.
+                    COREWEBVIEW2_WEB_ERROR_STATUS webErrorStatus = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                    args->get_WebErrorStatus(&webErrorStatus);
+                    ::WebViewInitLog("NavigationCompleted:failed", E_FAIL,
+                                     "webErrorStatus=%d (COREWEBVIEW2_WEB_ERROR_STATUS)", (int) webErrorStatus);
                   }
                   return S_OK;
                 })
@@ -705,6 +718,19 @@ void IWebViewImpl::CloseWebView()
 
   if (mWebViewCtrlr.get() != nullptr)
   {
+    // Clear our per-instance virtual-host mapping so registrations don't leak
+    // across editor open/close cycles within the shared browser process.
+    if (mCoreWebView && mVirtualHost.GetLength() > 0)
+    {
+      if (auto webView3 = mCoreWebView.try_query<ICoreWebView2_3>())
+      {
+        int vhostLen = UTF8ToUTF16Len(mVirtualHost.Get());
+        std::vector<WCHAR> vhostWide(vhostLen);
+        UTF8ToUTF16(vhostWide.data(), mVirtualHost.Get(), vhostLen);
+        webView3->ClearVirtualHostNameToFolderMapping(vhostWide.data());
+      }
+    }
+
     mWebViewCtrlr->Close();
     mWebViewCtrlr = nullptr;
     mCoreWebView = nullptr;
@@ -764,47 +790,88 @@ void IWebViewImpl::LoadFile(const char* fileName, const char* bundleID)
     return;
   }
 
+  // Per-instance virtual host. Every iPlug2 WebView plugin used to map the
+  // SAME host ("iplug.example"); with ExclusiveUserDataFolderAccess(FALSE)
+  // multiple WebViews share one browser process, and Microsoft documents
+  // inconsistent same-host mappings across WebViews as undefined behavior.
+  // In practice SetVirtualHostNameToFolderMapping then returns S_OK but the
+  // resource filter silently never attaches, so Navigate escapes to real DNS
+  // (the ERR_NAME_NOT_RESOLVED symptom). A host unique to this instance can
+  // never collide, no matter how many other WebView plugins are loaded.
+  if (mVirtualHost.GetLength() == 0)
+    mVirtualHost.SetFormatted(64, "iplug-%p.example", (void*) this);
+
+  WDL_String webFolder{fileName};
+  webFolder.remove_filepart();
+  mWebRoot.Set(webFolder.Get());
+
+  bool mappingOk = false;
+
   wil::com_ptr<ICoreWebView2_3> webView3 = mCoreWebView.try_query<ICoreWebView2_3>();
   if (!webView3)
   {
-    // ICoreWebView2_3 has shipped in every WebView2 Runtime since ~2021;
-    // a missing interface here means the runtime is severely out of date,
-    // which would also affect any other modern WebView2 plugin on the
-    // machine. Log explicitly so the customer's runtime version becomes
-    // a triage signal instead of an invisible silent skip.
+    // ICoreWebView2_3 has shipped in every WebView2 Runtime since ~2021; a
+    // missing interface means the runtime is severely out of date, which
+    // would also affect any other modern WebView2 plugin on the machine.
     ::WebViewInitLog("LoadFile:no_ICoreWebView2_3", E_NOINTERFACE,
-                     "try_query<ICoreWebView2_3> returned null — WebView2 Runtime too old?");
+                     "try_query<ICoreWebView2_3> returned null -- WebView2 Runtime too old?");
   }
   else
   {
-    WDL_String webFolder{fileName};
-    webFolder.remove_filepart();
-    int bufSize = UTF8ToUTF16Len(webFolder.Get());
-    std::vector<WCHAR> webFolderWide(bufSize);
-    UTF8ToUTF16(webFolderWide.data(), webFolder.Get(), bufSize);
+    int folderLen = UTF8ToUTF16Len(webFolder.Get());
+    std::vector<WCHAR> webFolderWide(folderLen);
+    UTF8ToUTF16(webFolderWide.data(), webFolder.Get(), folderLen);
 
-    // Capture the HRESULT. A failure here is the most likely actual cause
-    // of "Navigate falls through to DNS" on a customer machine where env
-    // + controller succeeded but the virtual-host filter never attached.
+    int vhostLen = UTF8ToUTF16Len(mVirtualHost.Get());
+    std::vector<WCHAR> vhostWide(vhostLen);
+    UTF8ToUTF16(vhostWide.data(), mVirtualHost.Get(), vhostLen);
+
     HRESULT mapHr = webView3->SetVirtualHostNameToFolderMapping(
-      L"iplug.example", webFolderWide.data(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
+      vhostWide.data(), webFolderWide.data(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
     if (FAILED(mapHr))
     {
       ::WebViewInitLog("LoadFile:SetVirtualHostNameToFolderMapping_failed", mapHr,
-                       "webFolder='%s'", webFolder.Get());
+                       "vhost='%s' webFolder='%s'", mVirtualHost.Get(), webFolder.Get());
+    }
+    else
+    {
+      // Log the success path too, so a clean mapping is positively recorded
+      // instead of being the (previously ambiguous) absence of a failure line.
+      mappingOk = true;
+      ::WebViewInitLog("LoadFile:mapping_ok", S_OK,
+                       "vhost='%s' webFolder='%s'", mVirtualHost.Get(), webFolder.Get());
     }
   }
 
-  WDL_String baseName{fileName};
-  WDL_String root{fileName};
-  root.remove_filepart();
-  mWebRoot.Set(root.Get());
+  // Fail closed. If the mapping was not established, navigating to the vhost
+  // URL would escape to real DNS and show the user the Edge "can't reach this
+  // page" error. Show an inline error page instead -- no network, no asset
+  // refs -- naming the diagnostic log so a stuck customer can send it.
+  if (!mappingOk)
+  {
+    ::WebViewInitLog("LoadFile:fail_closed_inline_error", E_FAIL,
+                     "mapping not established; showing inline error instead of navigating");
+    LoadHTML(
+      "<!doctype html><meta charset=\"utf-8\">"
+      "<style>html,body{height:100%;margin:0}"
+      "body{background:#1e1e1e;color:#e2e8f0;font:13px/1.6 system-ui,sans-serif;"
+      "display:flex;align-items:center;justify-content:center}"
+      "div{max-width:34em;padding:2em;text-align:center}"
+      "code{color:#9ca3af;font-size:12px}</style>"
+      "<div><h2>Plugin UI could not start</h2>"
+      "<p>The embedded view could not be initialized on this machine.</p>"
+      "<p>Diagnostic log:<br><code>%LOCALAPPDATA%\\iPlug2\\Logs\\webview-init-&lt;pid&gt;.log</code></p>"
+      "</div>");
+    return;
+  }
 
+  // Mapping established -- safe to navigate to the per-instance virtual host.
+  WDL_String baseName{fileName};
   WDL_String fullStr;
-  fullStr.SetFormatted(2048, "https://iplug.example/%s", baseName.get_filepart());
-  int bufSize = UTF8ToUTF16Len(fullStr.Get());
-  std::vector<WCHAR> fileUrlWide(bufSize);
-  UTF8ToUTF16(fileUrlWide.data(), fullStr.Get(), bufSize);
+  fullStr.SetFormatted(2048, "https://%s/%s", mVirtualHost.Get(), baseName.get_filepart());
+  int urlLen = UTF8ToUTF16Len(fullStr.Get());
+  std::vector<WCHAR> fileUrlWide(urlLen);
+  UTF8ToUTF16(fileUrlWide.data(), fullStr.Get(), urlLen);
   mCoreWebView->Navigate(fileUrlWide.data());
 }
 
