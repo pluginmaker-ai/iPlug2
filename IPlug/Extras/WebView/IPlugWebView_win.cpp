@@ -37,6 +37,7 @@
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
+#include <cmath>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib") // SHCreateDirectoryExW
@@ -136,6 +137,7 @@ private:
   static LRESULT CALLBACK AspectRatioSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
   void InstallAspectRatioHook(int designWidth, int designHeight);
   void RemoveAspectRatioHook();
+  void ApplyWebViewBounds();
 public:
   void SetMinSize(int minW, int minH) { mMinWidth = minW; mMinHeight = minH; }
 private:
@@ -161,7 +163,16 @@ private:
   bool mShowOnLoad = true;
   WDL_String mWebRoot;
   WDL_String mVirtualHost; // per-instance WebView2 virtual host (see LoadFile); avoids same-host mapping collisions across instances
-  RECT mWebViewBounds;
+  RECT mWebViewBounds = {};
+  // Last size request from SetWebViewBounds, replayed by the async
+  // controller-creation callback so the initial bounds are computed against
+  // the host window as it exists then, not as it was at request time.
+  float mLastBoundsX = 0.f;
+  float mLastBoundsY = 0.f;
+  float mLastBoundsW = 0.f;
+  float mLastBoundsH = 0.f;
+  float mLastBoundsScale = 1.f;
+  bool mHasLastBounds = false;
 };
 
 END_IPLUG_NAMESPACE
@@ -699,7 +710,14 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
               controller2->put_DefaultBackgroundColor(color);
             }
 
-            mWebViewCtrlr->put_Bounds(mWebViewBounds);
+            // Replay the latest size request now that the controller exists.
+            // The host may have (re)sized the parent window during the async
+            // controller creation, so recompute against the live client rect
+            // instead of pushing the possibly-stale mWebViewBounds.
+            if (mHasLastBounds)
+              ApplyWebViewBounds();
+            else
+              mWebViewCtrlr->put_Bounds(mWebViewBounds);
             ::WebViewInitLog("controller:OnWebViewReady_fire", S_OK, nullptr);
             mIWebView->OnWebViewReady();
             return S_OK;
@@ -918,76 +936,95 @@ void IWebViewImpl::EnableInteraction(bool enable)
 
 void IWebViewImpl::SetWebViewBounds(float x, float y, float w, float h, float scale)
 {
+  mLastBoundsX = x;
+  mLastBoundsY = y;
+  mLastBoundsW = w;
+  mLastBoundsH = h;
+  mLastBoundsScale = scale;
+  mHasLastBounds = true;
+
+  ApplyWebViewBounds();
+}
+
+void IWebViewImpl::ApplyWebViewBounds()
+{
+  const float x = mLastBoundsX;
+  const float y = mLastBoundsY;
+  const float w = mLastBoundsW;
+  const float h = mLastBoundsH;
+  const float scale = mLastBoundsScale;
+
   float dpiScale = GetScaleForHWND(mParentWnd);
   if (dpiScale <= 0.f) dpiScale = 1.f;
   mWebViewBounds = GetScaledRect(x, y, w, h, dpiScale);
 
+  if (!mWebViewCtrlr)
+    return;
+
+  // scale == -1: FL Studio — zoom = 1/dpiScale, normal DPI bounds
+  // scale == -2: Cubase — zoom = 1.0, skip DPI bounds (host sends physical pixels)
+  // scale >= 0: Ableton/default — pass through, then reconcile below
+  float zoom = 1.f;
+  if (scale == -1.f)
   {
-    FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
-    if (f) {
-      SYSTEMTIME st; GetLocalTime(&st);
-      fprintf(f, "[%02d:%02d:%02d.%03d][SetWebViewBounds] w=%.0f h=%.0f scale=%.2f dpiScale=%.2f rect=%ldx%ld\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        w, h, scale, dpiScale,
-        mWebViewBounds.right - mWebViewBounds.left, mWebViewBounds.bottom - mWebViewBounds.top);
-      fflush(f); fclose(f);
-    }
+    zoom = 1.f / dpiScale;
   }
-
-  if (mWebViewCtrlr)
+  else if (scale == -2.f)
   {
-    // scale == -1: FL Studio — zoom = 1/dpiScale, normal DPI bounds
-    // scale == -2: Cubase — zoom = 1.0, skip DPI bounds (host sends physical pixels)
-    // scale >= 0: Ableton/default — pass through as-is
-    float zoom = 1.f;
-    if (scale == -1.f)
-    {
-      zoom = 1.f / dpiScale;
-    }
-    else if (scale == -2.f)
-    {
-      mWebViewBounds = GetScaledRect(x, y, w, h, 1.f);
-      zoom = 1.f;
-    }
-    else
-    {
-      zoom = scale;
-    }
-    mWebViewCtrlr->SetBoundsAndZoomFactor(mWebViewBounds, zoom);
+    mWebViewBounds = GetScaledRect(x, y, w, h, 1.f);
+    zoom = 1.f;
+  }
+  else
+  {
+    zoom = scale;
 
-    // Log actual HWND client rect vs our WebView bounds
-    RECT clientRect;
+    // Reconcile against the parent's actual client rect. Ableton 12.4's
+    // "Auto-Scale Plug-In Window" (ON by default) sizes the plugin window to
+    // displayScale * the logical size it reports via onSize, while
+    // GetDpiForWindow on the parent still reports 96 — so every input above
+    // says 1.0 and the WebView fills only the top-left of the window (white
+    // right/bottom margins). The client rect is the only ground truth, so
+    // when it disagrees with our computed bounds by a UNIFORM factor, size
+    // the WebView to the real window and fold the factor into the WebView2
+    // zoom (crisp CSS-pixel re-raster, not a bitmap stretch). Hosts whose
+    // client rect matches the logical size (older Ableton, Auto-Scale OFF,
+    // 100% scaling, Reaper, Bitwig, ...) measure factor ~1.0 and skip this
+    // block entirely — behavior identical to before. The FL (-1) and Cubase
+    // (-2) branches are intentionally not reconciled: FL virtualizes the
+    // client rect to logical units, so a mismatch there is expected.
+    RECT clientRect = {};
     GetClientRect(mParentWnd, &clientRect);
-    {
-      FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
-      if (f) {
-        SYSTEMTIME st; GetLocalTime(&st);
-        fprintf(f, "[%02d:%02d:%02d.%03d][HWNDvsWV] hwndClient=%ldx%ld webviewRect=%ldx%ld zoom=%.3f dpi=%.2f\n",
-          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-          clientRect.right - clientRect.left, clientRect.bottom - clientRect.top,
-          mWebViewBounds.right - mWebViewBounds.left, mWebViewBounds.bottom - mWebViewBounds.top,
-          zoom, dpiScale);
-        fflush(f); fclose(f);
-      }
-    }
+    const LONG clientW = clientRect.right - clientRect.left;
+    const LONG clientH = clientRect.bottom - clientRect.top;
+    const LONG boundsW = mWebViewBounds.right - mWebViewBounds.left;
+    const LONG boundsH = mWebViewBounds.bottom - mWebViewBounds.top;
 
-    // Log the actual zoom applied and what WebView2 reports back
-    double actualZoom = 0;
-    mWebViewCtrlr->get_ZoomFactor(&actualZoom);
-    RECT actualBounds;
-    mWebViewCtrlr->get_Bounds(&actualBounds);
+    if (x == 0.f && y == 0.f && clientW > 0 && clientH > 0 && boundsW > 0 && boundsH > 0)
     {
-      FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
-      if (f) {
-        SYSTEMTIME st; GetLocalTime(&st);
-        fprintf(f, "[%02d:%02d:%02d.%03d][WebView2State] requestedZoom=%.3f actualZoom=%.3f actualBounds=%ldx%ld\n",
-          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-          zoom, actualZoom,
-          actualBounds.right - actualBounds.left, actualBounds.bottom - actualBounds.top);
-        fflush(f); fclose(f);
+      const float fx = static_cast<float>(clientW) / static_cast<float>(boundsW);
+      const float fy = static_cast<float>(clientH) / static_cast<float>(boundsH);
+      const bool uniform = std::fabs(fx - fy) < 0.02f; // a scale, not an unrelated relayout
+      const bool nonTrivial = std::fabs(fx - 1.f) > 0.05f; // ignore the +1 slop in GetScaledRect
+      const bool sane = fx > 0.5f && fx < 4.f; // plausible display-scale range
+
+      if (uniform && nonTrivial && sane)
+      {
+        mWebViewBounds = clientRect;
+        zoom *= fx;
+        ::WebViewInitLog("SetWebViewBounds:reconciled", S_OK,
+                         "f=%.3f client=%ldx%ld requested=%ldx%ld zoom=%.3f",
+                         fx, clientW, clientH, boundsW, boundsH, zoom);
       }
     }
   }
+
+  mWebViewCtrlr->SetBoundsAndZoomFactor(mWebViewBounds, zoom);
+
+  ::WebViewInitLog("SetWebViewBounds:applied", S_OK,
+                   "w=%.0f h=%.0f scale=%.2f dpiScale=%.2f rect=%ldx%ld zoom=%.3f",
+                   w, h, scale, dpiScale,
+                   mWebViewBounds.right - mWebViewBounds.left,
+                   mWebViewBounds.bottom - mWebViewBounds.top, zoom);
 }
 
 void IWebViewImpl::GetLocalDownloadPathForFile(const char* fileName, WDL_String& downloadPath)
