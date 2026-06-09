@@ -992,8 +992,40 @@ void IWebViewImpl::ApplyWebViewBounds()
     // block entirely — behavior identical to before. The FL (-1) and Cubase
     // (-2) branches are intentionally not reconciled: FL virtualizes the
     // client rect to logical units, so a mismatch there is expected.
+    //
+    // CRITICAL: read the client rect in the PARENT WINDOW'S OWN DPI context.
+    // Ableton 12.4 hosts the plugin window subtree DPI-UNAWARE (that is what
+    // Auto-Scale is: DWM bitmap-stretches the subtree), and a GetClientRect
+    // from a differently-aware calling thread gets DPI-virtualized
+    // coordinates — measured 1500x1000 for a window whose true client (in
+    // the units put_Bounds/SetBoundsAndZoomFactor actually consume) is
+    // 1200x800. Sizing the WebView from the virtualized number makes it
+    // overflow its parent and get clipped. Switching the thread context to
+    // the window's own context for the read returns untranslated units.
     RECT clientRect = {};
-    GetClientRect(mParentWnd, &clientRect);
+    {
+      using GetWindowDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(HWND);
+      using SetThreadDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+      static GetWindowDpiCtxFn pGetWindowDpiCtx = []() {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        return user32 ? reinterpret_cast<GetWindowDpiCtxFn>(GetProcAddress(user32, "GetWindowDpiAwarenessContext")) : nullptr;
+      }();
+      static SetThreadDpiCtxFn pSetThreadDpiCtx = []() {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        return user32 ? reinterpret_cast<SetThreadDpiCtxFn>(GetProcAddress(user32, "SetThreadDpiAwarenessContext")) : nullptr;
+      }();
+
+      if (pGetWindowDpiCtx && pSetThreadDpiCtx)
+      {
+        DPI_AWARENESS_CONTEXT prev = pSetThreadDpiCtx(pGetWindowDpiCtx(mParentWnd));
+        GetClientRect(mParentWnd, &clientRect);
+        pSetThreadDpiCtx(prev);
+      }
+      else
+      {
+        GetClientRect(mParentWnd, &clientRect); // pre-1607 Windows: no virtualization APIs, no lie
+      }
+    }
     const LONG clientW = clientRect.right - clientRect.left;
     const LONG clientH = clientRect.bottom - clientRect.top;
     const LONG boundsW = mWebViewBounds.right - mWebViewBounds.left;
