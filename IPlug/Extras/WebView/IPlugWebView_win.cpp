@@ -35,8 +35,62 @@
 #include <shlobj.h>
 #include <commctrl.h>
 #include <cassert>
+#include <cstdarg>
+#include <cstdio>
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shell32.lib") // SHCreateDirectoryExW
+
+namespace
+{
+// WebView2 init diagnostic log — one file per host process, append mode,
+// best-effort (never throws, never blocks the audio thread). Lives at
+// %LOCALAPPDATA%\iPlug2\Logs\webview-init-<pid>.log. We open and close
+// per write so multiple controllers in the same host don't fight a
+// shared FILE handle and so a crash mid-init doesn't lose buffered
+// lines. Format is one self-contained line per event so a customer can
+// just zip the directory and send it.
+//
+// Why a custom log instead of OutputDebugString / iPlug2's DBGMSG:
+// release-build customers don't have a debugger attached and DBGMSG is
+// invisible to them. A real file on disk is the only thing they can
+// screenshot or send.
+void WebViewInitLog(const char* event, HRESULT hr, const char* detailFmt = nullptr, ...)
+{
+  WCHAR localAppData[MAX_PATH] = {};
+  if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppData)))
+    return;
+
+  WCHAR logDir[MAX_PATH] = {};
+  swprintf_s(logDir, L"%s\\iPlug2\\Logs", localAppData);
+  // Best-effort: ignore errors. If the dir can't be created we'll just
+  // fail to write below — diagnostic log is never load-bearing.
+  SHCreateDirectoryExW(nullptr, logDir, nullptr);
+
+  WCHAR logPath[MAX_PATH] = {};
+  swprintf_s(logPath, L"%s\\webview-init-%lu.log", logDir, GetCurrentProcessId());
+
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, logPath, L"a") != 0 || !f) return;
+
+  SYSTEMTIME st; GetLocalTime(&st);
+  fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] [pid=%lu] event=%s hr=0x%08lX",
+          st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+          GetCurrentProcessId(), event ? event : "(null)", static_cast<unsigned long>(hr));
+
+  if (detailFmt && *detailFmt)
+  {
+    fprintf(f, " detail=\"");
+    va_list args;
+    va_start(args, detailFmt);
+    vfprintf(f, detailFmt, args);
+    va_end(args);
+    fprintf(f, "\"");
+  }
+  fputc('\n', f);
+  fclose(f);
+}
+} // anonymous namespace
 
 #include <wrl.h>
 #include <wil/com.h>
@@ -316,6 +370,22 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
   std::vector<WCHAR> cachePathWide(bufSize);
   UTF8ToUTF16(cachePathWide.data(), cachePath.Get(), IPLUG_WIN_MAX_WIDE_PATH);
 
+  // Pre-create the UDF parent path. WebView2 will create it itself on
+  // most configurations, but on machines with restrictive AV / EDR or
+  // weird ACL inheritance the silent failure surfaces upstream as a
+  // blank WebView. Doing it ourselves with a documented Windows API
+  // gives us a logged GetLastError if the create step is where things
+  // fall over. SHCreateDirectoryExW handles intermediate path creation
+  // and returns ERROR_ALREADY_EXISTS as a non-error.
+  {
+    int rc = SHCreateDirectoryExW(nullptr, cachePathWide.data(), nullptr);
+    if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && rc != ERROR_FILE_EXISTS)
+    {
+      ::WebViewInitLog("OpenWebView:SHCreateDirectoryEx_failed", HRESULT_FROM_WIN32(rc),
+                       "cachePath='%s' GetLastError=%lu", cachePath.Get(), GetLastError());
+    }
+  }
+
   auto options = Make<CoreWebView2EnvironmentOptions>();
   options->put_AllowSingleSignOnUsingOSPrimaryAccount(FALSE);
   options->put_ExclusiveUserDataFolderAccess(FALSE);
@@ -323,24 +393,44 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
   options->put_IsCustomCrashReportingEnabled(FALSE);
   options->put_AdditionalBrowserArguments(L"--disable-gpu");
 
+  ::WebViewInitLog("OpenWebView:start", S_OK,
+                   "cachePath='%s' parentHwnd=%p", cachePath.Get(), (void*)mParentWnd);
+
   CreateCoreWebView2EnvironmentWithOptions(
     nullptr, cachePathWide.data(), options.Get(),
     Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>([&](
                                                                            HRESULT result,
                                                                            ICoreWebView2Environment* env) -> HRESULT {
+      // Null-check env BEFORE dereferencing. If env-creation actually
+      // failed (env is null), the previous code path-faulted on the
+      // CreateCoreWebView2Controller call below — a latent crash bug.
+      // Surface the HRESULT to the log either way so we know whether
+      // env creation is where things fall over on a customer machine.
+      if (FAILED(result) || env == nullptr)
+      {
+        ::WebViewInitLog("env:create_failed", result, "env=%p", (void*)env);
+        return result;
+      }
+      ::WebViewInitLog("env:create_ok", result, nullptr);
+
       mWebViewEnvironment = env;
 
       mWebViewEnvironment->CreateCoreWebView2Controller(
         mParentWnd,
           Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>([&](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
-            if (controller != nullptr)
+            if (FAILED(result) || controller == nullptr)
             {
-              mWebViewCtrlr = controller;
-              mWebViewCtrlr->get_CoreWebView2(&mCoreWebView);
+              ::WebViewInitLog("controller:create_failed", result, "controller=%p", (void*)controller);
+              return result;
             }
-            
+            ::WebViewInitLog("controller:create_ok", result, nullptr);
+
+            mWebViewCtrlr = controller;
+            mWebViewCtrlr->get_CoreWebView2(&mCoreWebView);
+
             if (mCoreWebView == nullptr)
             {
+              ::WebViewInitLog("controller:get_CoreWebView2_null", E_POINTER, nullptr);
               return S_OK;
             }
 
@@ -597,6 +687,7 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
             }
 
             mWebViewCtrlr->put_Bounds(mWebViewBounds);
+            ::WebViewInitLog("controller:OnWebViewReady_fire", S_OK, nullptr);
             mIWebView->OnWebViewReady();
             return S_OK;
           })
@@ -659,44 +750,62 @@ void IWebViewImpl::LoadURL(const char* url)
 
 void IWebViewImpl::LoadFile(const char* fileName, const char* bundleID)
 {
+  // Diagnose-first instrumentation. If LoadFile fires while mCoreWebView
+  // is still null (race against the async controller-creation callback),
+  // the virtual-host mapping for iplug.example is never registered and
+  // the subsequent Navigate falls through to real DNS (the
+  // ERR_NAME_NOT_RESOLVED symptom). Surface that explicitly so the next
+  // stuck-customer log tells us if this is the race we suspect.
+  if (!mCoreWebView)
   {
-    FILE* f = fopen("C:\\temp\\iplug-resize.log", "a");
-    if (f) {
-      SYSTEMTIME st; GetLocalTime(&st);
-      fprintf(f, "[%02d:%02d:%02d.%03d][LoadFile] fileName='%s' bundleID='%s' mCoreWebView=%p\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        fileName ? fileName : "(null)", bundleID ? bundleID : "(null)", (void*)mCoreWebView.get());
-      fflush(f); fclose(f);
-    }
+    ::WebViewInitLog("LoadFile:skipped", S_FALSE,
+                     "mCoreWebView=null at LoadFile call — race with controller-creation callback. fileName='%s'",
+                     fileName ? fileName : "(null)");
+    return;
   }
-  if (mCoreWebView)
+
+  wil::com_ptr<ICoreWebView2_3> webView3 = mCoreWebView.try_query<ICoreWebView2_3>();
+  if (!webView3)
   {
-    wil::com_ptr<ICoreWebView2_3> webView3 = mCoreWebView.try_query<ICoreWebView2_3>();
-    if (webView3)
+    // ICoreWebView2_3 has shipped in every WebView2 Runtime since ~2021;
+    // a missing interface here means the runtime is severely out of date,
+    // which would also affect any other modern WebView2 plugin on the
+    // machine. Log explicitly so the customer's runtime version becomes
+    // a triage signal instead of an invisible silent skip.
+    ::WebViewInitLog("LoadFile:no_ICoreWebView2_3", E_NOINTERFACE,
+                     "try_query<ICoreWebView2_3> returned null — WebView2 Runtime too old?");
+  }
+  else
+  {
+    WDL_String webFolder{fileName};
+    webFolder.remove_filepart();
+    int bufSize = UTF8ToUTF16Len(webFolder.Get());
+    std::vector<WCHAR> webFolderWide(bufSize);
+    UTF8ToUTF16(webFolderWide.data(), webFolder.Get(), bufSize);
+
+    // Capture the HRESULT. A failure here is the most likely actual cause
+    // of "Navigate falls through to DNS" on a customer machine where env
+    // + controller succeeded but the virtual-host filter never attached.
+    HRESULT mapHr = webView3->SetVirtualHostNameToFolderMapping(
+      L"iplug.example", webFolderWide.data(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
+    if (FAILED(mapHr))
     {
-      WDL_String webFolder{fileName};
-      webFolder.remove_filepart();
-      int bufSize = UTF8ToUTF16Len(webFolder.Get());
-      std::vector<WCHAR> webFolderWide(bufSize);
-      UTF8ToUTF16(webFolderWide.data(), webFolder.Get(), bufSize);
-
-      webView3->SetVirtualHostNameToFolderMapping(
-        L"iplug.example", webFolderWide.data(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
+      ::WebViewInitLog("LoadFile:SetVirtualHostNameToFolderMapping_failed", mapHr,
+                       "webFolder='%s'", webFolder.Get());
     }
-
-    WDL_String baseName{fileName};
-    WDL_String root{fileName};
-    root.remove_filepart();
-    mWebRoot.Set(root.Get());
-
-    WDL_String fullStr;
-    fullStr.SetFormatted(2048, "https://iplug.example/%s", baseName.get_filepart());
-    // fullStr.SetFormatted(2048, useCustomUrlScheme ? "iplug://%s" : "file://%s", fileName);
-    int bufSize = UTF8ToUTF16Len(fullStr.Get());
-    std::vector<WCHAR> fileUrlWide(bufSize);
-    UTF8ToUTF16(fileUrlWide.data(), fullStr.Get(), bufSize);
-    mCoreWebView->Navigate(fileUrlWide.data());
   }
+
+  WDL_String baseName{fileName};
+  WDL_String root{fileName};
+  root.remove_filepart();
+  mWebRoot.Set(root.Get());
+
+  WDL_String fullStr;
+  fullStr.SetFormatted(2048, "https://iplug.example/%s", baseName.get_filepart());
+  int bufSize = UTF8ToUTF16Len(fullStr.Get());
+  std::vector<WCHAR> fileUrlWide(bufSize);
+  UTF8ToUTF16(fileUrlWide.data(), fullStr.Get(), bufSize);
+  mCoreWebView->Navigate(fileUrlWide.data());
 }
 
 

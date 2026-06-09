@@ -121,8 +121,17 @@ void INIPath(WDL_String& path, const char * pluginName)
 
 void WebViewCachePath(WDL_String& path)
 {
-  GetKnownFolder(path, CSIDL_APPDATA);
-  path.Append("\\iPlug2\\WebViewCache"); // tmp
+  // CSIDL_LOCAL_APPDATA, not CSIDL_APPDATA. WebView2 holds long-lived
+  // file locks on the User Data Folder (cache, cookies, IndexedDB,
+  // network state). Putting the UDF under Roaming AppData makes those
+  // locks fight enterprise sync agents (OneDrive Files-On-Demand,
+  // Folder Redirection, AD roaming profiles), which can either delay
+  // env creation or fail it outright with a Permission Denied that
+  // surfaces upstream as a blank WebView. Every other path helper in
+  // this file already uses CSIDL_LOCAL_APPDATA; this one was the
+  // outlier (the previous "// tmp" comment flagged it as such).
+  GetKnownFolder(path, CSIDL_LOCAL_APPDATA);
+  path.Append("\\iPlug2\\WebViewCache");
 }
 
 struct WinResourceSearch
