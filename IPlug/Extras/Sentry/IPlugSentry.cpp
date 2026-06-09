@@ -27,6 +27,15 @@
   #include "IPlugSentryPendingDump.h"
   #include "IPlugSentryWatchdog.h"
 
+  // White-label brand identity. Written by the alexh build pipeline's
+  // applyPluginNetOverlay step into the per-build tempDir's shared/
+  // dir (only when a brand context is set). Guarded by __has_include so
+  // standard consumer builds — which never get a BrandConfig.h written —
+  // compile unchanged and VendorDirName() returns the default literal.
+  #if __has_include("shared/BrandConfig.h")
+    #include "shared/BrandConfig.h"
+  #endif
+
   // Forward decl of the probe-seam anchor — implemented in
   // IPlugSentryProbeSeam.cpp. Called once from Init() to force the static
   // archive to pull that TU's strong override of
