@@ -61,6 +61,24 @@ namespace
   constexpr size_t kMaxSentinelBytes = 4096;
   constexpr int kSentinelVersion = 1;
 
+  // The on-disk directory under <appData> that holds the per-product
+  // telemetry consent sentinel + sentry-db. Default is the vendor name
+  // ("PluginMaker"), shared across the consumer installer and every
+  // consumer-pipeline-built plugin. White-label builds override this via
+  // the PM_BRAND_PRODUCT_NAME compile define (emitted by the alexh
+  // faust-cpp step from PluginOptions.brandProductName) so each brand's
+  // plugins read + write under their own brand-scoped directory —
+  // keeping each brand's GDPR Article 4(11) controller consent isolated
+  // from every other brand's.
+  inline const char* VendorDirName()
+  {
+  #if defined(PM_BRAND_PRODUCT_NAME)
+    return PM_BRAND_PRODUCT_NAME;
+  #else
+    return "PluginMaker";
+  #endif
+  }
+
   std::string SentinelPath()
   {
   #if defined(_WIN32)
@@ -71,13 +89,17 @@ namespace
     WideCharToMultiByte(CP_UTF8, 0, appData, -1, buf, MAX_PATH, nullptr, nullptr);
     CoTaskMemFree(appData);
     std::string path(buf);
-    path += "\\PluginMaker\\telemetry_consent.json";
+    path += "\\";
+    path += VendorDirName();
+    path += "\\telemetry_consent.json";
     return path;
   #elif defined(__APPLE__)
     const char* home = std::getenv("HOME");
     if (!home || !*home) return "";
     std::string path(home);
-    path += "/Library/Application Support/PluginMaker/telemetry_consent.json";
+    path += "/Library/Application Support/";
+    path += VendorDirName();
+    path += "/telemetry_consent.json";
     return path;
   #else
     return "";
@@ -302,14 +324,18 @@ namespace
     WideCharToMultiByte(CP_UTF8, 0, localAppData, -1, buf, MAX_PATH, nullptr, nullptr);
     CoTaskMemFree(localAppData);
     std::string path(buf);
-    path += "\\PluginMaker\\sentry-db\\";
+    path += "\\";
+    path += VendorDirName();
+    path += "\\sentry-db\\";
     path += pluginId ? pluginId : "unknown";
     return path;
   #elif defined(__APPLE__)
     const char* home = std::getenv("HOME");
     if (!home || !*home) return "";
     std::string path(home);
-    path += "/Library/Application Support/PluginMaker/sentry-db/";
+    path += "/Library/Application Support/";
+    path += VendorDirName();
+    path += "/sentry-db/";
     path += pluginId ? pluginId : "unknown";
     return path;
   #else
