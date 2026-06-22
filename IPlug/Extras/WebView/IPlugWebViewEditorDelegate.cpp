@@ -147,42 +147,110 @@ bool WebViewEditorDelegate::OnKeyDown(const IKeyPress& key)
   #ifdef OS_WIN
   if (key.VK == VK_SPACE)
   {
-    // Forward spacebar to the DAW so transport (play/stop) still works while the
-    // WebView is focused. CRITICAL: post to the host's TOP-LEVEL window (GA_ROOT),
-    // never to mView. mView is the WebView's own parent HWND, so a synthetic key
-    // sent there is routed back into the focused WebView, whose injected JS
-    // re-reports it via SKPFUI -> OnKeyDown -> here = an infinite key-echo loop
-    // that hangs the host UI thread (Windows-only; macOS bubbles via the responder
-    // chain and cannot loop). GA_ROOT reaches the DAW's own WndProc instead, which
-    // cannot re-enter the WebView. The short time-guard is belt-and-suspenders
-    // against any host that reflects the synthetic key back to its focused child.
-    const unsigned int nowMs = (unsigned int) GetTickCount();
-    if (nowMs - mLastSpaceForwardMs >= 60)
-    {
-      mLastSpaceForwardMs = nowMs;
-      HWND root = GetAncestor((HWND) mView, GA_ROOT);
-      if (root)
-      {
-        // 1) Send a media-key APPCOMMAND. This is the standard Windows
-        //    mechanism for telling the foreground app to play/pause
-        //    (what hardware media keys, Spotify keyboards, and
-        //    presentation remotes send). Many DAWs (Reaper, Cubase,
-        //    Studio One) handle WM_APPCOMMAND for transport even when
-        //    they ignore a synthetic WM_KEYDOWN reaching a non-focused
-        //    window. Hosts that don't handle it just no-op silently.
-        PostMessage(root, WM_APPCOMMAND, (WPARAM) root,
-                    MAKELPARAM(0, FAPPCOMMAND_KEY | APPCOMMAND_MEDIA_PLAY_PAUSE));
+    // Forward spacebar to the DAW so transport (play/stop) still works while
+    // the WebView is focused.
+    //
+    // Why SendInput (and not just PostMessage WM_KEYDOWN or WM_APPCOMMAND):
+    // empirical testing in Ableton Live on Windows confirms that
+    // PostMessage(GA_ROOT, WM_KEYDOWN, VK_SPACE, lParam) does NOT toggle
+    // transport, even with a real scan code in lParam; and Ableton ignores
+    // PostMessage(GA_ROOT, WM_APPCOMMAND, MEDIA_PLAY_PAUSE) too. Ableton
+    // appears to bind its transport via either RegisterHotKey (delivers
+    // WM_HOTKEY for real OS keypresses only — synthesized PostMessage'd
+    // WM_KEYDOWN does not generate WM_HOTKEY) or raw input / a focus-gated
+    // accelerator filter on a specific child window that is not GA_ROOT.
+    //
+    // The only path that goes through the same OS input pipeline as a real
+    // hardware keystroke is SendInput. But SendInput delivers to whichever
+    // window has keyboard focus AT THE TIME the OS dispatches the queued
+    // input — and that's our WebView, not the DAW. To make the synthesized
+    // key actually reach the DAW, we briefly transfer focus to the host's
+    // top-level window before SendInput, pump messages so the OS can drain
+    // the input queue while the DAW still has focus, then restore focus to
+    // whatever had it before.
+    //
+    // Trade-offs:
+    //  - The DAW gets focus for ~30ms. Imperceptible to the user; no
+    //    visible flicker because GA_ROOT is already the active top-level.
+    //  - We re-enter our own message loop briefly. Other messages may run
+    //    during this window (timers, paint). Bounded to 30ms.
+    //  - Synthesized space WILL echo back to the focused WebView once we
+    //    restore focus. The 150ms tick guard absorbs the echo.
+    //  - Foreground-process check ensures we don't fire space into Discord
+    //    or a browser if the user alt-tabbed mid-event. The TOCTOU race
+    //    window (check -> SetFocus -> SendInput) is microseconds.
+    //
+    // macOS is untouched — its NSResponder chain handles this naturally
+    // and the .mm code path returns false on space.
 
-        // 2) Also forward as a synthetic WM_KEYDOWN/WM_KEYUP for hosts
-        //    whose transport binding is in their accelerator table or
-        //    main WndProc keyboard handler rather than WM_APPCOMMAND.
-        //    lParam carries a real scan code so input filters that
-        //    reject lParam=0 as injected (e.g. FL Studio) accept it.
-        const LPARAM scan = (LPARAM) MapVirtualKey(VK_SPACE, MAPVK_VK_TO_VSC);
-        PostMessage(root, WM_KEYDOWN, VK_SPACE, (scan << 16) | 0x00000001);
-        PostMessage(root, WM_KEYUP,   VK_SPACE, (scan << 16) | 0xC0000001);
+    const unsigned int nowMs = (unsigned int) GetTickCount();
+    if (nowMs - mLastSpaceForwardMs < 150)
+      return true; // recursion / echo guard
+    mLastSpaceForwardMs = nowMs;
+
+    HWND root = GetAncestor((HWND) mView, GA_ROOT);
+    if (!root || root == (HWND) mView)
+      return true;
+
+    // Foreground guard — only fire if our plugin's process owns the
+    // foreground window. Without this, alt-tabbing during a held space
+    // would dump synth space presses into whatever app is now in front.
+    HWND fg = GetForegroundWindow();
+    if (!fg)
+      return true;
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(fg, &fgPid);
+    if (fgPid != GetCurrentProcessId())
+      return true;
+
+    // Allow cross-thread SetFocus / focus state sharing if the DAW's UI
+    // runs on a different thread than ours. In most VST3 hosts the plugin
+    // editor shares the host UI thread, so this is a no-op.
+    DWORD ourThread = GetCurrentThreadId();
+    DWORD rootThread = GetWindowThreadProcessId(root, nullptr);
+    BOOL attached = FALSE;
+    if (ourThread != rootThread)
+      attached = AttachThreadInput(ourThread, rootThread, TRUE);
+
+    HWND prevFocus = GetFocus();
+    SetFocus(root);
+
+    // Synthesize a real OS-level SPACE keystroke. Goes through the full
+    // Windows input pipeline (raw input, WM_HOTKEY, accelerator tables) —
+    // unlike PostMessage which is invisible to RegisterHotKey filters.
+    INPUT in[2] = {};
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_SPACE;
+    in[0].ki.wScan = (WORD) MapVirtualKey(VK_SPACE, MAPVK_VK_TO_VSC);
+    in[1] = in[0];
+    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, in, sizeof(INPUT));
+
+    // Pump messages so the DAW's WndProc runs while focus is still on root
+    // and processes the synth WM_KEYDOWN/WM_KEYUP that the OS just queued.
+    // If we returned without pumping, our caller's message loop would
+    // resume, but by then we'd already have restored focus to the WebView
+    // — and the OS would dispatch the synth key to the WebView, defeating
+    // the entire purpose.
+    const DWORD endTick = GetTickCount() + 30;
+    MSG msg;
+    while ((unsigned int) GetTickCount() < endTick)
+    {
+      if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
+      {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+      }
+      else
+      {
+        Sleep(1);
       }
     }
+
+    SetFocus(prevFocus);
+    if (attached)
+      AttachThreadInput(ourThread, rootThread, FALSE);
+
     return true;
   }
   #endif
