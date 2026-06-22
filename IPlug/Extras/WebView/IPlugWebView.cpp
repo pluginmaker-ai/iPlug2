@@ -118,3 +118,8 @@ void IWebView::GetWebRoot(WDL_String& path) const
 {
   mpImpl->GetWebRoot(path);
 }
+
+bool IWebView::InitiateFileDrag(const char* path)
+{
+  return mpImpl->InitiateFileDrag(path);
+}
