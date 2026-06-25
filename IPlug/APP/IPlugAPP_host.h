@@ -206,7 +206,14 @@ public:
   * @param name The name of the audio device to test
   * @return The ID RTAudio has given the audio device if found */
   std::optional<uint32_t> GetAudioDeviceID(const char* name) const;
-  
+
+  /** Resolve an OUTPUT device by name among output-capable devices only,
+   * preferring the variant with the most output channels. Needed because
+   * CoreAudio exposes some devices (e.g. Bluetooth AirPods) under one name as
+   * both a mono input/HFP endpoint and a stereo output — a plain name match can
+   * bind the output stream to the mono variant, so opening 2 channels fails. */
+  std::optional<uint32_t> GetAudioOutputDeviceID(const char* name) const;
+
   /** @param direction Either kInput or kOutput
    * @param name The name of the midi device
    * @return An integer specifying the output port number, where 0 means any */
@@ -223,7 +230,16 @@ public:
   bool TryToChangeAudioDriverType();
   bool TryToChangeAudio();
   bool SelectMIDIDevice(ERoute direction, const char* portName);
-  
+
+  // PM additions: device enumeration/selection surfaced to the standalone's
+  // webview UI (audio-output + MIDI-input pickers). Thin wrappers over the
+  // existing probe results + state so the picker bridge doesn't touch privates.
+  std::vector<std::string> GetAudioOutputDeviceNames() const;
+  std::vector<std::string> GetMIDIInputDeviceNames() const;
+  const char* GetSelectedAudioOutDeviceName() const { return mState.mAudioOutDev.Get(); }
+  const char* GetSelectedMIDIInDeviceName() const { return mState.mMidiInDev.Get(); }
+  bool SelectAudioOutDevice(const char* name);
+
   static int AudioCallback(void* pOutputBuffer, void* pInputBuffer, uint32_t nFrames, double streamTime, RtAudioStreamStatus status, void* pUserData);
   static void MIDICallback(double deltatime, std::vector<uint8_t>* pMsg, void* pUserData);
   static void ErrorCallback(RtAudioErrorType type, const std::string& errorText);
