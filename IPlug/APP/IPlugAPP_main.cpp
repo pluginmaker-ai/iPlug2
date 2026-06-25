@@ -372,6 +372,30 @@ int main(int argc, char *argv[])
   return NSApplicationMain(argc, (const char**) argv);
 }
 
+#include "IPlugMidi.h"
+#include <map>
+#include <algorithm>
+
+// Computer-keyboard → MIDI for the standalone player. Home row + upper row play
+// a chromatic run; mapped by physical macOS virtual key code so it's keyboard-
+// layout independent (A/S/D/F/G/H/J/K/L white, W/E/T/Y/U/O black, Z/X octave).
+// PM addition (vs vanilla iPlug2): lets the standalone be played with no MIDI
+// gear, alongside the on-screen keyboard.
+static int IPlugAPPKbdSemitone(unsigned short kc)
+{
+  switch (kc)
+  {
+    case 0:  return 0;  case 13: return 1;  case 1:  return 2;  case 14: return 3;
+    case 2:  return 4;  case 3:  return 5;  case 17: return 6;  case 5:  return 7;
+    case 16: return 8;  case 4:  return 9;  case 32: return 10; case 38: return 11;
+    case 40: return 12; case 31: return 13; case 37: return 14;
+    default: return -1;
+  }
+}
+
+static int sIPlugAPPKbdOctave = 0;                    // Z/X shift, clamped ±3
+static std::map<unsigned short, int> sIPlugAPPKbdHeld; // keyCode → note (dedup + correct note-off)
+
 INT_PTR SWELLAppMain(int msg, INT_PTR parm1, INT_PTR parm2)
 {
   IPlugAPPHost* pAppHost = nullptr;
@@ -500,11 +524,52 @@ INT_PTR SWELLAppMain(int msg, INT_PTR parm1, INT_PTR parm2)
       if (!textField && etype == NSKeyDown)
       {
         int flag, code = SWELL_MacKeyToWindowsKey(pEvent, &flag);
-        
+
         if (!(flag&~FVIRTKEY) && (code == VK_RETURN || code == VK_ESCAPE))
         {
           [pContentView keyDown: pEvent];
           return 1;
+        }
+      }
+
+      // PM: computer-keyboard → MIDI for the standalone player. Skip when a
+      // command/control/option modifier is down so app shortcuts still work.
+      if (!textField && (etype == NSKeyDown || etype == NSKeyUp))
+      {
+        IPlugAPPHost* pKbdHost = IPlugAPPHost::sInstance.get();
+        IPlugAPP* pKbdPlug = pKbdHost ? pKbdHost->GetPlug() : nullptr;
+        const bool modified = ([pEvent modifierFlags] & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption)) != 0;
+        if (pKbdPlug && !modified)
+        {
+          const unsigned short kc = [pEvent keyCode];
+          if (etype == NSKeyDown && ![pEvent isARepeat])
+          {
+            if (kc == 6)  { sIPlugAPPKbdOctave = std::max(-3, sIPlugAPPKbdOctave - 1); return 1; } // Z
+            if (kc == 7)  { sIPlugAPPKbdOctave = std::min( 3, sIPlugAPPKbdOctave + 1); return 1; } // X
+            const int st = IPlugAPPKbdSemitone(kc);
+            if (st >= 0 && sIPlugAPPKbdHeld.find(kc) == sIPlugAPPKbdHeld.end())
+            {
+              const int note = 48 + sIPlugAPPKbdOctave * 12 + st;
+              if (note >= 0 && note <= 127)
+              {
+                sIPlugAPPKbdHeld[kc] = note;
+                IMidiMsg msg; msg.MakeNoteOnMsg(note, 96, 0);
+                pKbdPlug->SendMidiMsgFromUI(msg);
+              }
+              return 1;
+            }
+          }
+          else if (etype == NSKeyUp)
+          {
+            auto it = sIPlugAPPKbdHeld.find(kc);
+            if (it != sIPlugAPPKbdHeld.end())
+            {
+              IMidiMsg msg; msg.MakeNoteOffMsg(it->second, 0);
+              pKbdPlug->SendMidiMsgFromUI(msg);
+              sIPlugAPPKbdHeld.erase(it);
+              return 1;
+            }
+          }
         }
       }
       break;

@@ -16,6 +16,7 @@
 #endif
 
 #include "IPlugLogger.h"
+#include "../../Dependencies/Extras/nlohmann/json.hpp"
 
 using namespace iplug;
 
@@ -229,8 +230,34 @@ std::optional<uint32_t> IPlugAPPHost::GetAudioDeviceID(const char* deviceNameToT
       return deviceID;
     }
   }
-  
+
   return std::nullopt;
+}
+
+std::optional<uint32_t> IPlugAPPHost::GetAudioOutputDeviceID(const char* deviceNameToTest) const
+{
+  std::optional<uint32_t> best;
+  unsigned int bestChannels = 0;
+
+  // Match only output-capable devices, and among same-named ones keep the
+  // variant with the most output channels — Bluetooth headsets (AirPods)
+  // surface a mono HFP endpoint and a stereo A2DP output under one name, and
+  // binding the output stream to the mono one makes openStream(2ch) fail.
+  for (auto deviceID : mAudioOutputDevIDs)
+  {
+    if (std::string_view(deviceNameToTest) != GetAudioDeviceName(deviceID))
+      continue;
+
+    const unsigned int channels = mDAC->getDeviceInfo(deviceID).outputChannels;
+
+    if (!best || channels > bestChannels)
+    {
+      best = deviceID;
+      bestChannels = channels;
+    }
+  }
+
+  return best;
 }
 
 int IPlugAPPHost::GetMIDIPortNumber(ERoute direction, const char* nameToTest) const
@@ -424,7 +451,7 @@ bool IPlugAPPHost::TryToChangeAudio()
 #else
   #error NOT IMPLEMENTED
 #endif
-  auto outputID = GetAudioDeviceID(mState.mAudioOutDev.Get());
+  auto outputID = GetAudioOutputDeviceID(mState.mAudioOutDev.Get());
 
   bool failedToFindDevice = false;
   bool resetToDefault = false;
@@ -563,6 +590,77 @@ bool IPlugAPPHost::SelectMIDIDevice(ERoute direction, const char* pPortName)
   
   return false;
 }
+
+std::vector<std::string> IPlugAPPHost::GetAudioOutputDeviceNames() const
+{
+  std::vector<std::string> names;
+  names.reserve(mAudioOutputDevIDs.size());
+  for (auto id : mAudioOutputDevIDs)
+    names.push_back(GetAudioDeviceName(id));
+  return names;
+}
+
+std::vector<std::string> IPlugAPPHost::GetMIDIInputDeviceNames() const
+{
+  return mMidiInputDevNames;
+}
+
+bool IPlugAPPHost::SelectAudioOutDevice(const char* name)
+{
+  if (!name)
+    return false;
+
+  mState.mAudioOutDev.Set(name);
+  const bool changed = TryToChangeAudio();
+  UpdateINI();
+  return changed;
+}
+
+// Bridge helpers for the standalone's webview device pickers. Declared in
+// IPlugWebViewEditorDelegate.h (APP target only) so the generic WebView header
+// never pulls in RtAudio/RtMidi/IPlugAPPHost. They reach the single app-host
+// instance, marshal the device lists across to the webview, and apply a
+// selection coming back from the picker UI.
+namespace iplug {
+
+std::string PMGetDeviceListScript()
+{
+  nlohmann::json payload;
+  IPlugAPPHost* pHost = IPlugAPPHost::sInstance.get();
+
+  if (pHost)
+  {
+    payload["audioOut"] = pHost->GetAudioOutputDeviceNames();
+    payload["midiIn"] = pHost->GetMIDIInputDeviceNames();
+    payload["selAudioOut"] = pHost->GetSelectedAudioOutDeviceName();
+    payload["selMidiIn"] = pHost->GetSelectedMIDIInDeviceName();
+  }
+  else
+  {
+    payload["audioOut"] = std::vector<std::string>{};
+    payload["midiIn"] = std::vector<std::string>{};
+    payload["selAudioOut"] = "";
+    payload["selMidiIn"] = "";
+  }
+
+  return "if(window.PMOnDevices)window.PMOnDevices(" + payload.dump() + ");";
+}
+
+void PMSelectAudioOutputDevice(const char* name)
+{
+  IPlugAPPHost* pHost = IPlugAPPHost::sInstance.get();
+  if (pHost && name)
+    pHost->SelectAudioOutDevice(name);
+}
+
+void PMSelectMIDIInputDevice(const char* name)
+{
+  IPlugAPPHost* pHost = IPlugAPPHost::sInstance.get();
+  if (pHost && name)
+    pHost->SelectMIDIDevice(ERoute::kInput, name);
+}
+
+} // namespace iplug
 
 void IPlugAPPHost::CloseAudio()
 {
