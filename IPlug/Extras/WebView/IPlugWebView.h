@@ -115,6 +115,11 @@ public:
   
   /** Called after navigation instructions have been exectued and e.g. a page has loaded */
   virtual void OnWebContentLoaded() {}
+
+  /** Called (Windows) when the native WebView viewport changed underneath the page —
+   * e.g. the host window crossed to a monitor with a different DPI, or the visible
+   * region was clamped — so the delegate can re-fit the content to the new viewport. */
+  virtual void OnWebViewViewportChanged() {}
   
   /** When a script in the web view posts a message, it will arrive as a UTF8 json string here */
   virtual void OnMessageFromWebView(const char* json) {}

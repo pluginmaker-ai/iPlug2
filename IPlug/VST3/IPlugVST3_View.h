@@ -59,26 +59,15 @@ public:
 
     if (pSize && mOwner.GetHostResizeEnabled())
     {
-      // Windows has no OS-level aspect-ratio lock like macOS setContentAspectRatio,
-      // so we enforce it here: run the plugin's ConstrainEditorResize, and if it
-      // modified the dimensions, ask the host to snap its window to the corrected
-      // size via plugFrame->resizeView(). Hosts must respect resizeView() even when
-      // they ignore checkSizeConstraint(), so this works across Ableton/Bitwig/etc.
-      int w = pSize->getWidth();
-      int h = pSize->getHeight();
-      const int origW = w;
-      const int origH = h;
-
-      mOwner.ConstrainEditorResize(w, h);
-
-      if ((w != origW || h != origH) && plugFrame)
-      {
-        Steinberg::ViewRect correctedRect(0, 0, w, h);
-        plugFrame->resizeView(this, &correctedRect);
-        pSize->right = pSize->left + w;
-        pSize->bottom = pSize->top + h;
-      }
-
+      // Accept whatever the host committed — never bounce a "corrected" size
+      // back via plugFrame->resizeView() from here. That bounce made hosts like
+      // Studio One shrink/center the view inside the window mid-drag (dead
+      // black bands) and could spiral through repeated onSize negotiations.
+      // Content correctness is owned downstream: the delegate letterboxes the
+      // content to the design aspect inside whatever rect arrives, and the
+      // Windows frame snap trims the host window to hug the content once the
+      // interaction settles. checkSizeConstraint() still aspect-corrects live
+      // resizes on hosts that honor it.
       rect = *pSize;
       mOwner.SetEditorSize(rect.getWidth(), rect.getHeight());
       mOwner.OnParentWindowResize(rect.getWidth(), rect.getHeight());
