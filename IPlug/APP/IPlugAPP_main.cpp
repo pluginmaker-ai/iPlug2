@@ -36,6 +36,27 @@ HWND gHWND;
 extern HINSTANCE gHINSTANCE;
 UINT gScrollMessage;
 
+// True when keyboard focus currently sits inside the hosted WebView2. Its host
+// window and children all use the "Chrome_WidgetWin" window-class family, so we
+// walk up from the focused window looking for one. Used by the message pump to
+// bypass IsDialogMessage for the WebView2 — otherwise dialog message processing
+// eats the keydown/keyup destined for the web content, and the standalone's
+// computer-keyboard → MIDI handler (a document-level listener in the web UI)
+// never fires. macOS has no equivalent problem: it feeds the keyboard to MIDI
+// natively via SWELLAPP_PROCESSMESSAGE below, not through the webview.
+static bool KeyboardFocusIsInWebView()
+{
+  HWND hFocus = GetFocus();
+  for (int depth = 0; hFocus && depth < 8; depth++)
+  {
+    wchar_t className[64] = {};
+    if (GetClassNameW(hFocus, className, 64) > 0 && wcsncmp(className, L"Chrome_WidgetWin", 16) == 0)
+      return true;
+    hFocus = GetParent(hFocus);
+  }
+  return false;
+}
+
 // Save a screenshot of the given HWND to a PNG file using Win32 API
 bool SaveWindowScreenshot(HWND hwnd, const char* path)
 {
@@ -226,26 +247,46 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpszCmdPa
         continue;
       }
       
-      if (gHWND && (TranslateAccelerator(gHWND, hAccel, &msg) || IsDialogMessage(gHWND, &msg)))
+      // Accelerators run regardless of focus so app shortcuts (screenshot etc.)
+      // keep working. This only consumes registered accelerator combos (all of
+      // which use Ctrl/Shift), never the plain, unmodified note keys.
+      if (gHWND && TranslateAccelerator(gHWND, hAccel, &msg))
         continue;
-      
-      // default processing for other dialogs
-      HWND hWndParent = NULL;
-      HWND temphwnd = msg.hwnd;
-      
-      do
+
+      // When the WebView2 has keyboard focus, skip all dialog-message
+      // processing and let the message dispatch straight to the webview.
+      // IsDialogMessage would otherwise intercept keydown/keyup meant for the
+      // web content — both the parent dialog (gHWND) and, via the ancestor
+      // walk below, any dialog-class parent of the focused webview window — and
+      // do dialog Tab-navigation that pulls focus back out. That is exactly
+      // what stops the computer keyboard from reaching the QWERTY → MIDI
+      // handler on Windows. macOS is unaffected (this whole block is the
+      // Windows APP host).
+      const bool focusInWebView = KeyboardFocusIsInWebView();
+
+      if (!focusInWebView)
       {
-        if (GetClassLong(temphwnd, GCW_ATOM) == (INT)32770)
+        if (gHWND && IsDialogMessage(gHWND, &msg))
+          continue;
+
+        // default processing for other dialogs
+        HWND hWndParent = NULL;
+        HWND temphwnd = msg.hwnd;
+
+        do
         {
-          hWndParent = temphwnd;
-          if (!(GetWindowLong(temphwnd, GWL_STYLE) & WS_CHILD))
-            break; // not a child, exit
+          if (GetClassLong(temphwnd, GCW_ATOM) == (INT)32770)
+          {
+            hWndParent = temphwnd;
+            if (!(GetWindowLong(temphwnd, GWL_STYLE) & WS_CHILD))
+              break; // not a child, exit
+          }
         }
+        while (temphwnd = GetParent(temphwnd));
+
+        if (hWndParent && IsDialogMessage(hWndParent, &msg))
+          continue;
       }
-      while (temphwnd = GetParent(temphwnd));
-      
-      if (hWndParent && IsDialogMessage(hWndParent,&msg))
-        continue;
 
       TranslateMessage(&msg);
       DispatchMessage(&msg);
