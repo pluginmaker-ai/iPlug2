@@ -718,6 +718,22 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
               ApplyWebViewBounds();
             else
               mWebViewCtrlr->put_Bounds(mWebViewBounds);
+
+#if defined APP_API
+            // Standalone (APP) only: move keyboard focus into the WebView2 so
+            // the web UI's document-level keydown/keyup listeners actually fire
+            // — most importantly the computer-keyboard → MIDI handler that plays
+            // notes (A/S/D… white, W/E/T… black, Z/X octave). The WebView2 gets
+            // mouse input without focus (so clicking the on-screen keys works),
+            // but never sees keydown until something moves focus into it, and
+            // nothing in the APP host does. In a DAW the host manages focus, so
+            // this is gated to the APP target to avoid stealing focus there.
+            // See also IPlugAPP_main.cpp's message pump, which stops
+            // IsDialogMessage from swallowing these keys once focus is here.
+            if (mShowOnLoad)
+              mWebViewCtrlr->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+#endif
+
             ::WebViewInitLog("controller:OnWebViewReady_fire", S_OK, nullptr);
             mIWebView->OnWebViewReady();
             return S_OK;
