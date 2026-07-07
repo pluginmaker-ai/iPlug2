@@ -59,6 +59,7 @@ public:
 
     if (pSize && mOwner.GetHostResizeEnabled())
     {
+#ifdef OS_WIN
       // Accept whatever the host committed — never bounce a "corrected" size
       // back via plugFrame->resizeView() from here. That bounce made hosts like
       // Studio One shrink/center the view inside the window mid-drag (dead
@@ -68,6 +69,28 @@ public:
       // Windows frame snap trims the host window to hug the content once the
       // interaction settles. checkSizeConstraint() still aspect-corrects live
       // resizes on hosts that honor it.
+#else
+      // macOS: unchanged v106 behavior — enforce the aspect ratio via
+      // ConstrainEditorResize and bounce a corrected size to the host through
+      // plugFrame->resizeView(). The Windows accept-all rework is deliberately
+      // not applied here; the mac windowing path (setContentAspectRatio) was
+      // validated as-is and stays byte-identical.
+      int w = pSize->getWidth();
+      int h = pSize->getHeight();
+      const int origW = w;
+      const int origH = h;
+
+      mOwner.ConstrainEditorResize(w, h);
+
+      if ((w != origW || h != origH) && plugFrame)
+      {
+        Steinberg::ViewRect correctedRect(0, 0, w, h);
+        plugFrame->resizeView(this, &correctedRect);
+        pSize->right = pSize->left + w;
+        pSize->bottom = pSize->top + h;
+      }
+#endif
+
       rect = *pSize;
       mOwner.SetEditorSize(rect.getWidth(), rect.getHeight());
       mOwner.OnParentWindowResize(rect.getWidth(), rect.getHeight());

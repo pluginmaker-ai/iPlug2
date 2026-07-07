@@ -211,6 +211,7 @@ public:
 
   void OnParentWindowResize(int width, int height) override;
 
+#ifdef OS_WIN
   // Fit the web content to the WebView's ACTUAL viewport, measured live in JS
   // (window.innerWidth/innerHeight), instead of a scale derived from mScreenScale.
   // A stale/wrong mScreenScale — e.g. after a mixed-DPI monitor move, or a host
@@ -219,6 +220,10 @@ public:
   // the viewport and clipping the bottom of the UI (Studio One / FSP at high DPI).
   // Measuring the viewport is correct by construction and self-installs a resize
   // listener so it re-fits on open, drag-resize, and DPI change alike.
+  // Windows-only: macOS compiles IPlugWebViewEditorDelegate.mm (which has no
+  // InjectViewportFit definition — declaring it here broke the mac link) and
+  // handles sizing natively via setContentAspectRatio. Mac keeps its verified
+  // v106 behavior untouched.
   void InjectViewportFit();
 
   bool ConstrainEditorResize(int& w, int& h) const override
@@ -234,6 +239,32 @@ public:
     // settles. (Return true = "use the caller's original values".)
     return true;
   }
+#else
+  bool ConstrainEditorResize(int& w, int& h) const override
+  {
+    // macOS: unchanged v106 behavior — width-driven aspect correction. The
+    // return value is inverted: `checkSizeConstraint` only writes w/h back to
+    // the host's ViewRect when this returns false (meaning "I modified the
+    // values"), so when we enforce aspect ratio we MUST return false to get
+    // the correction through.
+    if (mDesignWidth > 0 && mDesignHeight > 0)
+    {
+      float aspectRatio = static_cast<float>(mDesignWidth) / static_cast<float>(mDesignHeight);
+      int newH = static_cast<int>(std::round(static_cast<float>(w) / aspectRatio));
+      if (newH >= GetMinHeight() && newH <= GetMaxHeight())
+      {
+        h = newH;
+      }
+      else
+      {
+        h = Clip(newH, GetMinHeight(), GetMaxHeight());
+        w = static_cast<int>(std::round(static_cast<float>(h) * aspectRatio));
+      }
+      return false;
+    }
+    return IEditorDelegate::ConstrainEditorResize(w, h);
+  }
+#endif
 
 #ifdef OS_WIN
   void SetScreenScale(float scale) override
@@ -283,19 +314,23 @@ public:
 
     OnUIOpen();
 
+#ifdef OS_WIN
     // Fit the content to the viewport on load, and install the resize/DPI
     // listener — so the UI is correctly scaled on a fresh open even for hosts
     // that don't send an initial onSize/OnParentWindowResize (and re-fits on
     // every subsequent resize or monitor-DPI change on its own).
     InjectViewportFit();
+#endif
   }
 
+#ifdef OS_WIN
   void OnWebViewViewportChanged() override
   {
     // Native viewport changed underneath the page (DPI change / visibility
     // clamp) — re-measure and re-fit without waiting for a host callback.
     InjectViewportFit();
   }
+#endif
   
   void SetMaxJSStringLength(int length)
   {
