@@ -544,6 +544,26 @@ static void ClientResize(HWND hWnd, int width, int height)
   SetWindowPos(hWnd, 0, x, y, width + ptDiff.x, height + ptDiff.y, 0);
 }
 
+#ifdef OS_WIN
+// Posted from WM_ACTIVATE so it runs AFTER the dialog's default focus restore,
+// guaranteeing the WebView2 — not the dialog — ends up with keyboard focus. The
+// standalone's computer-keyboard → MIDI handler is a document-level listener in
+// the web UI, so it only receives keys while the webview holds focus.
+#define WM_APP_REFOCUS_WEBVIEW (WM_APP + 17)
+
+// Move keyboard focus into the hosted WebView2. Its host window is a direct
+// child of the dialog and uses the "Chrome_WidgetWin" class family; SetFocus on
+// it routes keyboard input into the web content.
+static void FocusHostedWebView(HWND hDlg)
+{
+  HWND hWebView = FindWindowExW(hDlg, NULL, L"Chrome_WidgetWin_1", NULL);
+  if (!hWebView)
+    hWebView = FindWindowExW(hDlg, NULL, L"Chrome_WidgetWin_0", NULL);
+  if (hWebView)
+    SetFocus(hWebView);
+}
+#endif
+
 //static
 WDL_DLGRET IPlugAPPHost::MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
@@ -573,6 +593,20 @@ WDL_DLGRET IPlugAPPHost::MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPA
 
       return 1;
     }
+#ifdef OS_WIN
+    case WM_ACTIVATE:
+      // On (re)activation, pull keyboard focus back into the WebView2 so the
+      // computer-keyboard → MIDI web handler keeps working after the user
+      // Alt-Tabs away and back or interacts with native chrome. Posted, not
+      // done inline, so it runs after the dialog's own focus restore. Fall
+      // through to default activation handling (title-bar repaint etc.).
+      if (LOWORD(wParam) != WA_INACTIVE)
+        PostMessage(hwndDlg, WM_APP_REFOCUS_WEBVIEW, 0, 0);
+      break;
+    case WM_APP_REFOCUS_WEBVIEW:
+      FocusHostedWebView(hwndDlg);
+      return 0;
+#endif
     case WM_TIMER:
     {
       if (wParam == IDT_SCREENSHOT_TIMER)

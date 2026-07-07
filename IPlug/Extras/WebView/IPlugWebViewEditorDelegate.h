@@ -48,6 +48,15 @@
 
 BEGIN_IPLUG_NAMESPACE
 
+#if defined APP_API
+// Standalone (APP) device-picker bridge — implemented in IPlugAPP_host.cpp so
+// this generic WebView header stays free of the RtAudio/RtMidi host headers.
+// PMGetDeviceListScript() returns a JS snippet calling window.PMOnDevices({...}).
+std::string PMGetDeviceListScript();
+void PMSelectAudioOutputDevice(const char* name);
+void PMSelectMIDIInputDevice(const char* name);
+#endif
+
 /** An editor delegate base class that uses a platform native webview for the UI
 * @ingroup EditorDelegates */
 class WebViewEditorDelegate : public IEditorDelegate
@@ -181,6 +190,21 @@ public:
       IKeyPress keyPress = ConvertToIKeyPress(json["keyCode"].get<uint32_t>(), json["utf8"].get<std::string>().c_str(), json["S"].get<bool>(), json["C"].get<bool>(), json["A"].get<bool>());
       json["isUp"].get<bool>() ? OnKeyUp(keyPress) : OnKeyDown(keyPress); // return value not used
     }
+#if defined APP_API
+    else if(json["msg"] == "PMRDV") // standalone: request audio/MIDI device list
+    {
+      std::string script = PMGetDeviceListScript();
+      EvaluateJavaScript(script.c_str(), nullptr);
+    }
+    else if(json["msg"] == "PMSAO") // standalone: select audio output device
+    {
+      PMSelectAudioOutputDevice(json.value("name", std::string()).c_str());
+    }
+    else if(json["msg"] == "PMSMI") // standalone: select MIDI input device
+    {
+      PMSelectMIDIInputDevice(json.value("name", std::string()).c_str());
+    }
+#endif
   }
 
   void Resize(int width, int height);

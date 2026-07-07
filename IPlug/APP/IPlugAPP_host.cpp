@@ -16,6 +16,7 @@
 #endif
 
 #include "IPlugLogger.h"
+#include "../../Dependencies/Extras/nlohmann/json.hpp"
 
 using namespace iplug;
 
@@ -208,6 +209,14 @@ std::string IPlugAPPHost::GetAudioDeviceName(uint32_t deviceID) const
   if (pos != std::string::npos)
   {
     std::string subStr = str.substr(pos + 1);
+    // Strip the leading space left by "Manufacturer: Device" splitting. The
+    // INI parser (GetPrivateProfileString) strips leading whitespace on read,
+    // so a space-prefixed name saved to settings.ini never exact-matched on
+    // the next launch and the app silently fell back to the default device.
+    // Trimming here keeps every consumer (INI round-trip, webview picker,
+    // CoreAudio matching) consistent.
+    while (!subStr.empty() && subStr.front() == ' ')
+      subStr.erase(subStr.begin());
     return subStr;
   }
   else
@@ -229,8 +238,34 @@ std::optional<uint32_t> IPlugAPPHost::GetAudioDeviceID(const char* deviceNameToT
       return deviceID;
     }
   }
-  
+
   return std::nullopt;
+}
+
+std::optional<uint32_t> IPlugAPPHost::GetAudioOutputDeviceID(const char* deviceNameToTest) const
+{
+  std::optional<uint32_t> best;
+  unsigned int bestChannels = 0;
+
+  // Match only output-capable devices, and among same-named ones keep the
+  // variant with the most output channels — Bluetooth headsets (AirPods)
+  // surface a mono HFP endpoint and a stereo A2DP output under one name, and
+  // binding the output stream to the mono one makes openStream(2ch) fail.
+  for (auto deviceID : mAudioOutputDevIDs)
+  {
+    if (std::string_view(deviceNameToTest) != GetAudioDeviceName(deviceID))
+      continue;
+
+    const unsigned int channels = mDAC->getDeviceInfo(deviceID).outputChannels;
+
+    if (!best || channels > bestChannels)
+    {
+      best = deviceID;
+      bestChannels = channels;
+    }
+  }
+
+  return best;
 }
 
 int IPlugAPPHost::GetMIDIPortNumber(ERoute direction, const char* nameToTest) const
@@ -424,7 +459,7 @@ bool IPlugAPPHost::TryToChangeAudio()
 #else
   #error NOT IMPLEMENTED
 #endif
-  auto outputID = GetAudioDeviceID(mState.mAudioOutDev.Get());
+  auto outputID = GetAudioOutputDeviceID(mState.mAudioOutDev.Get());
 
   bool failedToFindDevice = false;
   bool resetToDefault = false;
@@ -564,6 +599,77 @@ bool IPlugAPPHost::SelectMIDIDevice(ERoute direction, const char* pPortName)
   return false;
 }
 
+std::vector<std::string> IPlugAPPHost::GetAudioOutputDeviceNames() const
+{
+  std::vector<std::string> names;
+  names.reserve(mAudioOutputDevIDs.size());
+  for (auto id : mAudioOutputDevIDs)
+    names.push_back(GetAudioDeviceName(id));
+  return names;
+}
+
+std::vector<std::string> IPlugAPPHost::GetMIDIInputDeviceNames() const
+{
+  return mMidiInputDevNames;
+}
+
+bool IPlugAPPHost::SelectAudioOutDevice(const char* name)
+{
+  if (!name)
+    return false;
+
+  mState.mAudioOutDev.Set(name);
+  const bool changed = TryToChangeAudio();
+  UpdateINI();
+  return changed;
+}
+
+// Bridge helpers for the standalone's webview device pickers. Declared in
+// IPlugWebViewEditorDelegate.h (APP target only) so the generic WebView header
+// never pulls in RtAudio/RtMidi/IPlugAPPHost. They reach the single app-host
+// instance, marshal the device lists across to the webview, and apply a
+// selection coming back from the picker UI.
+namespace iplug {
+
+std::string PMGetDeviceListScript()
+{
+  nlohmann::json payload;
+  IPlugAPPHost* pHost = IPlugAPPHost::sInstance.get();
+
+  if (pHost)
+  {
+    payload["audioOut"] = pHost->GetAudioOutputDeviceNames();
+    payload["midiIn"] = pHost->GetMIDIInputDeviceNames();
+    payload["selAudioOut"] = pHost->GetSelectedAudioOutDeviceName();
+    payload["selMidiIn"] = pHost->GetSelectedMIDIInDeviceName();
+  }
+  else
+  {
+    payload["audioOut"] = std::vector<std::string>{};
+    payload["midiIn"] = std::vector<std::string>{};
+    payload["selAudioOut"] = "";
+    payload["selMidiIn"] = "";
+  }
+
+  return "if(window.PMOnDevices)window.PMOnDevices(" + payload.dump() + ");";
+}
+
+void PMSelectAudioOutputDevice(const char* name)
+{
+  IPlugAPPHost* pHost = IPlugAPPHost::sInstance.get();
+  if (pHost && name)
+    pHost->SelectAudioOutDevice(name);
+}
+
+void PMSelectMIDIInputDevice(const char* name)
+{
+  IPlugAPPHost* pHost = IPlugAPPHost::sInstance.get();
+  if (pHost && name)
+    pHost->SelectMIDIDevice(ERoute::kInput, name);
+}
+
+} // namespace iplug
+
 void IPlugAPPHost::CloseAudio()
 {
   if (mDAC && mDAC->isStreamOpen())
@@ -582,6 +688,100 @@ void IPlugAPPHost::CloseAudio()
   }
 }
 
+#if defined OS_MAC
+#include <CoreAudio/CoreAudio.h>
+
+// Silent render callback for the Bluetooth wake pre-roll below — pumps zeros.
+// userData points at the stream's channel count (RTAUDIO_FLOAT64, contiguous
+// either way under RTAUDIO_NONINTERLEAVED, so one memset covers the buffer).
+static int PMSilentWakeCallback(void* pOutputBuffer, void*, unsigned int nFrames, double, RtAudioStreamStatus, void* pUserData)
+{
+  unsigned int nChans = *static_cast<unsigned int*>(pUserData);
+  memset(pOutputBuffer, 0, nFrames * nChans * sizeof(double));
+  return 0;
+}
+
+// Minimal CoreAudio helpers for the Bluetooth handling: RtAudio's device ids
+// are its own (and renumber on BT reconnect), so the route-state check and the
+// nominal-rate query talk to CoreAudio directly, matching the device by name.
+
+static std::string PMCAGetDeviceName(AudioDeviceID device)
+{
+  CFStringRef name = nullptr;
+  UInt32 size = sizeof(name);
+  AudioObjectPropertyAddress address = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+  if (AudioObjectGetPropertyData(device, &address, 0, nullptr, &size, &name) != noErr || !name)
+    return "";
+  char buf[256] = {0};
+  CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8);
+  CFRelease(name);
+  return buf;
+}
+
+static unsigned int PMCAOutputChannels(AudioDeviceID device)
+{
+  AudioObjectPropertyAddress address = { kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain };
+  UInt32 size = 0;
+  if (AudioObjectGetPropertyDataSize(device, &address, 0, nullptr, &size) != noErr || size == 0)
+    return 0;
+  std::vector<char> raw(size);
+  AudioBufferList* pBufferList = (AudioBufferList*) raw.data();
+  if (AudioObjectGetPropertyData(device, &address, 0, nullptr, &size, pBufferList) != noErr)
+    return 0;
+  unsigned int total = 0;
+  for (UInt32 i = 0; i < pBufferList->mNumberBuffers; i++)
+    total += pBufferList->mBuffers[i].mNumberChannels;
+  return total;
+}
+
+// Match by name among output-capable devices, preferring the most output
+// channels — mirrors GetAudioOutputDeviceID's disambiguation of same-named
+// Bluetooth endpoints (mono HFP vs stereo A2DP).
+static AudioDeviceID PMCAFindOutputByName(const std::string& wanted)
+{
+  AudioObjectPropertyAddress address = { kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+  UInt32 size = 0;
+  if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &address, 0, nullptr, &size) != noErr)
+    return kAudioObjectUnknown;
+  std::vector<AudioDeviceID> devices(size / sizeof(AudioDeviceID));
+  if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, nullptr, &size, devices.data()) != noErr)
+    return kAudioObjectUnknown;
+
+  AudioDeviceID best = kAudioObjectUnknown;
+  unsigned int bestChannels = 0;
+  for (auto device : devices)
+  {
+    unsigned int channels = PMCAOutputChannels(device);
+    if (channels == 0 || PMCAGetDeviceName(device) != wanted)
+      continue;
+    if (best == kAudioObjectUnknown || channels > bestChannels)
+    {
+      best = device;
+      bestChannels = channels;
+    }
+  }
+  return best;
+}
+
+static bool PMCAIsRunningSomewhere(AudioDeviceID device)
+{
+  AudioObjectPropertyAddress address = { kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+  UInt32 running = 0, size = sizeof(running);
+  if (AudioObjectGetPropertyData(device, &address, 0, nullptr, &size, &running) != noErr)
+    return false;
+  return running != 0;
+}
+
+static Float64 PMCAGetNominalRate(AudioDeviceID device)
+{
+  AudioObjectPropertyAddress address = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+  Float64 rate = 0;
+  UInt32 size = sizeof(rate);
+  AudioObjectGetPropertyData(device, &address, 0, nullptr, &size, &rate);
+  return rate;
+}
+#endif
+
 bool IPlugAPPHost::InitAudio(uint32_t inID, uint32_t outID, uint32_t sr, uint32_t iovs)
 {
   CloseAudio();
@@ -594,6 +794,71 @@ bool IPlugAPPHost::InitAudio(uint32_t inID, uint32_t outID, uint32_t sr, uint32_
   oParams.deviceId = outID;
   oParams.nChannels = GetPlug()->MaxNChannels(ERoute::kOutput); // TODO: flexible channel count
   oParams.firstChannel = 0; // TODO: flexible channel count
+
+#if defined OS_MAC
+  // Bluetooth headsets (AirPods): NEVER set/flip the device's nominal sample
+  // rate — follow it. RtAudio silently sets the nominal rate to whatever we
+  // request; on Bluetooth that clock yank (44.1k <-> 24k <-> 48k as the
+  // headset renegotiates profiles) can wedge the entire route at the OS level:
+  // audio dies for EVERY app (even Apple's `say`) until the headset
+  // reconnects. Instead, open at the device's CURRENT nominal rate and run the
+  // DSP there — the open is then a no-op rate-wise (fast, no 2s rate-update
+  // waits, no wedge risk). 24000 in the output device's rate list is the
+  // Bluetooth-telephony tell; built-in/USB/virtual devices don't expose it
+  // (and RtAudio's DirectSound backend lists 24k for most devices — hence the
+  // OS_MAC gate). Pro-audio interfaces are untouched: without the 24k tell we
+  // honor the user's configured rate as before.
+  {
+    auto outInfo = mDAC->getDeviceInfo(outID);
+    bool btTelephonyCapable = false;
+    for (auto rate : outInfo.sampleRates)
+    {
+      if (rate == 24000) { btTelephonyCapable = true; break; }
+    }
+
+    const std::string outName = GetAudioDeviceName(outID);
+    AudioDeviceID caDevice = btTelephonyCapable ? PMCAFindOutputByName(outName) : kAudioObjectUnknown;
+
+    if (btTelephonyCapable && caDevice != kAudioObjectUnknown)
+    {
+      const Float64 nominal = PMCAGetNominalRate(caDevice);
+      if (nominal >= 8000.0 && (uint32_t) nominal != sr)
+      {
+        std::cerr << "BT follow-device: opening at nominal " << nominal << " instead of requested " << sr << std::endl;
+        sr = (uint32_t) nominal;
+      }
+
+      // If nothing is rendering to the device, feed it ~300ms of silence at
+      // ITS OWN rate before the real open (no clock change involved) so a
+      // parked route is live when the real stream starts. Skipped whenever any
+      // client (music app, previous stream) already runs the device.
+      if (!PMCAIsRunningSomewhere(caDevice))
+      {
+        std::cerr << "BT wake: '" << outName << "' idle — pre-rolling silence at " << sr << std::endl;
+        RtAudio::StreamParameters wakeParams;
+        wakeParams.deviceId = outID;
+        wakeParams.nChannels = oParams.nChannels;
+        wakeParams.firstChannel = 0;
+        RtAudio::StreamOptions wakeOptions;
+        wakeOptions.flags = RTAUDIO_NONINTERLEAVED;
+        unsigned int wakeFrames = 512;
+        unsigned int wakeChans = wakeParams.nChannels;
+
+        if (mDAC->openStream(&wakeParams, nullptr, RTAUDIO_FLOAT64, sr, &wakeFrames, &PMSilentWakeCallback, &wakeChans, &wakeOptions) == RTAUDIO_NO_ERROR)
+        {
+          mDAC->startStream();
+          Sleep(300);
+          mDAC->stopStream();
+          mDAC->closeStream();
+        }
+        else
+        {
+          std::cerr << "BT wake: pre-roll open failed: " << mDAC->getErrorText() << std::endl;
+        }
+      }
+    }
+  }
+#endif
 
   mBufferSize = iovs; // mBufferSize may get changed by stream
 
@@ -616,6 +881,24 @@ bool IPlugAPPHost::InitAudio(uint32_t inID, uint32_t outID, uint32_t sr, uint32_
   mIPlug->OnReset();
 
   auto status = mDAC->openStream(&oParams, iParams.nChannels > 0 ? &iParams : nullptr, RTAUDIO_FLOAT64, sr, &mBufferSize, &AudioCallback, this, &options);
+
+#if defined OS_MAC
+  // Bluetooth devices change their nominal sample rate asynchronously as the
+  // headset renegotiates profiles (A2DP <-> HFP). RtAudio's probeDeviceOpen
+  // only waits 2 s for the rate update and fails with "timeout waiting for
+  // sample rate update" when the transport is still settling — which would
+  // leave the app with NO audio stream at all (silent output, frozen meters).
+  // The follow-device logic above makes this rare (we open at the current
+  // nominal rate), but a profile transition can still race the open; each
+  // retry waits another window so slow transitions settle instead of failing
+  // audio init outright.
+  for (int attempt = 0; status != RtAudioErrorType::RTAUDIO_NO_ERROR && attempt < 2; attempt++)
+  {
+    DBGMSG("openStream failed (%s) — retrying after settle\n", mDAC->getErrorText().c_str());
+    Sleep(500);
+    status = mDAC->openStream(&oParams, iParams.nChannels > 0 ? &iParams : nullptr, RTAUDIO_FLOAT64, sr, &mBufferSize, &AudioCallback, this, &options);
+  }
+#endif
 
   if (status != RtAudioErrorType::RTAUDIO_NO_ERROR)
   {
@@ -755,7 +1038,7 @@ int IPlugAPPHost::AudioCallback(void* pOutputBuffer, void* pInputBuffer, uint32_
   {
     memset(pOutputBufferD, 0, nFrames * nouts * sizeof(double));
   }
-  
+
   _this->mVecWait = std::min(_this->mVecWait + 1, uint32_t(APP_N_VECTOR_WAIT + 1));
 
   return 0;
