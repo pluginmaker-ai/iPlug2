@@ -196,21 +196,25 @@ bool WebViewEditorDelegate::OnKeyDown(const IKeyPress& key)
       HWND root = GetAncestor((HWND) mView, GA_ROOT);
       if (root)
       {
-        // 1) Send a media-key APPCOMMAND. This is the standard Windows
-        //    mechanism for telling the foreground app to play/pause
-        //    (what hardware media keys, Spotify keyboards, and
-        //    presentation remotes send). Many DAWs (Reaper, Cubase,
-        //    Studio One) handle WM_APPCOMMAND for transport even when
-        //    they ignore a synthetic WM_KEYDOWN reaching a non-focused
-        //    window. Hosts that don't handle it just no-op silently.
-        PostMessage(root, WM_APPCOMMAND, (WPARAM) root,
-                    MAKELPARAM(0, FAPPCOMMAND_KEY | APPCOMMAND_MEDIA_PLAY_PAUSE));
-
-        // 2) Also forward as a synthetic WM_KEYDOWN/WM_KEYUP for hosts
-        //    whose transport binding is in their accelerator table or
-        //    main WndProc keyboard handler rather than WM_APPCOMMAND.
-        //    lParam carries a real scan code so input filters that
-        //    reject lParam=0 as injected (e.g. FL Studio) accept it.
+        // Forward as a synthetic WM_KEYDOWN/WM_KEYUP to the host's top-level
+        // window so DAWs that bind transport (play/stop) to the space key —
+        // via their accelerator table or main WndProc keyboard handler — still
+        // toggle while the WebView is focused. lParam carries a real scan code
+        // so input filters that reject lParam=0 as injected (e.g. FL Studio)
+        // accept it. A WM_KEYDOWN posted to a specific HWND does not escape
+        // that window, so it cannot leak system-wide.
+        //
+        // We deliberately do NOT also post WM_APPCOMMAND /
+        // APPCOMMAND_MEDIA_PLAY_PAUSE here. It looks like a targeted message,
+        // but DefWindowProc's default handling forwards an unhandled
+        // WM_APPCOMMAND up the parent chain and ultimately to the shell as a
+        // SYSTEM-WIDE media-key event — the exact path a hardware play/pause
+        // key takes. Windows then routes it to the active media session, so
+        // pressing space with the plugin focused would start/stop whatever the
+        // user has playing (Spotify, etc.). Since DAW transport is bound to the
+        // space key and not to the media-play-pause APPCOMMAND, that post never
+        // helped transport and only produced the music-toggle bug. See
+        // pluginmaker-ai/alexh — "spacebar toggles Spotify" fix.
         const LPARAM scan = (LPARAM) MapVirtualKey(VK_SPACE, MAPVK_VK_TO_VSC);
         PostMessage(root, WM_KEYDOWN, VK_SPACE, (scan << 16) | 0x00000001);
         PostMessage(root, WM_KEYUP,   VK_SPACE, (scan << 16) | 0xC0000001);
