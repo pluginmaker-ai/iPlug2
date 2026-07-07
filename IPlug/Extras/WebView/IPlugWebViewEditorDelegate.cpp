@@ -118,13 +118,25 @@ void WebViewEditorDelegate::InjectViewportFit()
   // under it). So besides the 'resize' listener, re-fit on devicePixelRatio
   // changes via the canonical matchMedia('(resolution: Xdppx)') watcher, plus a
   // few timed convergence re-fits. The fit itself is idempotent and cheap.
-  char js[1400];
+  // DPI-virtualized hosts (Ableton Auto-Scale) make innerWidth/Height lie by
+  // exactly the virtualization factor — the page persistently measures the
+  // physical-derived viewport while only measured/vf CSS px are visible, and
+  // no resize/dpr event ever corrects it (measured: iw=1500 for a visible
+  // ~1200, across a whole session). The native zoom reconcile measures the
+  // factor and publishes it via SetViewportVirtScale (1.0 everywhere else);
+  // divide the fit's measurements by it. Re-baked on every injection, which
+  // the native side triggers whenever the viewport or factor could change.
+  float vf = GetViewportVirtScale();
+  if (!(vf > 0.f))
+    vf = 1.f;
+
+  char js[1500];
   snprintf(js, sizeof(js),
     "(function(){"
-    "var dw=%d,dh=%d;"
+    "var dw=%d,dh=%d,vf=%.4f;"
     "var de=document.documentElement,b=document.body;"
     "window.__iplugFit=function(){"
-      "var iw=window.innerWidth,ih=window.innerHeight;"
+      "var iw=window.innerWidth/vf,ih=window.innerHeight/vf;"
       "if(!(iw>0&&ih>0&&dw>0&&dh>0))return;"
       // Undershoot by 2 CSS px per axis: innerWidth/Height are rounded UP from
       // the physical surface, the surface itself overshoots the parent by the
@@ -156,10 +168,10 @@ void WebViewEditorDelegate::InjectViewportFit()
     "setTimeout(window.__iplugFit,50);setTimeout(window.__iplugFit,200);"
     "setTimeout(window.__iplugFit,600);setTimeout(window.__iplugFit,1500);"
     // diagnostic: surfaced in the webview-init log via the fit_done trace
-    "return JSON.stringify({iw:window.innerWidth,ih:window.innerHeight,"
+    "return JSON.stringify({iw:window.innerWidth,ih:window.innerHeight,vf:vf,"
     "dpr:window.devicePixelRatio,dw:dw,dh:dh,t:de.style.transform});"
     "})();",
-    mDesignWidth, mDesignHeight);
+    mDesignWidth, mDesignHeight, vf);
   EvaluateJavaScript(js, nullptr);
 }
 

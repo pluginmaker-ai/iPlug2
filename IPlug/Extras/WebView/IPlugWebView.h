@@ -120,6 +120,16 @@ public:
    * e.g. the host window crossed to a monitor with a different DPI, or the visible
    * region was clamped — so the delegate can re-fit the content to the new viewport. */
   virtual void OnWebViewViewportChanged() {}
+
+  /** (Windows) DPI-virtualized hosts (Ableton Auto-Scale) make window.innerWidth/Height
+   * lie by exactly the virtualization factor: the page persistently measures the
+   * physical-derived viewport while only measured/vf CSS px are actually visible
+   * (measured on Ableton 12.4 @125%: innerWidth 1500 for a visible ~1200, across the
+   * whole session — it never settles). The zoom reconcile measures the factor from
+   * dual-context client-rect reads and stores it here; the viewport-fit divides its
+   * measurements by it. 1.0 on every host that doesn't virtualize. */
+  void SetViewportVirtScale(float scale) { mViewportVirtScale = (scale > 0.f) ? scale : 1.f; }
+  float GetViewportVirtScale() const { return mViewportVirtScale; }
   
   /** When a script in the web view posts a message, it will arrive as a UTF8 json string here */
   virtual void OnMessageFromWebView(const char* json) {}
@@ -146,6 +156,7 @@ private:
   std::unique_ptr<IWebViewImpl> mpImpl;
   bool mOpaque;
   bool mEnableDevTools = false;
+  float mViewportVirtScale = 1.f;
   WDL_String mCustomUrlScheme;
 };
 

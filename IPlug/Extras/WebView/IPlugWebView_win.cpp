@@ -1177,10 +1177,27 @@ bool IWebViewImpl::ApplyWebViewBounds()
         // (margins, overzoomed crop, and a hand-corrected perfect render).
         mWebViewBounds = physicalRect;
         zoom *= fx / monitorScale;
+
+        // On this (virtualized) path window.innerWidth/Height persistently lie
+        // by monitorScale — the page measures the physical-derived viewport
+        // while only measured/monitorScale CSS px are visible, and no
+        // resize/dpr event ever corrects it. Publish the factor so the
+        // viewport-fit divides its measurements by it (natural-size render,
+        // the verified Ableton 12.4 state). 1.0 hosts never reach this block.
+        if (mIWebView)
+          mIWebView->SetViewportVirtScale(monitorScale);
+
         ::WebViewInitLog("SetWebViewBounds:reconciled", S_OK,
                          "f=%.3f monitorScale=%.3f clientPhys=%ldx%ld internal=%ldx%ld requested=%ldx%ld zoom=%.3f",
                          fx, monitorScale, clientW, clientH, internalW,
                          internalRect.bottom - internalRect.top, boundsW, boundsH, zoom);
+      }
+      else if (!nonTrivial && mIWebView)
+      {
+        // Bounds match the physical client (the normal-host signature) —
+        // make sure a stale factor from a prior virtualized state can't
+        // linger after e.g. toggling Auto-Scale off.
+        mIWebView->SetViewportVirtScale(1.f);
       }
     }
   }
