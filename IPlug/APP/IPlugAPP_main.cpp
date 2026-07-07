@@ -25,6 +25,10 @@ using namespace iplug;
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <map>
+#include <algorithm>
+
+#include "IPlugMidi.h"
 
 // Include stb_image_write for PNG saving
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -54,6 +58,107 @@ static bool KeyboardFocusIsInWebView()
       return true;
     hFocus = GetParent(hFocus);
   }
+  return false;
+}
+
+// Computer-keyboard → MIDI for the Windows standalone player, mirroring the
+// macOS SWELLAPP_PROCESSMESSAGE handler below. Home row + upper row play a
+// chromatic run (A/S/D/F/G/H/J/K/L white, W/E/T/Y/U/O black, Z/X shift octave).
+// Mapped by physical scan code so it's keyboard-layout independent — same layout
+// the macOS handler gets from physical virtual-key codes. Unlike macOS (whose
+// native SWELL host sees every key event), the shipped web UI has no computer-
+// keyboard handler on any platform, so this native path is what makes the
+// standalone playable from the QWERTY keys on Windows.
+static int IPlugAPPKbdSemitoneWin(unsigned int scanCode)
+{
+  switch (scanCode)
+  {
+    case 0x1E: return 0;   // A -> C
+    case 0x11: return 1;   // W -> C#
+    case 0x1F: return 2;   // S -> D
+    case 0x12: return 3;   // E -> D#
+    case 0x20: return 4;   // D -> E
+    case 0x21: return 5;   // F -> F
+    case 0x14: return 6;   // T -> F#
+    case 0x22: return 7;   // G -> G
+    case 0x15: return 8;   // Y -> G#
+    case 0x23: return 9;   // H -> A
+    case 0x16: return 10;  // U -> A#
+    case 0x24: return 11;  // J -> B
+    case 0x25: return 12;  // K -> C
+    case 0x18: return 13;  // O -> C#
+    case 0x26: return 14;  // L -> D
+    default:   return -1;
+  }
+}
+
+static const unsigned int kIPlugAPPKbdScanZ = 0x2C; // octave down
+static const unsigned int kIPlugAPPKbdScanX = 0x2D; // octave up
+
+static int sIPlugAPPKbdOctaveWin = 0;                     // Z/X shift, clamped ±3
+static std::map<unsigned int, int> sIPlugAPPKbdHeldWin;   // scanCode → note (dedup + correct note-off)
+
+// Handle a WM_KEYDOWN/WM_KEYUP from the message pump as a computer-keyboard note.
+// Returns true when the message was a mapped note/octave key that we consumed —
+// the caller then skips dispatch so the key doesn't also reach the WebView2 (the
+// macOS handler consumes mapped keys the same way by returning 1). Any other
+// message returns false and flows on untouched.
+static bool HandleKbdMidiMessage(const MSG& msg)
+{
+  if (msg.message != WM_KEYDOWN && msg.message != WM_KEYUP)
+    return false;
+
+  IPlugAPPHost* pHost = IPlugAPPHost::sInstance.get();
+  IPlugAPP* pPlug = pHost ? pHost->GetPlug() : nullptr;
+  if (!pPlug)
+    return false;
+
+  const unsigned int scanCode = (msg.lParam >> 16) & 0xFF;
+
+  // Note-off is processed regardless of current modifiers: a note started
+  // without a modifier must always be released, even if Ctrl/Alt is now held —
+  // otherwise the voice sticks.
+  if (msg.message == WM_KEYUP)
+  {
+    auto held = sIPlugAPPKbdHeldWin.find(scanCode);
+    if (held == sIPlugAPPKbdHeldWin.end())
+      return false;
+    IMidiMsg midiMsg; midiMsg.MakeNoteOffMsg(held->second, 0);
+    pPlug->SendMidiMsgFromUI(midiMsg);
+    sIPlugAPPKbdHeldWin.erase(held);
+    return true;
+  }
+
+  // WM_KEYDOWN. Skip when Ctrl/Alt is down so app accelerators (screenshot etc.)
+  // and system shortcuts keep working.
+  if ((GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000))
+    return false;
+
+  const bool isMapped =
+    scanCode == kIPlugAPPKbdScanZ || scanCode == kIPlugAPPKbdScanX || IPlugAPPKbdSemitoneWin(scanCode) >= 0;
+
+  // Auto-repeat (lParam bit 30): consume mapped keys without re-triggering, so a
+  // held note doesn't leak repeated keydowns to the WebView2. Mirrors the macOS
+  // !isARepeat guard.
+  if (msg.lParam & 0x40000000)
+    return isMapped;
+
+  if (scanCode == kIPlugAPPKbdScanZ) { sIPlugAPPKbdOctaveWin = std::max(-3, sIPlugAPPKbdOctaveWin - 1); return true; }
+  if (scanCode == kIPlugAPPKbdScanX) { sIPlugAPPKbdOctaveWin = std::min( 3, sIPlugAPPKbdOctaveWin + 1); return true; }
+
+  const int semitone = IPlugAPPKbdSemitoneWin(scanCode);
+  if (semitone >= 0 && sIPlugAPPKbdHeldWin.find(scanCode) == sIPlugAPPKbdHeldWin.end())
+  {
+    const int note = 48 + sIPlugAPPKbdOctaveWin * 12 + semitone;
+    if (note >= 0 && note <= 127)
+    {
+      sIPlugAPPKbdHeldWin[scanCode] = note;
+      IMidiMsg midiMsg; midiMsg.MakeNoteOnMsg(note, 96, 0);
+      pPlug->SendMidiMsgFromUI(midiMsg);
+    }
+    return true;
+  }
+
   return false;
 }
 
@@ -246,7 +351,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpszCmdPa
         DispatchMessage(&msg);
         continue;
       }
-      
+
+      // Play the standalone from the computer keyboard (mirrors the macOS
+      // SWELLAPP_PROCESSMESSAGE handler). Handled here in the pump so it sees the
+      // key whether the WebView2 or the dialog has focus; mapped note/octave keys
+      // are consumed so they don't also reach the web content. Runs before the
+      // accelerator check, but skips itself while Ctrl/Alt is held, so app
+      // accelerators (e.g. Ctrl+Shift+S screenshot) are unaffected.
+      if (HandleKbdMidiMessage(msg))
+        continue;
+
       // Accelerators run regardless of focus so app shortcuts (screenshot etc.)
       // keep working. This only consumes registered accelerator combos (all of
       // which use Ctrl/Shift), never the plain, unmodified note keys.
