@@ -1284,6 +1284,58 @@ void IWebViewImpl::PinRasterizationScale()
   if (!ctrlr3)
     return;
 
+  // Hosts that DPI-virtualize the plugin window (Ableton Auto-Scale: window
+  // internally 1200x800 but displayed 1500x1000, every DPI API lying) depend
+  // on Chromium's hidden monitor-scale rasterization, which the zoom
+  // reconcile in SetWebViewBounds counters (zoom = f / monitorScale). Pinning
+  // the rasterization scale on such a host kills that hidden scale AFTER the
+  // page already measured its viewport — and with detection off no
+  // resize/dpr event ever fires for the correction — so the fit stays
+  // computed against the pre-settle viewport and the content renders
+  // overzoomed and cropped (the exact failure state the Ableton 12.4
+  // reconcile fixed). Measure the virtualization ratio the same dual-context
+  // way the reconcile does and skip the pin entirely on virtualized hosts;
+  // their proven-good path is Chromium auto-detection + the zoom reconcile.
+  // The ratio is ~1.0 on every host that doesn't play this game (Studio One,
+  // Fender Studio Pro, Reaper, ...), so those keep the pin unchanged.
+  {
+    using GetWindowDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(HWND);
+    using SetThreadDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    static GetWindowDpiCtxFn pGetWindowDpiCtx = []() {
+      HMODULE user32 = GetModuleHandleW(L"user32.dll");
+      return user32 ? reinterpret_cast<GetWindowDpiCtxFn>(GetProcAddress(user32, "GetWindowDpiAwarenessContext")) : nullptr;
+    }();
+    static SetThreadDpiCtxFn pSetThreadDpiCtx = []() {
+      HMODULE user32 = GetModuleHandleW(L"user32.dll");
+      return user32 ? reinterpret_cast<SetThreadDpiCtxFn>(GetProcAddress(user32, "SetThreadDpiAwarenessContext")) : nullptr;
+    }();
+
+    if (pGetWindowDpiCtx && pSetThreadDpiCtx)
+    {
+      RECT physicalRect = {};
+      RECT internalRect = {};
+      DPI_AWARENESS_CONTEXT prev = pSetThreadDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+      GetClientRect(mParentWnd, &physicalRect);
+      pSetThreadDpiCtx(pGetWindowDpiCtx(mParentWnd));
+      GetClientRect(mParentWnd, &internalRect);
+      pSetThreadDpiCtx(prev);
+
+      const LONG physW = physicalRect.right - physicalRect.left;
+      const LONG intW = internalRect.right - internalRect.left;
+      if (physW > 0 && intW > 0)
+      {
+        const float virtScale = static_cast<float>(physW) / static_cast<float>(intW);
+        if (virtScale > 0.5f && virtScale < 4.f && std::fabs(virtScale - 1.f) > 0.05f)
+        {
+          ::WebViewInitLog("controller:raster_pin_skipped", S_OK,
+                           "virtScale=%.3f (DPI-virtualized host — Chromium auto-scale + zoom reconcile own this path)",
+                           virtScale);
+          return;
+        }
+      }
+    }
+  }
+
   float scale = GetScaleForHWND(mParentWnd);
   if (scale <= 0.f)
     scale = 1.f;
