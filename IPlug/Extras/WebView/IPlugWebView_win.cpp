@@ -135,9 +135,12 @@ private:
   }
 
   static LRESULT CALLBACK AspectRatioSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
+  static LRESULT CALLBACK ParentWatchSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
   void InstallAspectRatioHook(int designWidth, int designHeight);
   void RemoveAspectRatioHook();
-  void ApplyWebViewBounds();
+  bool ApplyWebViewBounds(); // returns true when the effective bounds/zoom actually changed
+  void PinRasterizationScale();
+  void SnapFrameToContent();
 public:
   void SetMinSize(int minW, int minH) { mMinWidth = minW; mMinHeight = minH; }
 private:
@@ -146,6 +149,13 @@ private:
   bool mOpaque;
   HWND mParentWnd = NULL;
   HWND mSubclassedHwnd = NULL;
+  HWND mSubclassedParentWnd = NULL;
+  bool mInSizeMove = false;
+  // Last bounds/zoom actually pushed to the controller — dedup guard so the
+  // parent-watch and resize storms don't spam identical SetBoundsAndZoomFactor
+  // calls (and identical log lines).
+  RECT mLastPushedBounds = { -1, -1, -1, -1 };
+  double mLastPushedZoom = -999.0;
   int mDesignWidth = 0;
   int mDesignHeight = 0;
   int mMinWidth = 0;
@@ -186,6 +196,8 @@ using namespace Microsoft::WRL;
 // the user's live drag gesture and lets us clamp the rect in place before
 // Windows (and the host DAW) ever see a non-proportional size.
 static const UINT_PTR kAspectRatioSubclassId = 0x1AA5BEC7;
+static const UINT_PTR kParentWatchSubclassId = 0x1AA5BEC8;
+static const UINT_PTR kFrameSnapTimerId = 0x1AA5BEC9;
 
 LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
@@ -195,7 +207,8 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
     return DefSubclassProc(hWnd, msg, wParam, lParam);
   }
 
-  if ((msg != WM_SIZING && msg != WM_GETMINMAXINFO) || !dwRefData)
+  if ((msg != WM_GETMINMAXINFO && msg != WM_SIZE && msg != WM_DPICHANGED &&
+       msg != WM_ENTERSIZEMOVE && msg != WM_EXITSIZEMOVE && msg != WM_TIMER) || !dwRefData)
     return DefSubclassProc(hWnd, msg, wParam, lParam);
 
   IWebViewImpl* self = reinterpret_cast<IWebViewImpl*>(dwRefData);
@@ -216,8 +229,21 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
     RECT windowRect, clientRect;
     GetWindowRect(hWnd, &windowRect);
     GetClientRect(hWnd, &clientRect);
-    const int ncW = (windowRect.right - windowRect.left) - clientRect.right;
-    const int ncH = (windowRect.bottom - windowRect.top) - clientRect.bottom;
+    int ncW = (windowRect.right - windowRect.left) - clientRect.right;
+    int ncH = (windowRect.bottom - windowRect.top) - clientRect.bottom;
+
+    // Include the host's in-client chrome (see the WM_SIZING block) so the
+    // minimum applies to the plugin area, not the whole frame client.
+    if (self->mParentWnd && self->mParentWnd != hWnd)
+    {
+      RECT containerRect = {};
+      if (GetClientRect(self->mParentWnd, &containerRect) && containerRect.right > 0 && containerRect.bottom > 0 &&
+          clientRect.right >= containerRect.right && clientRect.bottom >= containerRect.bottom)
+      {
+        ncW += clientRect.right - containerRect.right;
+        ncH += clientRect.bottom - containerRect.bottom;
+      }
+    }
 
     MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
     mmi->ptMinTrackSize.x = minW + ncW;
@@ -225,107 +251,127 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
     return 0;
   }
 
-  // Below here: msg == WM_SIZING
+  // Track the interactive size/move loop, and after it ends (or after any
+  // settled layout change, via the debounce timer) snap the host frame to hug
+  // the plugin content: hosts like Studio One center the aspect-corrected view
+  // inside whatever window the user dragged and paint the leftover as dead
+  // black bands — they never shrink the window themselves.
+  if (msg == WM_ENTERSIZEMOVE)
+  {
+    self->mInSizeMove = true;
+    ::WebViewInitLog("AspectHook:ENTERSIZEMOVE", S_OK, nullptr);
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+  }
+  if (msg == WM_EXITSIZEMOVE)
+  {
+    self->mInSizeMove = false;
+    ::WebViewInitLog("AspectHook:EXITSIZEMOVE", S_OK, nullptr);
+    SetTimer(hWnd, kFrameSnapTimerId, 60, nullptr);
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+  }
+  if (msg == WM_TIMER)
+  {
+    if (wParam == kFrameSnapTimerId)
+    {
+      KillTimer(hWnd, kFrameSnapTimerId);
+      ::WebViewInitLog("FrameSnap:timer_fire", S_OK, nullptr);
+      self->SnapFrameToContent();
+      return 0;
+    }
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+  }
 
-  RECT* rect = reinterpret_cast<RECT*>(lParam);
-  // Subtract non-client (title bar, borders) so aspect applies to the client
-  // area only — otherwise the title bar skews the ratio.
-  RECT windowRect, clientRect;
-  GetWindowRect(hWnd, &windowRect);
-  GetClientRect(hWnd, &clientRect);
-  const int ncW = (windowRect.right - windowRect.left) - clientRect.right;
-  const int ncH = (windowRect.bottom - windowRect.top) - clientRect.bottom;
+  // WM_DPICHANGED: the top-level frame crossed to a monitor with a different
+  // DPI. Hosts like Studio One / Fender Studio Pro tell the plugin NOTHING here
+  // (no onSize, no setContentScaleFactor) while re-laying-out their own chrome —
+  // measured live: the chrome strip grows to chromeLogical*newScale and our
+  // parent container is shifted down below it WITHOUT being resized, so its
+  // bottom hangs outside the frame, clipped. Let the host's own handler run
+  // first (DefSubclassProc), then self-correct: re-pin the rasterization scale,
+  // re-apply + re-clamp the WebView bounds against the frame's new layout, and
+  // have the delegate re-fit the content to the changed viewport.
+  if (msg == WM_DPICHANGED)
+  {
+    const LRESULT res = DefSubclassProc(hWnd, msg, wParam, lParam);
+    if (self->mHasLastBounds && self->mWebViewCtrlr)
+    {
+      ::WebViewInitLog("AspectHook:WM_DPICHANGED", S_OK, "newDpi=%u", (unsigned)HIWORD(wParam));
+      self->ApplyWebViewBounds();
+      if (self->mIWebView)
+        self->mIWebView->OnWebViewViewportChanged();
+    }
+    return res;
+  }
 
-  const int draggedW = (rect->right - rect->left) - ncW;
-  const int draggedH = (rect->bottom - rect->top) - ncH;
-  if (draggedW <= 0 || draggedH <= 0)
+  // WM_SIZE: the host committed a frame size. Studio One / Fender Studio Pro
+  // clamp ONLY this top-level frame to the screen work area on a clean open
+  // (delivered as a bare WM_SIZE, never WM_SIZING) while building our parent
+  // container at the full requested size as a child of the clamped frame — so
+  // the bottom of the WebView hangs below the visible frame edge, clipped, with
+  // no scrollbar. GetClientRect(mParentWnd) can't see it (it stays full size);
+  // only this frame is clamped. Re-apply so the visibility clamp inside
+  // ApplyWebViewBounds re-reads the frame's real client region, and re-fit the
+  // content. (Idempotent — on ordinary host-driven resizes the host's onSize
+  // storm re-applies with identical values anyway.)
+  if (msg == WM_SIZE)
+  {
+    if (self->mHasLastBounds && self->mWebViewCtrlr)
+    {
+      self->ApplyWebViewBounds();
+      if (self->mIWebView)
+        self->mIWebView->OnWebViewViewportChanged();
+      // debounce a frame snap for hosts that never run the standard size-move
+      // loop (no WM_ENTER/EXITSIZEMOVE) — reset on every size event, fires
+      // once the layout settles
+      if (!self->mInSizeMove)
+        SetTimer(hWnd, kFrameSnapTimerId, 80, nullptr);
+    }
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+  }
+
+  // NOTE: we deliberately do NOT intercept WM_SIZING to aspect-lock the drag
+  // rectangle anymore. Measured live on Fender Studio Pro: FSP re-applies its
+  // own mouse-driven width right after our correction, so the two fight and the
+  // window visibly oscillates (~192px) throughout the drag. Aspect is now owned
+  // by the injected viewport-fit (letterboxes the content, centered, during the
+  // drag) and by the post-release frame snap (trims the host window to hug the
+  // content). No mid-drag window correction = no fight = no flicker.
+  return DefSubclassProc(hWnd, msg, wParam, lParam);
+}
+
+// The host can re-layout our parent container SILENTLY — measured on Fender
+// Studio Pro: after an interactive resize ends (and on some DPI transitions)
+// the container is moved/cropped within the host frame with NO WM_SIZE on the
+// frame and NO onSize to the plugin, leaving the WebView's bottom outside the
+// visible area. Watching the parent itself closes that blind spot: any position
+// or size change re-runs ApplyWebViewBounds (which re-measures the visible
+// intersection) and, only when the effective bounds really changed, asks the
+// delegate to re-fit the content. The dedup guard in ApplyWebViewBounds makes
+// the storm-case (WM_WINDOWPOSCHANGED spam during drags) a cheap no-op.
+LRESULT CALLBACK IWebViewImpl::ParentWatchSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+  if (msg == WM_NCDESTROY)
+  {
+    RemoveWindowSubclass(hWnd, &IWebViewImpl::ParentWatchSubclassProc, uIdSubclass);
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+  }
+
+  if ((msg != WM_WINDOWPOSCHANGED && msg != WM_SIZE && msg != WM_MOVE) || !dwRefData)
     return DefSubclassProc(hWnd, msg, wParam, lParam);
 
-  const float aspect = static_cast<float>(designW) / static_cast<float>(designH);
-  int newW = draggedW;
-  int newH = draggedH;
+  const LRESULT res = DefSubclassProc(hWnd, msg, wParam, lParam);
 
-  switch (wParam)
+  IWebViewImpl* self = reinterpret_cast<IWebViewImpl*>(dwRefData);
+  if (self->mHasLastBounds && self->mWebViewCtrlr)
   {
-    case WMSZ_LEFT:
-    case WMSZ_RIGHT:
-      // Horizontal edge drag — keep width, adjust height to match aspect.
-      newH = static_cast<int>(static_cast<float>(draggedW) / aspect + 0.5f);
-      break;
-    case WMSZ_TOP:
-    case WMSZ_BOTTOM:
-      // Vertical edge drag — keep height, adjust width to match aspect.
-      newW = static_cast<int>(static_cast<float>(draggedH) * aspect + 0.5f);
-      break;
-    case WMSZ_TOPLEFT:
-    case WMSZ_TOPRIGHT:
-    case WMSZ_BOTTOMLEFT:
-    case WMSZ_BOTTOMRIGHT:
-    {
-      // Corner drag — pick the dimension that was dragged more aggressively
-      // relative to the design aspect, and clamp the other to match.
-      const float draggedAspect = static_cast<float>(draggedW) / static_cast<float>(draggedH);
-      if (draggedAspect > aspect)
-        newW = static_cast<int>(static_cast<float>(draggedH) * aspect + 0.5f);
-      else
-        newH = static_cast<int>(static_cast<float>(draggedW) / aspect + 0.5f);
-      break;
-    }
-    default:
-      return DefSubclassProc(hWnd, msg, wParam, lParam);
+    if (self->ApplyWebViewBounds() && self->mIWebView)
+      self->mIWebView->OnWebViewViewportChanged();
+    // the host re-laid-out our container — debounce a frame snap so dead
+    // letterbox bands (host centers a smaller view, keeps its window) collapse
+    if (!self->mInSizeMove && self->mSubclassedHwnd)
+      SetTimer(self->mSubclassedHwnd, kFrameSnapTimerId, 80, nullptr);
   }
-
-  // Clamp to the plugin's minimum size while preserving aspect ratio. If
-  // either dimension would go below its minimum, rescale both so the smaller
-  // dimension sits exactly at its minimum — this keeps the resize smooth
-  // instead of snapping to sub-minimum sizes.
-  if (newW < minW || newH < minH)
-  {
-    const float scaleW = static_cast<float>(minW) / static_cast<float>(newW);
-    const float scaleH = static_cast<float>(minH) / static_cast<float>(newH);
-    const float scaleUp = (scaleW > scaleH) ? scaleW : scaleH;
-    newW = static_cast<int>(static_cast<float>(newW) * scaleUp + 0.5f);
-    newH = static_cast<int>(static_cast<float>(newH) * scaleUp + 0.5f);
-  }
-
-  // Anchor the non-moving edge, move the other to apply the corrected dims.
-  switch (wParam)
-  {
-    case WMSZ_LEFT:
-      rect->left = rect->right - (newW + ncW);
-      rect->bottom = rect->top + newH + ncH;
-      break;
-    case WMSZ_RIGHT:
-      rect->right = rect->left + newW + ncW;
-      rect->bottom = rect->top + newH + ncH;
-      break;
-    case WMSZ_TOP:
-      rect->top = rect->bottom - (newH + ncH);
-      rect->right = rect->left + newW + ncW;
-      break;
-    case WMSZ_BOTTOM:
-      rect->bottom = rect->top + newH + ncH;
-      rect->right = rect->left + newW + ncW;
-      break;
-    case WMSZ_TOPLEFT:
-      rect->top = rect->bottom - (newH + ncH);
-      rect->left = rect->right - (newW + ncW);
-      break;
-    case WMSZ_TOPRIGHT:
-      rect->top = rect->bottom - (newH + ncH);
-      rect->right = rect->left + newW + ncW;
-      break;
-    case WMSZ_BOTTOMLEFT:
-      rect->bottom = rect->top + newH + ncH;
-      rect->left = rect->right - (newW + ncW);
-      break;
-    case WMSZ_BOTTOMRIGHT:
-      rect->bottom = rect->top + newH + ncH;
-      rect->right = rect->left + newW + ncW;
-      break;
-  }
-
-  return TRUE;
+  return res;
 }
 
 void IWebViewImpl::InstallAspectRatioHook(int designWidth, int designHeight)
@@ -346,14 +392,29 @@ void IWebViewImpl::InstallAspectRatioHook(int designWidth, int designHeight)
   {
     mSubclassedHwnd = topLevel;
   }
+
+  // Watch the parent container itself for silent host re-layouts (see
+  // ParentWatchSubclassProc). Skip when the parent IS the top-level window
+  // (standalone app) — the frame subclass already covers it.
+  if (mParentWnd != topLevel &&
+      SetWindowSubclass(mParentWnd, &IWebViewImpl::ParentWatchSubclassProc, kParentWatchSubclassId, reinterpret_cast<DWORD_PTR>(this)))
+  {
+    mSubclassedParentWnd = mParentWnd;
+  }
 }
 
 void IWebViewImpl::RemoveAspectRatioHook()
 {
   if (mSubclassedHwnd)
   {
+    KillTimer(mSubclassedHwnd, kFrameSnapTimerId);
     RemoveWindowSubclass(mSubclassedHwnd, &IWebViewImpl::AspectRatioSubclassProc, kAspectRatioSubclassId);
     mSubclassedHwnd = NULL;
+  }
+  if (mSubclassedParentWnd)
+  {
+    RemoveWindowSubclass(mSubclassedParentWnd, &IWebViewImpl::ParentWatchSubclassProc, kParentWatchSubclassId);
+    mSubclassedParentWnd = NULL;
   }
 }
 
@@ -710,14 +771,46 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
               controller2->put_DefaultBackgroundColor(color);
             }
 
+            // Own the rasterization scale from the first frame. By default
+            // WebView2 auto-detects monitor scale changes and re-rasterizes at
+            // its own pace — racing our bounds math and the injected CSS fit
+            // (measured: the fit read the viewport, then the auto-raster kicked
+            // in and shrank it, leaving the content ~monitorScale too large and
+            // the bottom clipped). Pin it to the parent window's DPI so the
+            // page's devicePixelRatio is deterministic; re-pinned on every
+            // ApplyWebViewBounds and on WM_DPICHANGED.
+            PinRasterizationScale();
+
             // Replay the latest size request now that the controller exists.
             // The host may have (re)sized the parent window during the async
             // controller creation, so recompute against the live client rect
             // instead of pushing the possibly-stale mWebViewBounds.
             if (mHasLastBounds)
+            {
               ApplyWebViewBounds();
+            }
             else
-              mWebViewCtrlr->put_Bounds(mWebViewBounds);
+            {
+              // No host onSize yet. Some hosts (e.g. Studio One / Fender Studio
+              // Pro with this plugin) never send an initial onSize — they wait
+              // for the first resize/DPI event. Seed the controller bounds from
+              // the parent's actual client rect so the UI is visible on OPEN
+              // instead of a black rectangle until the user resizes. The proper
+              // sentinel-aware sizing lands as soon as onSize does fire.
+              RECT seed = {};
+              bool haveSeed = GetClientRect(mParentWnd, &seed) && seed.right > 0 && seed.bottom > 0;
+              if (!haveSeed && mDesignWidth > 0 && mDesignHeight > 0)
+              {
+                float dpiScale = GetScaleForHWND(mParentWnd);
+                if (dpiScale <= 0.f) dpiScale = 1.f;
+                seed = GetScaledRect(0.f, 0.f, static_cast<float>(mDesignWidth), static_cast<float>(mDesignHeight), dpiScale);
+                haveSeed = true;
+              }
+              mWebViewCtrlr->put_Bounds(haveSeed ? seed : mWebViewBounds);
+              mWebViewBounds = haveSeed ? seed : mWebViewBounds;
+              mWebViewCtrlr->put_IsVisible(TRUE);
+              ::WebViewInitLog("controller:seed_bounds", S_OK, "rect=%ldx%ld", seed.right, seed.bottom);
+            }
 
 #if defined APP_API
             // Standalone (APP) only: move keyboard focus into the WebView2 so
@@ -920,15 +1013,26 @@ void IWebViewImpl::ReloadPageContent()
 
 void IWebViewImpl::EvaluateJavaScript(const char* scriptStr, IWebView::completionHandlerFunc func)
 {
+  // The viewport-fit script is load-bearing for DPI correctness — trace its
+  // submission, silent drops (no webview yet), and completion result so a
+  // missing fit is visible in the webview-init log instead of a mystery.
+  const bool isFitScript = scriptStr && strstr(scriptStr, "__iplugFit") != nullptr;
+
   if (mCoreWebView)
   {
+    if (isFitScript)
+      ::WebViewInitLog("EvaluateJavaScript:fit_submit", S_OK, "len=%d", (int)strlen(scriptStr));
+
     int bufSize = UTF8ToUTF16Len(scriptStr);
     std::vector<WCHAR> scriptWide(bufSize);
     UTF8ToUTF16(scriptWide.data(), scriptStr, bufSize);
 
     mCoreWebView->ExecuteScript(
-      scriptWide.data(), Callback<ICoreWebView2ExecuteScriptCompletedHandler>([func](HRESULT errorCode,
+      scriptWide.data(), Callback<ICoreWebView2ExecuteScriptCompletedHandler>([func, isFitScript](HRESULT errorCode,
                                                                               LPCWSTR resultObjectAsJson) -> HRESULT {
+                    if (isFitScript)
+                      ::WebViewInitLog("EvaluateJavaScript:fit_done", errorCode, "result=%S",
+                                       resultObjectAsJson ? resultObjectAsJson : L"(null)");
                     if (func && resultObjectAsJson)
                     {
                       WDL_String str;
@@ -937,6 +1041,10 @@ void IWebViewImpl::EvaluateJavaScript(const char* scriptStr, IWebView::completio
                     }
                     return S_OK;
                   }).Get());
+  }
+  else if (isFitScript)
+  {
+    ::WebViewInitLog("EvaluateJavaScript:fit_dropped", E_FAIL, "no CoreWebView yet");
   }
 }
 
@@ -962,7 +1070,7 @@ void IWebViewImpl::SetWebViewBounds(float x, float y, float w, float h, float sc
   ApplyWebViewBounds();
 }
 
-void IWebViewImpl::ApplyWebViewBounds()
+bool IWebViewImpl::ApplyWebViewBounds()
 {
   const float x = mLastBoundsX;
   const float y = mLastBoundsY;
@@ -975,7 +1083,11 @@ void IWebViewImpl::ApplyWebViewBounds()
   mWebViewBounds = GetScaledRect(x, y, w, h, dpiScale);
 
   if (!mWebViewCtrlr)
-    return;
+    return false;
+
+  // Keep the rasterization scale in lockstep with the parent window's DPI
+  // (idempotent; see the comment at the controller-ready pin).
+  PinRasterizationScale();
 
   // scale == -1: FL Studio — zoom = 1/dpiScale, normal DPI bounds
   // scale == -2: Cubase — zoom = 1.0, skip DPI bounds (host sends physical pixels)
@@ -1081,13 +1193,110 @@ void IWebViewImpl::ApplyWebViewBounds()
         // (margins, overzoomed crop, and a hand-corrected perfect render).
         mWebViewBounds = physicalRect;
         zoom *= fx / monitorScale;
+
+        // On this (virtualized) path window.innerWidth/Height persistently lie
+        // by monitorScale — the page measures the physical-derived viewport
+        // while only measured/monitorScale CSS px are visible, and no
+        // resize/dpr event ever corrects it. Publish the factor so the
+        // viewport-fit divides its measurements by it (natural-size render,
+        // the verified Ableton 12.4 state). 1.0 hosts never reach this block.
+        if (mIWebView)
+          mIWebView->SetViewportVirtScale(monitorScale);
+
         ::WebViewInitLog("SetWebViewBounds:reconciled", S_OK,
                          "f=%.3f monitorScale=%.3f clientPhys=%ldx%ld internal=%ldx%ld requested=%ldx%ld zoom=%.3f",
                          fx, monitorScale, clientW, clientH, internalW,
                          internalRect.bottom - internalRect.top, boundsW, boundsH, zoom);
       }
+      else if (!nonTrivial && mIWebView)
+      {
+        // Bounds match the physical client (the normal-host signature) —
+        // make sure a stale factor from a prior virtualized state can't
+        // linger after e.g. toggling Auto-Scale off.
+        mIWebView->SetViewportVirtScale(1.f);
+      }
     }
   }
+
+  // Visibility clamp (Studio One / Fender Studio Pro and similar). Two measured
+  // host behaviors leave part of the WebView OUTSIDE the visible top-level
+  // frame, clipped with no scrollbar and no callback to the plugin:
+  //  - clean open on a short screen: the host clamps only the frame to the
+  //    work area while building our parent container at full requested size;
+  //  - cross-DPI monitor move: the host's chrome grows with the new DPI and
+  //    our container is SHIFTED DOWN below it without being resized.
+  // Neither is visible in GetClientRect(mParentWnd) — the parent keeps its full
+  // size; only its position/overlap vs the GA_ROOT frame changes. So compute
+  // the VISIBLE region — the intersection of the frame's client area and the
+  // parent's client area, expressed in parent-client coordinates and measured
+  // in the same PER_MONITOR_AWARE_V2 physical units SetBoundsAndZoomFactor
+  // consumes — and clamp the bounds to it. Zoom is deliberately untouched:
+  // shrinking the bounds shrinks the page viewport, and the delegate's
+  // viewport-fit letterboxes the content inside it. A 2px deadband absorbs the
+  // +1 slop in GetScaledRect so healthy opens stay byte-identical.
+  if (HWND rootFrame = GetAncestor(mParentWnd, GA_ROOT))
+  {
+    RECT parentScreen = {};
+    RECT frameScreen = {};
+    bool measured = false;
+    {
+      using SetThreadDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+      static SetThreadDpiCtxFn pSetThreadDpiCtx = []() {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        return user32 ? reinterpret_cast<SetThreadDpiCtxFn>(GetProcAddress(user32, "SetThreadDpiAwarenessContext")) : nullptr;
+      }();
+      DPI_AWARENESS_CONTEXT prev = pSetThreadDpiCtx ? pSetThreadDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) : nullptr;
+      RECT pc = {}, fc = {};
+      POINT pOrigin = { 0, 0 }, fOrigin = { 0, 0 };
+      if (GetClientRect(mParentWnd, &pc) && ClientToScreen(mParentWnd, &pOrigin) &&
+          GetClientRect(rootFrame, &fc) && ClientToScreen(rootFrame, &fOrigin) &&
+          pc.right > 0 && pc.bottom > 0 && fc.right > 0 && fc.bottom > 0)
+      {
+        parentScreen = { pOrigin.x, pOrigin.y, pOrigin.x + pc.right, pOrigin.y + pc.bottom };
+        frameScreen = { fOrigin.x, fOrigin.y, fOrigin.x + fc.right, fOrigin.y + fc.bottom };
+        measured = true;
+      }
+      if (pSetThreadDpiCtx)
+        pSetThreadDpiCtx(prev);
+    }
+
+    if (measured)
+    {
+      RECT visScreen = {};
+      if (IntersectRect(&visScreen, &parentScreen, &frameScreen))
+      {
+        // visible region in parent-client coordinates (the space of mWebViewBounds)
+        const RECT vis = { visScreen.left - parentScreen.left, visScreen.top - parentScreen.top,
+                           visScreen.right - parentScreen.left, visScreen.bottom - parentScreen.top };
+        RECT clamped = {};
+        if (IntersectRect(&clamped, &mWebViewBounds, &vis))
+        {
+          const bool differs = (clamped.left   > mWebViewBounds.left + 2)  ||
+                               (clamped.top    > mWebViewBounds.top + 2)   ||
+                               (clamped.right  < mWebViewBounds.right - 2) ||
+                               (clamped.bottom < mWebViewBounds.bottom - 2);
+          if (differs)
+          {
+            ::WebViewInitLog("SetWebViewBounds:visclamp", S_OK,
+                             "bounds=(%ld,%ld %ldx%ld) visible=(%ld,%ld %ldx%ld) clamped=(%ld,%ld %ldx%ld)",
+                             mWebViewBounds.left, mWebViewBounds.top,
+                             mWebViewBounds.right - mWebViewBounds.left, mWebViewBounds.bottom - mWebViewBounds.top,
+                             vis.left, vis.top, vis.right - vis.left, vis.bottom - vis.top,
+                             clamped.left, clamped.top,
+                             clamped.right - clamped.left, clamped.bottom - clamped.top);
+            mWebViewBounds = clamped;
+          }
+        }
+      }
+    }
+  }
+
+  // Dedup: the parent-watch and resize storms re-run this often — only push
+  // (and log) when the effective bounds or zoom actually changed.
+  if (EqualRect(&mWebViewBounds, &mLastPushedBounds) && std::fabs(zoom - mLastPushedZoom) < 0.0005)
+    return false;
+  mLastPushedBounds = mWebViewBounds;
+  mLastPushedZoom = zoom;
 
   mWebViewCtrlr->SetBoundsAndZoomFactor(mWebViewBounds, zoom);
 
@@ -1096,6 +1305,176 @@ void IWebViewImpl::ApplyWebViewBounds()
                    w, h, scale, dpiScale,
                    mWebViewBounds.right - mWebViewBounds.left,
                    mWebViewBounds.bottom - mWebViewBounds.top, zoom);
+  return true;
+}
+
+void IWebViewImpl::PinRasterizationScale()
+{
+  if (!mWebViewCtrlr || !mParentWnd)
+    return;
+
+  auto ctrlr3 = mWebViewCtrlr.try_query<ICoreWebView2Controller3>();
+  if (!ctrlr3)
+    return;
+
+  // Hosts that DPI-virtualize the plugin window (Ableton Auto-Scale: window
+  // internally 1200x800 but displayed 1500x1000, every DPI API lying) depend
+  // on Chromium's hidden monitor-scale rasterization, which the zoom
+  // reconcile in SetWebViewBounds counters (zoom = f / monitorScale). Pinning
+  // the rasterization scale on such a host kills that hidden scale AFTER the
+  // page already measured its viewport — and with detection off no
+  // resize/dpr event ever fires for the correction — so the fit stays
+  // computed against the pre-settle viewport and the content renders
+  // overzoomed and cropped (the exact failure state the Ableton 12.4
+  // reconcile fixed). Measure the virtualization ratio the same dual-context
+  // way the reconcile does and skip the pin entirely on virtualized hosts;
+  // their proven-good path is Chromium auto-detection + the zoom reconcile.
+  // The ratio is ~1.0 on every host that doesn't play this game (Studio One,
+  // Fender Studio Pro, Reaper, ...), so those keep the pin unchanged.
+  {
+    using GetWindowDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(HWND);
+    using SetThreadDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    static GetWindowDpiCtxFn pGetWindowDpiCtx = []() {
+      HMODULE user32 = GetModuleHandleW(L"user32.dll");
+      return user32 ? reinterpret_cast<GetWindowDpiCtxFn>(GetProcAddress(user32, "GetWindowDpiAwarenessContext")) : nullptr;
+    }();
+    static SetThreadDpiCtxFn pSetThreadDpiCtx = []() {
+      HMODULE user32 = GetModuleHandleW(L"user32.dll");
+      return user32 ? reinterpret_cast<SetThreadDpiCtxFn>(GetProcAddress(user32, "SetThreadDpiAwarenessContext")) : nullptr;
+    }();
+
+    if (pGetWindowDpiCtx && pSetThreadDpiCtx)
+    {
+      RECT physicalRect = {};
+      RECT internalRect = {};
+      DPI_AWARENESS_CONTEXT prev = pSetThreadDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+      GetClientRect(mParentWnd, &physicalRect);
+      pSetThreadDpiCtx(pGetWindowDpiCtx(mParentWnd));
+      GetClientRect(mParentWnd, &internalRect);
+      pSetThreadDpiCtx(prev);
+
+      const LONG physW = physicalRect.right - physicalRect.left;
+      const LONG intW = internalRect.right - internalRect.left;
+      if (physW > 0 && intW > 0)
+      {
+        const float virtScale = static_cast<float>(physW) / static_cast<float>(intW);
+        if (virtScale > 0.5f && virtScale < 4.f && std::fabs(virtScale - 1.f) > 0.05f)
+        {
+          ::WebViewInitLog("controller:raster_pin_skipped", S_OK,
+                           "virtScale=%.3f (DPI-virtualized host — Chromium auto-scale + zoom reconcile own this path)",
+                           virtScale);
+          return;
+        }
+      }
+    }
+  }
+
+  float scale = GetScaleForHWND(mParentWnd);
+  if (scale <= 0.f)
+    scale = 1.f;
+
+  // One source of truth for the page's devicePixelRatio: the parent window's
+  // DPI. Auto-detection is disabled so WebView2 can never re-rasterize behind
+  // our back on a monitor/DPI change — we re-pin explicitly instead.
+  ctrlr3->put_ShouldDetectMonitorScaleChanges(FALSE);
+
+  double current = 0.0;
+  ctrlr3->get_RasterizationScale(&current);
+  if (std::fabs(current - static_cast<double>(scale)) > 0.01)
+  {
+    ctrlr3->put_RasterizationScale(static_cast<double>(scale));
+    ::WebViewInitLog("controller:raster_pinned", S_OK, "raster=%.2f (was %.2f)", scale, current);
+  }
+}
+
+void IWebViewImpl::SnapFrameToContent()
+{
+  // Collapse dead letterbox bands: when the host centers our (aspect-corrected,
+  // smaller) container inside the window the user dragged — painting the
+  // leftover client area as black bands — shrink the host frame so its client
+  // hugs chrome + container exactly. Shrink-only, >=4px deadband, converges in
+  // one step (the resulting WM_SIZE re-measures to delta 0). Runs debounced
+  // after layout settles, never during the interactive drag.
+  if (!mParentWnd || !mSubclassedHwnd || mInSizeMove)
+  {
+    ::WebViewInitLog("FrameSnap:skip", S_OK, "parent=%p frame=%p inSizeMove=%d",
+                     (void*)mParentWnd, (void*)mSubclassedHwnd, mInSizeMove ? 1 : 0);
+    return;
+  }
+  if (GetAncestor(mParentWnd, GA_ROOT) != mSubclassedHwnd)
+  {
+    ::WebViewInitLog("FrameSnap:skip", S_OK, "reparented (root=%p != hooked frame=%p)",
+                     (void*)GetAncestor(mParentWnd, GA_ROOT), (void*)mSubclassedHwnd);
+    return;
+  }
+
+  using SetThreadDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+  static SetThreadDpiCtxFn pSetThreadDpiCtx = []() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    return user32 ? reinterpret_cast<SetThreadDpiCtxFn>(GetProcAddress(user32, "SetThreadDpiAwarenessContext")) : nullptr;
+  }();
+
+  DPI_AWARENESS_CONTEXT prev = pSetThreadDpiCtx ? pSetThreadDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) : nullptr;
+
+  RECT frameClient = {}, frameWindow = {}, containerWindow = {};
+  POINT frameOrigin = { 0, 0 };
+  const bool ok = GetClientRect(mSubclassedHwnd, &frameClient) && ClientToScreen(mSubclassedHwnd, &frameOrigin) &&
+                  GetWindowRect(mSubclassedHwnd, &frameWindow) && GetWindowRect(mParentWnd, &containerWindow);
+
+  bool snapped = false;
+  int deltaW = 0, deltaH = 0;
+  if (ok && frameClient.right > 0 && frameClient.bottom > 0 && mDesignWidth > 0 && mDesignHeight > 0)
+  {
+    const int containerW = containerWindow.right - containerWindow.left;
+    const int containerH = containerWindow.bottom - containerWindow.top;
+    const int topChrome = containerWindow.top - frameOrigin.y; // host UI strip above the plugin — keep it
+
+    if (containerW > 0 && containerH > 0 && topChrome >= 0)
+    {
+      // Target = the design-aspect contain-fit of the container: where the
+      // CONTENT actually ends (the viewport-fit letterboxes inside the page).
+      // Trimming to the content collapses both the host's dead bands around a
+      // smaller view AND the in-page letterbox in one step.
+      const float fitX = static_cast<float>(containerW) / static_cast<float>(mDesignWidth);
+      const float fitY = static_cast<float>(containerH) / static_cast<float>(mDesignHeight);
+      const float fit = (fitX < fitY) ? fitX : fitY;
+      const int targetW = static_cast<int>(mDesignWidth * fit + 0.5f);
+      const int targetH = static_cast<int>(mDesignHeight * fit + 0.5f);
+
+      deltaW = frameClient.right - targetW;                // dead band + letterbox, horizontally
+      deltaH = frameClient.bottom - (topChrome + targetH); // same, below the content
+
+      // Collapse each axis's dead band INDEPENDENTLY. A small negative delta is
+      // a rounding artifact (measured live: deltaH=-1 while deltaW=193) — it
+      // must NOT veto the other axis's real band, so clamp it to zero. Only a
+      // genuinely negative delta (content overflows the frame by more than the
+      // rounding slop) is clip territory, owned by the visibility clamp; leave
+      // that axis alone rather than shrink into a clip.
+      const int kSlop = 8;
+      const int shrinkW = (deltaW > 4) ? deltaW : 0;
+      const int shrinkH = (deltaH > 4) ? deltaH : 0;
+      if ((shrinkW > 0 && deltaH > -kSlop) || (shrinkH > 0 && deltaW > -kSlop))
+      {
+        const int applyW = (deltaW > -kSlop) ? shrinkW : 0;
+        const int applyH = (deltaH > -kSlop) ? shrinkH : 0;
+        const int newW = (frameWindow.right - frameWindow.left) - applyW;
+        const int newH = (frameWindow.bottom - frameWindow.top) - applyH;
+        SetWindowPos(mSubclassedHwnd, nullptr, 0, 0, newW, newH,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        deltaW = applyW; deltaH = applyH; // report what we actually applied
+        snapped = true;
+      }
+    }
+  }
+
+  if (pSetThreadDpiCtx)
+    pSetThreadDpiCtx(prev);
+
+  if (snapped)
+    ::WebViewInitLog("FrameSnap:applied", S_OK, "deltaW=%d deltaH=%d", deltaW, deltaH);
+  else
+    ::WebViewInitLog("FrameSnap:noop", S_OK, "ok=%d deltaW=%d deltaH=%d frameClient=%ldx%ld",
+                     ok ? 1 : 0, deltaW, deltaH, frameClient.right, frameClient.bottom);
 }
 
 void IWebViewImpl::GetLocalDownloadPathForFile(const char* fileName, WDL_String& downloadPath)

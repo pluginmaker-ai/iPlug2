@@ -68,30 +68,9 @@ void WebViewEditorDelegate::Resize(int width, int height)
   else if (mScreenScale > 1.f) zoomFactor = -2.f;
   SetWebViewBounds(0, 0, static_cast<float>(width), static_cast<float>(height), zoomFactor);
 
-  float effectiveWidth = static_cast<float>(width);
-  float effectiveHeight = static_cast<float>(height);
-  if (!mNeedsDpiZoomCompensation && mScreenScale > 1.f)
-  {
-    effectiveWidth /= mScreenScale;
-    effectiveHeight /= mScreenScale;
-  }
-
-  float scaleX = (mDesignWidth > 0) ? (effectiveWidth / static_cast<float>(mDesignWidth)) : 1.f;
-  float scaleY = (mDesignHeight > 0) ? (effectiveHeight / static_cast<float>(mDesignHeight)) : 1.f;
-  float scale = (scaleX < scaleY) ? scaleX : scaleY;
-  char js[1024];
-  snprintf(js, sizeof(js),
-    "document.documentElement.style.width='%dpx';"
-    "document.documentElement.style.height='%dpx';"
-    "document.documentElement.style.overflow='hidden';"
-    "document.documentElement.style.transform='scale(%f)';"
-    "document.documentElement.style.transformOrigin='top left';"
-    "document.body.style.width='%dpx';"
-    "document.body.style.height='%dpx';"
-    "document.body.style.position='relative';"
-    "document.body.style.overflow='hidden';",
-    mDesignWidth, mDesignHeight, scale, mDesignWidth, mDesignHeight);
-  EvaluateJavaScript(js, nullptr);
+  // Fit the content to the WebView's ACTUAL measured viewport (see
+  // InjectViewportFit) rather than a scale derived from mScreenScale.
+  InjectViewportFit();
 
   EditorResizeFromUI(width, height, true);
 }
@@ -110,36 +89,90 @@ void WebViewEditorDelegate::OnParentWindowResize(int width, int height)
 
   SetWebViewBounds(0, 0, static_cast<float>(width), static_cast<float>(height), zoomFactor);
 
-  // For hosts that send physical pixels (Cubase), divide by screenScale to get
-  // logical CSS scale. For hosts that send logical pixels (FL Studio, Ableton),
-  // screenScale is 1.0 or zoom compensation handles it — no division needed.
-  float effectiveWidth = static_cast<float>(width);
-  float effectiveHeight = static_cast<float>(height);
-  if (!mNeedsDpiZoomCompensation && mScreenScale > 1.f)
-  {
-    effectiveWidth /= mScreenScale;
-    effectiveHeight /= mScreenScale;
-  }
-
-  float scaleX = (mDesignWidth > 0) ? (effectiveWidth / static_cast<float>(mDesignWidth)) : 1.f;
-  float scaleY = (mDesignHeight > 0) ? (effectiveHeight / static_cast<float>(mDesignHeight)) : 1.f;
-  float scale = (scaleX < scaleY) ? scaleX : scaleY;
-
-  char js[1024];
-  snprintf(js, sizeof(js),
-    "document.documentElement.style.width='%dpx';"
-    "document.documentElement.style.height='%dpx';"
-    "document.documentElement.style.overflow='hidden';"
-    "document.documentElement.style.transform='scale(%f)';"
-    "document.documentElement.style.transformOrigin='top left';"
-    "document.body.style.width='%dpx';"
-    "document.body.style.height='%dpx';"
-    "document.body.style.position='relative';"
-    "document.body.style.overflow='hidden';",
-    mDesignWidth, mDesignHeight, scale, mDesignWidth, mDesignHeight);
-  EvaluateJavaScript(js, nullptr);
+  // Fit the content to the WebView's ACTUAL measured viewport (see
+  // InjectViewportFit) rather than a scale derived from mScreenScale — the old
+  // path over-scaled the content by (realDPI / mScreenScale) after a mixed-DPI
+  // monitor move, or when the host's reported scale didn't match the WebView's
+  // rasterization, overflowing the viewport and clipping the bottom of the UI
+  // (the Studio One / Fender Studio Pro high-DPI clip).
+  InjectViewportFit();
 
   EditorResizeFromUI(width, height, false);
+}
+
+void WebViewEditorDelegate::InjectViewportFit()
+{
+  // Scale the design (mDesignWidth x mDesignHeight) to fit the WebView's real
+  // viewport, measured live via window.innerWidth/innerHeight — this is the true
+  // CSS-pixel space the content has, regardless of DPI, host, or which monitor
+  // the window was dragged onto. min(iw/dw, ih/dh) is by construction the largest
+  // scale at which the whole UI fits, so it can never overflow/clip; a host that
+  // already sizes us correctly measures the same scale as before (no visible
+  // change). Self-installs a single resize listener so the fit also re-runs on
+  // drag-resize and on DPI change (moving to a different-scale monitor changes
+  // innerWidth and fires 'resize'), not only when the host calls us back.
+  // The fit must survive the WebView's rasterization scale settling AFTER the
+  // page measured its viewport (measured on a fresh open on a 175% monitor:
+  // innerWidth still reported pre-raster CSS px at NavigationCompleted, the fit
+  // over-scaled, and no 'resize' event fired when the viewport later shrank
+  // under it). So besides the 'resize' listener, re-fit on devicePixelRatio
+  // changes via the canonical matchMedia('(resolution: Xdppx)') watcher, plus a
+  // few timed convergence re-fits. The fit itself is idempotent and cheap.
+  // DPI-virtualized hosts (Ableton Auto-Scale) make innerWidth/Height lie by
+  // exactly the virtualization factor — the page persistently measures the
+  // physical-derived viewport while only measured/vf CSS px are visible, and
+  // no resize/dpr event ever corrects it (measured: iw=1500 for a visible
+  // ~1200, across a whole session). The native zoom reconcile measures the
+  // factor and publishes it via SetViewportVirtScale (1.0 everywhere else);
+  // divide the fit's measurements by it. Re-baked on every injection, which
+  // the native side triggers whenever the viewport or factor could change.
+  float vf = GetViewportVirtScale();
+  if (!(vf > 0.f))
+    vf = 1.f;
+
+  char js[1500];
+  snprintf(js, sizeof(js),
+    "(function(){"
+    "var dw=%d,dh=%d,vf=%.4f;"
+    "var de=document.documentElement,b=document.body;"
+    "window.__iplugFit=function(){"
+      "var iw=window.innerWidth/vf,ih=window.innerHeight/vf;"
+      "if(!(iw>0&&ih>0&&dw>0&&dh>0))return;"
+      // Undershoot by 2 CSS px per axis: innerWidth/Height are rounded UP from
+      // the physical surface, the surface itself overshoots the parent by the
+      // +1 in GetScaledRect, and the host may sit the parent 1-2px past the
+      // frame. Scaling to the exact reported viewport parks the design's last
+      // rows in that slop and they get shaved; a 2px inset keeps the true
+      // bottom/right edge visibly inside in every host.
+      "var s=Math.min((iw-2)/dw,(ih-2)/dh);"
+      // center the letterboxed content: symmetric page-background margins look
+      // intentional while the host window is mid-drag / not yet snapped
+      "var tx=Math.max(0,(iw-dw*s)/2),ty=Math.max(0,(ih-dh*s)/2);"
+      "de.style.width=dw+'px';de.style.height=dh+'px';de.style.overflow='hidden';de.style.margin='0';"
+      "de.style.transform='translate('+tx+'px,'+ty+'px) scale('+s+')';de.style.transformOrigin='top left';"
+      // margin:0 is load-bearing: the browser's default 8px body margin offsets
+      // the body inside the (clipped) html box, pushing the design's last 8 CSS
+      // px below the viewport — with position:relative set here, bottom-anchored
+      // content sits in exactly those rows and gets shaved on every host.
+      "b.style.width=dw+'px';b.style.height=dh+'px';b.style.position='relative';b.style.overflow='hidden';b.style.margin='0';"
+    "};"
+    "if(!window.__iplugFitBound){window.__iplugFitBound=true;"
+      "window.addEventListener('resize',function(){window.__iplugFit&&window.__iplugFit();});"
+      "var wd=function(){try{"
+        "var q=matchMedia('(resolution: '+window.devicePixelRatio+'dppx)');"
+        "var f=function(){window.__iplugFit&&window.__iplugFit();wd();};"
+        "q.addEventListener?q.addEventListener('change',f,{once:true}):q.addListener(f);"
+      "}catch(e){}};"
+      "wd();}"
+    "window.__iplugFit();"
+    "setTimeout(window.__iplugFit,50);setTimeout(window.__iplugFit,200);"
+    "setTimeout(window.__iplugFit,600);setTimeout(window.__iplugFit,1500);"
+    // diagnostic: surfaced in the webview-init log via the fit_done trace
+    "return JSON.stringify({iw:window.innerWidth,ih:window.innerHeight,vf:vf,"
+    "dpr:window.devicePixelRatio,dw:dw,dh:dh,t:de.style.transform});"
+    "})();",
+    mDesignWidth, mDesignHeight, vf);
+  EvaluateJavaScript(js, nullptr);
 }
 
 bool WebViewEditorDelegate::OnKeyDown(const IKeyPress& key)
