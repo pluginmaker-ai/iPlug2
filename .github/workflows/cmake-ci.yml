@@ -32,7 +32,7 @@ on:
       examples:
         description: 'Examples to build (comma-separated, empty = IPlugEffect only, "all" = everything)'
         type: string
-        default: 'IPlugEffect'
+        default: 'IPlugEffect,IPlugWebUI'
       all_generators:
         description: 'Test all generators (Ninja, Make, Xcode, VS2022)'
         type: boolean
@@ -94,7 +94,7 @@ jobs:
           INPUT_EXAMPLES: ${{ inputs.examples }}
         run: |
           # Default examples to build (IPlugEffect only for faster CI)
-          DEFAULT_EXAMPLES="IPlugEffect"
+          DEFAULT_EXAMPLES="IPlugEffect,IPlugWebUI"
 
           # Function to validate examples input (alphanumeric, commas, underscores only)
           validate_examples() {
