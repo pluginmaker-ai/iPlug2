@@ -151,6 +151,9 @@ private:
   HWND mSubclassedHwnd = NULL;
   HWND mSubclassedParentWnd = NULL;
   bool mInSizeMove = false;
+  // Deferred post-open re-measures still owed (see the open-settle timer armed
+  // at controller-ready).
+  int mOpenSettleShotsRemaining = 0;
   // Last bounds/zoom actually pushed to the controller — dedup guard so the
   // parent-watch and resize storms don't spam identical SetBoundsAndZoomFactor
   // calls (and identical log lines).
@@ -198,6 +201,7 @@ using namespace Microsoft::WRL;
 static const UINT_PTR kAspectRatioSubclassId = 0x1AA5BEC7;
 static const UINT_PTR kParentWatchSubclassId = 0x1AA5BEC8;
 static const UINT_PTR kFrameSnapTimerId = 0x1AA5BEC9;
+static const UINT_PTR kOpenSettleTimerId = 0x1AA5BECA;
 
 LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
@@ -276,6 +280,25 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
       KillTimer(hWnd, kFrameSnapTimerId);
       ::WebViewInitLog("FrameSnap:timer_fire", S_OK, nullptr);
       self->SnapFrameToContent();
+      return 0;
+    }
+    if (wParam == kOpenSettleTimerId)
+    {
+      KillTimer(hWnd, kOpenSettleTimerId);
+      // Replay of the geometry events swallowed during async controller
+      // creation (they are all gated on mWebViewCtrlr) — same body as the
+      // WM_SIZE handler; the dedup guard makes stable-geometry shots free.
+      bool changed = false;
+      if (self->mHasLastBounds && self->mWebViewCtrlr)
+      {
+        changed = self->ApplyWebViewBounds();
+        if (changed && self->mIWebView)
+          self->mIWebView->OnWebViewViewportChanged();
+      }
+      ::WebViewInitLog("OpenSettle:timer_fire", S_OK, "changed=%d shotsLeft=%d",
+                       changed ? 1 : 0, self->mOpenSettleShotsRemaining - 1);
+      if (--self->mOpenSettleShotsRemaining > 0)
+        SetTimer(hWnd, kOpenSettleTimerId, 700, nullptr);
       return 0;
     }
     return DefSubclassProc(hWnd, msg, wParam, lParam);
@@ -408,6 +431,7 @@ void IWebViewImpl::RemoveAspectRatioHook()
   if (mSubclassedHwnd)
   {
     KillTimer(mSubclassedHwnd, kFrameSnapTimerId);
+    KillTimer(mSubclassedHwnd, kOpenSettleTimerId);
     RemoveWindowSubclass(mSubclassedHwnd, &IWebViewImpl::AspectRatioSubclassProc, kAspectRatioSubclassId);
     mSubclassedHwnd = NULL;
   }
@@ -824,6 +848,23 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
               mWebViewBounds = haveSeed ? seed : mWebViewBounds;
               mWebViewCtrlr->put_IsVisible(TRUE);
               ::WebViewInitLog("controller:seed_bounds", S_OK, "rect=%ldx%ld", seed.right, seed.bottom);
+            }
+
+            // First-open geometry storms happen while the controller is still
+            // being created — FL Studio builds its wrapper as a small stub and
+            // grows it to final size ~100ms after attach, and every re-measure
+            // path (WM_SIZE, parent-watch) is gated on mWebViewCtrlr, so those
+            // events are silently swallowed. The one measurement that does run
+            // then sees a mid-grow rect, the visibility clamp letterboxes to
+            // it, and nothing ever corrects it (measured: first open clamped
+            // to 1200x667/603/571, reopen of the same window fine at
+            // 1200x800). Arm a deferred settle re-measure now that the
+            // controller exists: two shots, dedup-guarded no-ops when the
+            // geometry is already stable.
+            if (mSubclassedHwnd)
+            {
+              mOpenSettleShotsRemaining = 2;
+              SetTimer(mSubclassedHwnd, kOpenSettleTimerId, 300, nullptr);
             }
 
 #if defined APP_API
