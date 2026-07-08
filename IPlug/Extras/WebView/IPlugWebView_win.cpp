@@ -204,6 +204,26 @@ static const UINT_PTR kParentWatchSubclassId = 0x1AA5BEC8;
 static const UINT_PTR kFrameSnapTimerId = 0x1AA5BEC9;
 static const UINT_PTR kOpenSettleTimerId = 0x1AA5BECA;
 
+// FL Studio can host plugin editors either as top-level wrapper windows
+// (detached) or as movable CHILD windows inside its main window (attached) —
+// the mode varies per session. In attached mode GetAncestor(GA_ROOT) is FL's
+// MAIN window, so the frame-management machinery below (min-size clamp,
+// post-release frame snap) — written for hosts where the plugin owns its
+// top-level frame (Studio One / FSP) — would size-manage the entire DAW:
+// measured live, the min-size clamp made FL's own window impossible to
+// shrink and the frame snap "snapped back" any user resize of FL on mouse
+// release. Never size-manage a window that belongs to the host application;
+// measuring (visclamp / re-fit) remains fine.
+static bool IsHostAppMainFrame(HWND root)
+{
+  if (!root)
+    return false;
+  wchar_t cls[64] = {};
+  if (!GetClassNameW(root, cls, 64))
+    return false;
+  return wcscmp(cls, L"TFruityLoopsMainForm") == 0; // FL Studio main window
+}
+
 LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
   if (msg == WM_NCDESTROY)
@@ -231,6 +251,11 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
   // WM_SIZE directly (bypassing WM_SIZING).
   if (msg == WM_GETMINMAXINFO)
   {
+    // Never impose the plugin's minimum on the host application's own main
+    // window (FL attached mode) — that made the whole DAW unshrinkable.
+    if (IsHostAppMainFrame(hWnd))
+      return DefSubclassProc(hWnd, msg, wParam, lParam);
+
     RECT windowRect, clientRect;
     GetWindowRect(hWnd, &windowRect);
     GetClientRect(hWnd, &clientRect);
@@ -1465,6 +1490,13 @@ void IWebViewImpl::SnapFrameToContent()
   {
     ::WebViewInitLog("FrameSnap:skip", S_OK, "parent=%p frame=%p inSizeMove=%d",
                      (void*)mParentWnd, (void*)mSubclassedHwnd, mInSizeMove ? 1 : 0);
+    return;
+  }
+  if (IsHostAppMainFrame(mSubclassedHwnd))
+  {
+    // FL attached mode: the subclassed root is the DAW's main window — never
+    // resize it (this "snapped back" the user's own resize of FL on release).
+    ::WebViewInitLog("FrameSnap:skip", S_OK, "host-app main frame");
     return;
   }
   if (GetAncestor(mParentWnd, GA_ROOT) != mSubclassedHwnd)
