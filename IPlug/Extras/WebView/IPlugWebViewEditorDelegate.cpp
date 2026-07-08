@@ -193,7 +193,21 @@ bool WebViewEditorDelegate::OnKeyDown(const IKeyPress& key)
     if (nowMs - mLastSpaceForwardMs >= 60)
     {
       mLastSpaceForwardMs = nowMs;
+      // Deliver to the DAW window that actually handles transport keys.
+      // Hosts differ (verified empirically via window-topology logging):
+      //  - FL Studio parents the editor under TFruityLoopsMainForm directly,
+      //    so GA_ROOT already IS the main window (no owner chain).
+      //  - Ableton hosts the editor in a top-level 'Vst3PlugWindow' float that
+      //    swallows posted keys; its OWNER is the Live main window, which
+      //    handles space -> transport.
+      //  - REAPER's FX float forwards space itself, and it is likewise owned
+      //    by the main REAPERwnd.
+      // Walking the owner chain from GA_ROOT to its top therefore lands on
+      // the app main window whenever the editor lives in a float, and stays
+      // on GA_ROOT when the editor is parented under the main window itself.
       HWND root = GetAncestor((HWND) mView, GA_ROOT);
+      for (HWND owner = root ? GetWindow(root, GW_OWNER) : NULL; owner; owner = GetWindow(owner, GW_OWNER))
+        root = owner;
       if (root)
       {
         // Forward as a synthetic WM_KEYDOWN/WM_KEYUP to the host's top-level
