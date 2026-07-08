@@ -316,7 +316,16 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
       // WM_SIZE handler; the dedup guard makes stable-geometry shots free.
       bool changed = false;
       bool nudged = false;
-      if (self->mHasLastBounds && self->mWebViewCtrlr)
+      // FL-only (scale == -1), deliberately: FL's sizing path is deterministic
+      // (zoom = 1/dpiScale, no measurement), so extra ApplyWebViewBounds
+      // evaluations are safe there. On scale >= 0 hosts ApplyWebViewBounds is
+      // NOT idempotent — the Ableton reconcile re-measures the window in two
+      // DPI contexts and derives zoom + viewport-virt-scale from whatever it
+      // sees at that instant; a settle shot firing before DWM re-establishes
+      // the Auto-Scale stretch on a reopened window captured monitorScale=1.0
+      // and froze an overzoomed, cut-off render (found by user testing).
+      // Gating restores the exact pre-settle behavior for every non-FL host.
+      if (self->mHasLastBounds && self->mWebViewCtrlr && self->mLastBoundsScale == -1.f)
       {
         // FL Studio (attached plugin windows): the first-open wrapper is
         // placed too low inside FL's client area — its bottom hangs clipped
