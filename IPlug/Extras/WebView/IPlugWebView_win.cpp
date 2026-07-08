@@ -155,6 +155,11 @@ private:
   // Deferred post-open re-measures still owed (see the open-settle timer armed
   // at controller-ready).
   int mOpenSettleShotsRemaining = 0;
+  // When the current controller was created (GetTickCount64). Measurements
+  // taken while a freshly-created window's DWM DPI-virtualization stretch is
+  // still being established are transients — see the virt-scale clear guard
+  // and the late settle re-reconcile.
+  ULONGLONG mControllerBornTick = 0;
   // Last bounds/zoom actually pushed to the controller — dedup guard so the
   // parent-watch and resize storms don't spam identical SetBoundsAndZoomFactor
   // calls (and identical log lines).
@@ -203,6 +208,12 @@ static const UINT_PTR kAspectRatioSubclassId = 0x1AA5BEC7;
 static const UINT_PTR kParentWatchSubclassId = 0x1AA5BEC8;
 static const UINT_PTR kFrameSnapTimerId = 0x1AA5BEC9;
 static const UINT_PTR kOpenSettleTimerId = 0x1AA5BECA;
+// Minimum controller age before a "this host isn't DPI-virtualized"
+// observation is trusted (virt-scale clear + late settle re-reconcile).
+// Measured on Ableton 12: a window born on a monitor with a different DPI
+// than the host's main window reads internal == physical for the first few
+// hundred ms, until DWM establishes the stretch.
+static const ULONGLONG kDpiSettleMinAgeMs = 1500;
 
 // FL Studio can host plugin editors either as top-level wrapper windows
 // (detached) or as movable CHILD windows inside its main window (attached) —
@@ -316,16 +327,24 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
       // WM_SIZE handler; the dedup guard makes stable-geometry shots free.
       bool changed = false;
       bool nudged = false;
-      // FL-only (scale == -1), deliberately: FL's sizing path is deterministic
-      // (zoom = 1/dpiScale, no measurement), so extra ApplyWebViewBounds
-      // evaluations are safe there. On scale >= 0 hosts ApplyWebViewBounds is
-      // NOT idempotent — the Ableton reconcile re-measures the window in two
-      // DPI contexts and derives zoom + viewport-virt-scale from whatever it
-      // sees at that instant; a settle shot firing before DWM re-establishes
-      // the Auto-Scale stretch on a reopened window captured monitorScale=1.0
-      // and froze an overzoomed, cut-off render (found by user testing).
-      // Gating restores the exact pre-settle behavior for every non-FL host.
-      if (self->mHasLastBounds && self->mWebViewCtrlr && self->mLastBoundsScale == -1.f)
+      // Per-path behavior (walked per host — regressions were found both ways):
+      //  scale == -1 (FL): deterministic sizing (zoom = 1/dpiScale, no
+      //    measurement) — BOTH shots run, plus the wrapper nudge. FL's
+      //    first-open geometry storms happen while the controller is being
+      //    created, so the swallowed events are replayed here.
+      //  scale >= 0 (Ableton/S1/FSP/default): the reconcile inside
+      //    ApplyWebViewBounds re-MEASURES the window per call and is
+      //    timing-sensitive — an EARLY shot on a reopened Ableton window
+      //    captured the pre-stretch state and froze an overzoomed render.
+      //    Only the LAST shot runs, landing after kDpiSettleMinAgeMs when the
+      //    DWM stretch is established: it self-heals a bad cross-DPI birth
+      //    (wrong bounds/zoom + cleared virt-scale) and is a dedup no-op on
+      //    healthy opens. S1/FSP measure ~1.0 → clear+push are no-ops.
+      //  scale == -2 (Cubase): physical-pixel path, no reconcile — excluded.
+      const bool flPath = (self->mLastBoundsScale == -1.f);
+      const bool reconcilePath = (self->mLastBoundsScale >= 0.f);
+      const bool lastShot = (self->mOpenSettleShotsRemaining <= 1);
+      if (self->mHasLastBounds && self->mWebViewCtrlr && (flPath || (reconcilePath && lastShot)))
       {
         // FL Studio (attached plugin windows): the first-open wrapper is
         // placed too low inside FL's client area — its bottom hangs clipped
@@ -335,7 +354,8 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
         // exactly like the user dragging the wrapper. Only child-ancestor
         // chains are nudged — top-level wrappers (Studio One / FSP) never
         // enter and keep today's clamp+letterbox behavior.
-        nudged = self->NudgeClippedAncestorIntoView();
+        if (flPath)
+          nudged = self->NudgeClippedAncestorIntoView();
         changed = self->ApplyWebViewBounds();
         if (changed && self->mIWebView)
           self->mIWebView->OnWebViewViewportChanged();
@@ -343,7 +363,7 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
       ::WebViewInitLog("OpenSettle:timer_fire", S_OK, "changed=%d nudged=%d shotsLeft=%d",
                        changed ? 1 : 0, nudged ? 1 : 0, self->mOpenSettleShotsRemaining - 1);
       if (--self->mOpenSettleShotsRemaining > 0)
-        SetTimer(hWnd, kOpenSettleTimerId, 700, nullptr);
+        SetTimer(hWnd, kOpenSettleTimerId, 1400, nullptr); // last shot ~1.7s after birth — safely past kDpiSettleMinAgeMs
       return 0;
     }
     return DefSubclassProc(hWnd, msg, wParam, lParam);
@@ -569,6 +589,7 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
 
             mWebViewCtrlr = controller;
             mWebViewCtrlr->get_CoreWebView2(&mCoreWebView);
+            mControllerBornTick = GetTickCount64();
 
             // A fresh controller starts at 0x0 and has never been pushed to,
             // but the push-dedup cache (mLastPushedBounds/mLastPushedZoom)
@@ -1313,7 +1334,25 @@ bool IWebViewImpl::ApplyWebViewBounds()
         // Bounds match the physical client (the normal-host signature) —
         // make sure a stale factor from a prior virtualized state can't
         // linger after e.g. toggling Auto-Scale off.
-        mIWebView->SetViewportVirtScale(1.f);
+        //
+        // Guarded against controller-birth transients: on Ableton a window
+        // BORN on a monitor with a different DPI than the host's main window
+        // measures internal == physical for its first few hundred ms (DWM
+        // hasn't established the stretch yet), which read as "normal host"
+        // here and CLEARED the real factor — the fit then rendered oversized
+        // and cut off, frozen, because no corrective event ever fires on an
+        // untouched window. Only accept the normal-host conclusion once the
+        // controller is old enough for the stretch to be established; until
+        // then the factor inherited from before the reopen stays (worst case
+        // a too-small render for a moment, corrected by the late settle
+        // shot). The legit use of this clear — Auto-Scale toggled off mid-
+        // session — always happens far later than the guard window.
+        if (mControllerBornTick != 0 && GetTickCount64() - mControllerBornTick > kDpiSettleMinAgeMs)
+          mIWebView->SetViewportVirtScale(1.f);
+        else
+          ::WebViewInitLog("SetWebViewBounds:virtclear_deferred", S_OK,
+                           "controller too young (%llums) to trust non-virtualized reading",
+                           mControllerBornTick ? (GetTickCount64() - mControllerBornTick) : 0ULL);
       }
     }
   }
