@@ -138,6 +138,7 @@ private:
   static LRESULT CALLBACK ParentWatchSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
   void InstallAspectRatioHook(int designWidth, int designHeight);
   void RemoveAspectRatioHook();
+  bool NudgeClippedAncestorIntoView();
   bool ApplyWebViewBounds(); // returns true when the effective bounds/zoom actually changed
   void PinRasterizationScale();
   void SnapFrameToContent();
@@ -151,6 +152,9 @@ private:
   HWND mSubclassedHwnd = NULL;
   HWND mSubclassedParentWnd = NULL;
   bool mInSizeMove = false;
+  // Deferred post-open re-measures still owed (see the open-settle timer armed
+  // at controller-ready).
+  int mOpenSettleShotsRemaining = 0;
   // Last bounds/zoom actually pushed to the controller — dedup guard so the
   // parent-watch and resize storms don't spam identical SetBoundsAndZoomFactor
   // calls (and identical log lines).
@@ -198,6 +202,27 @@ using namespace Microsoft::WRL;
 static const UINT_PTR kAspectRatioSubclassId = 0x1AA5BEC7;
 static const UINT_PTR kParentWatchSubclassId = 0x1AA5BEC8;
 static const UINT_PTR kFrameSnapTimerId = 0x1AA5BEC9;
+static const UINT_PTR kOpenSettleTimerId = 0x1AA5BECA;
+
+// FL Studio can host plugin editors either as top-level wrapper windows
+// (detached) or as movable CHILD windows inside its main window (attached) —
+// the mode varies per session. In attached mode GetAncestor(GA_ROOT) is FL's
+// MAIN window, so the frame-management machinery below (min-size clamp,
+// post-release frame snap) — written for hosts where the plugin owns its
+// top-level frame (Studio One / FSP) — would size-manage the entire DAW:
+// measured live, the min-size clamp made FL's own window impossible to
+// shrink and the frame snap "snapped back" any user resize of FL on mouse
+// release. Never size-manage a window that belongs to the host application;
+// measuring (visclamp / re-fit) remains fine.
+static bool IsHostAppMainFrame(HWND root)
+{
+  if (!root)
+    return false;
+  wchar_t cls[64] = {};
+  if (!GetClassNameW(root, cls, 64))
+    return false;
+  return wcscmp(cls, L"TFruityLoopsMainForm") == 0; // FL Studio main window
+}
 
 LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
@@ -226,6 +251,11 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
   // WM_SIZE directly (bypassing WM_SIZING).
   if (msg == WM_GETMINMAXINFO)
   {
+    // Never impose the plugin's minimum on the host application's own main
+    // window (FL attached mode) — that made the whole DAW unshrinkable.
+    if (IsHostAppMainFrame(hWnd))
+      return DefSubclassProc(hWnd, msg, wParam, lParam);
+
     RECT windowRect, clientRect;
     GetWindowRect(hWnd, &windowRect);
     GetClientRect(hWnd, &clientRect);
@@ -276,6 +306,44 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
       KillTimer(hWnd, kFrameSnapTimerId);
       ::WebViewInitLog("FrameSnap:timer_fire", S_OK, nullptr);
       self->SnapFrameToContent();
+      return 0;
+    }
+    if (wParam == kOpenSettleTimerId)
+    {
+      KillTimer(hWnd, kOpenSettleTimerId);
+      // Replay of the geometry events swallowed during async controller
+      // creation (they are all gated on mWebViewCtrlr) — same body as the
+      // WM_SIZE handler; the dedup guard makes stable-geometry shots free.
+      bool changed = false;
+      bool nudged = false;
+      // FL-only (scale == -1), deliberately: FL's sizing path is deterministic
+      // (zoom = 1/dpiScale, no measurement), so extra ApplyWebViewBounds
+      // evaluations are safe there. On scale >= 0 hosts ApplyWebViewBounds is
+      // NOT idempotent — the Ableton reconcile re-measures the window in two
+      // DPI contexts and derives zoom + viewport-virt-scale from whatever it
+      // sees at that instant; a settle shot firing before DWM re-establishes
+      // the Auto-Scale stretch on a reopened window captured monitorScale=1.0
+      // and froze an overzoomed, cut-off render (found by user testing).
+      // Gating restores the exact pre-settle behavior for every non-FL host.
+      if (self->mHasLastBounds && self->mWebViewCtrlr && self->mLastBoundsScale == -1.f)
+      {
+        // FL Studio (attached plugin windows): the first-open wrapper is
+        // placed too low inside FL's client area — its bottom hangs clipped
+        // below the frame and FL never repositions it (reopens spawn higher
+        // and render fine, which is why only first opens letterboxed).
+        // Verified live that a programmatic move up sticks: FL treats it
+        // exactly like the user dragging the wrapper. Only child-ancestor
+        // chains are nudged — top-level wrappers (Studio One / FSP) never
+        // enter and keep today's clamp+letterbox behavior.
+        nudged = self->NudgeClippedAncestorIntoView();
+        changed = self->ApplyWebViewBounds();
+        if (changed && self->mIWebView)
+          self->mIWebView->OnWebViewViewportChanged();
+      }
+      ::WebViewInitLog("OpenSettle:timer_fire", S_OK, "changed=%d nudged=%d shotsLeft=%d",
+                       changed ? 1 : 0, nudged ? 1 : 0, self->mOpenSettleShotsRemaining - 1);
+      if (--self->mOpenSettleShotsRemaining > 0)
+        SetTimer(hWnd, kOpenSettleTimerId, 700, nullptr);
       return 0;
     }
     return DefSubclassProc(hWnd, msg, wParam, lParam);
@@ -408,6 +476,7 @@ void IWebViewImpl::RemoveAspectRatioHook()
   if (mSubclassedHwnd)
   {
     KillTimer(mSubclassedHwnd, kFrameSnapTimerId);
+    KillTimer(mSubclassedHwnd, kOpenSettleTimerId);
     RemoveWindowSubclass(mSubclassedHwnd, &IWebViewImpl::AspectRatioSubclassProc, kAspectRatioSubclassId);
     mSubclassedHwnd = NULL;
   }
@@ -500,6 +569,20 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
 
             mWebViewCtrlr = controller;
             mWebViewCtrlr->get_CoreWebView2(&mCoreWebView);
+
+            // A fresh controller starts at 0x0 and has never been pushed to,
+            // but the push-dedup cache (mLastPushedBounds/mLastPushedZoom)
+            // survives CloseWebView -> OpenWebView on the same editor
+            // instance. When a reopen recomputes exactly the bounds of the
+            // previous session's last push (the common case: same wrapper
+            // size), ApplyWebViewBounds dedup-skipped the push and the new
+            // controller stayed 0x0 — a fully black editor until the next
+            // real resize broke the equality (measured in FL Studio 2025:
+            // warm reopens black 3 of 6, un-bricked by manually resizing the
+            // plugin window). Reset the cache at controller birth so the
+            // first apply after (re)creation always pushes.
+            mLastPushedBounds = { -1, -1, -1, -1 };
+            mLastPushedZoom = -999.0;
 
             if (mCoreWebView == nullptr)
             {
@@ -810,6 +893,23 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
               mWebViewBounds = haveSeed ? seed : mWebViewBounds;
               mWebViewCtrlr->put_IsVisible(TRUE);
               ::WebViewInitLog("controller:seed_bounds", S_OK, "rect=%ldx%ld", seed.right, seed.bottom);
+            }
+
+            // First-open geometry storms happen while the controller is still
+            // being created — FL Studio builds its wrapper as a small stub and
+            // grows it to final size ~100ms after attach, and every re-measure
+            // path (WM_SIZE, parent-watch) is gated on mWebViewCtrlr, so those
+            // events are silently swallowed. The one measurement that does run
+            // then sees a mid-grow rect, the visibility clamp letterboxes to
+            // it, and nothing ever corrects it (measured: first open clamped
+            // to 1200x667/603/571, reopen of the same window fine at
+            // 1200x800). Arm a deferred settle re-measure now that the
+            // controller exists: two shots, dedup-guarded no-ops when the
+            // geometry is already stable.
+            if (mSubclassedHwnd)
+            {
+              mOpenSettleShotsRemaining = 2;
+              SetTimer(mSubclassedHwnd, kOpenSettleTimerId, 300, nullptr);
             }
 
 #if defined APP_API
@@ -1401,6 +1501,13 @@ void IWebViewImpl::SnapFrameToContent()
                      (void*)mParentWnd, (void*)mSubclassedHwnd, mInSizeMove ? 1 : 0);
     return;
   }
+  if (IsHostAppMainFrame(mSubclassedHwnd))
+  {
+    // FL attached mode: the subclassed root is the DAW's main window — never
+    // resize it (this "snapped back" the user's own resize of FL on release).
+    ::WebViewInitLog("FrameSnap:skip", S_OK, "host-app main frame");
+    return;
+  }
   if (GetAncestor(mParentWnd, GA_ROOT) != mSubclassedHwnd)
   {
     ::WebViewInitLog("FrameSnap:skip", S_OK, "reparented (root=%p != hooked frame=%p)",
@@ -1475,6 +1582,81 @@ void IWebViewImpl::SnapFrameToContent()
   else
     ::WebViewInitLog("FrameSnap:noop", S_OK, "ok=%d deltaW=%d deltaH=%d frameClient=%ldx%ld",
                      ok ? 1 : 0, deltaW, deltaH, frameClient.right, frameClient.bottom);
+}
+
+bool IWebViewImpl::NudgeClippedAncestorIntoView()
+{
+  // FL Studio hosts attached plugin windows as movable CHILD windows inside
+  // its client area, and places a first-open wrapper so its bottom hangs
+  // below the frame's client region — clipped, with no notification, and
+  // never corrected by the host. Users fix it by dragging the wrapper up;
+  // this does the same programmatically, once, at open-settle. The walk
+  // stops at GA_ROOT, so hosts whose wrapper IS the top-level window
+  // (Studio One, FSP, ...) can never be nudged by this path.
+  if (!mParentWnd || mInSizeMove)
+    return false;
+  HWND root = GetAncestor(mParentWnd, GA_ROOT);
+  if (!root || root == mParentWnd)
+    return false;
+
+  using SetThreadDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+  static SetThreadDpiCtxFn pSetThreadDpiCtx = []() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    return user32 ? reinterpret_cast<SetThreadDpiCtxFn>(GetProcAddress(user32, "SetThreadDpiAwarenessContext")) : nullptr;
+  }();
+  DPI_AWARENESS_CONTEXT prev = pSetThreadDpiCtx ? pSetThreadDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) : nullptr;
+
+  bool nudged = false;
+  RECT rootClient = {};
+  POINT rootOrigin = { 0, 0 };
+  RECT parentRect = {};
+  if (GetClientRect(root, &rootClient) && ClientToScreen(root, &rootOrigin) &&
+      GetWindowRect(mParentWnd, &parentRect) && rootClient.bottom > 0)
+  {
+    const LONG rootTop = rootOrigin.y;
+    const LONG rootBottom = rootOrigin.y + rootClient.bottom;
+    const LONG overhang = parentRect.bottom - rootBottom;
+    if (overhang > 16)
+    {
+      // Highest ancestor BELOW the root whose bottom hangs past the root's
+      // client region — in FL that is the draggable wrapper form itself
+      // (its own parent, FL's layout panel, ends at the client bottom).
+      HWND cand = NULL;
+      RECT candRect = {};
+      for (HWND cur = mParentWnd; cur && cur != root; cur = GetAncestor(cur, GA_PARENT))
+      {
+        RECT r = {};
+        if (GetWindowRect(cur, &r) && r.bottom > rootBottom + 8)
+        {
+          cand = cur;
+          candRect = r;
+        }
+      }
+      if (cand)
+      {
+        LONG newTop = candRect.top - overhang - 8;
+        if (newTop < rootTop + 4)
+          newTop = rootTop + 4; // keep the caption reachable; partial visibility beats none
+        if (newTop < candRect.top)
+        {
+          HWND candParent = GetAncestor(cand, GA_PARENT);
+          POINT target = { candRect.left, newTop };
+          if (candParent && ScreenToClient(candParent, &target) &&
+              SetWindowPos(cand, nullptr, target.x, target.y, 0, 0,
+                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE))
+          {
+            nudged = true;
+            ::WebViewInitLog("OpenSettle:nudge_up", S_OK, "hwnd=%p by=%ld overhang=%ld",
+                             (void*)cand, candRect.top - newTop, overhang);
+          }
+        }
+      }
+    }
+  }
+
+  if (pSetThreadDpiCtx)
+    pSetThreadDpiCtx(prev);
+  return nudged;
 }
 
 void IWebViewImpl::GetLocalDownloadPathForFile(const char* fileName, WDL_String& downloadPath)
