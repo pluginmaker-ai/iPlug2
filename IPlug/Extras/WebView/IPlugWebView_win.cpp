@@ -138,6 +138,7 @@ private:
   static LRESULT CALLBACK ParentWatchSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
   void InstallAspectRatioHook(int designWidth, int designHeight);
   void RemoveAspectRatioHook();
+  bool NudgeClippedAncestorIntoView();
   bool ApplyWebViewBounds(); // returns true when the effective bounds/zoom actually changed
   void PinRasterizationScale();
   void SnapFrameToContent();
@@ -289,14 +290,24 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
       // creation (they are all gated on mWebViewCtrlr) — same body as the
       // WM_SIZE handler; the dedup guard makes stable-geometry shots free.
       bool changed = false;
+      bool nudged = false;
       if (self->mHasLastBounds && self->mWebViewCtrlr)
       {
+        // FL Studio (attached plugin windows): the first-open wrapper is
+        // placed too low inside FL's client area — its bottom hangs clipped
+        // below the frame and FL never repositions it (reopens spawn higher
+        // and render fine, which is why only first opens letterboxed).
+        // Verified live that a programmatic move up sticks: FL treats it
+        // exactly like the user dragging the wrapper. Only child-ancestor
+        // chains are nudged — top-level wrappers (Studio One / FSP) never
+        // enter and keep today's clamp+letterbox behavior.
+        nudged = self->NudgeClippedAncestorIntoView();
         changed = self->ApplyWebViewBounds();
         if (changed && self->mIWebView)
           self->mIWebView->OnWebViewViewportChanged();
       }
-      ::WebViewInitLog("OpenSettle:timer_fire", S_OK, "changed=%d shotsLeft=%d",
-                       changed ? 1 : 0, self->mOpenSettleShotsRemaining - 1);
+      ::WebViewInitLog("OpenSettle:timer_fire", S_OK, "changed=%d nudged=%d shotsLeft=%d",
+                       changed ? 1 : 0, nudged ? 1 : 0, self->mOpenSettleShotsRemaining - 1);
       if (--self->mOpenSettleShotsRemaining > 0)
         SetTimer(hWnd, kOpenSettleTimerId, 700, nullptr);
       return 0;
@@ -1530,6 +1541,81 @@ void IWebViewImpl::SnapFrameToContent()
   else
     ::WebViewInitLog("FrameSnap:noop", S_OK, "ok=%d deltaW=%d deltaH=%d frameClient=%ldx%ld",
                      ok ? 1 : 0, deltaW, deltaH, frameClient.right, frameClient.bottom);
+}
+
+bool IWebViewImpl::NudgeClippedAncestorIntoView()
+{
+  // FL Studio hosts attached plugin windows as movable CHILD windows inside
+  // its client area, and places a first-open wrapper so its bottom hangs
+  // below the frame's client region — clipped, with no notification, and
+  // never corrected by the host. Users fix it by dragging the wrapper up;
+  // this does the same programmatically, once, at open-settle. The walk
+  // stops at GA_ROOT, so hosts whose wrapper IS the top-level window
+  // (Studio One, FSP, ...) can never be nudged by this path.
+  if (!mParentWnd || mInSizeMove)
+    return false;
+  HWND root = GetAncestor(mParentWnd, GA_ROOT);
+  if (!root || root == mParentWnd)
+    return false;
+
+  using SetThreadDpiCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+  static SetThreadDpiCtxFn pSetThreadDpiCtx = []() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    return user32 ? reinterpret_cast<SetThreadDpiCtxFn>(GetProcAddress(user32, "SetThreadDpiAwarenessContext")) : nullptr;
+  }();
+  DPI_AWARENESS_CONTEXT prev = pSetThreadDpiCtx ? pSetThreadDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) : nullptr;
+
+  bool nudged = false;
+  RECT rootClient = {};
+  POINT rootOrigin = { 0, 0 };
+  RECT parentRect = {};
+  if (GetClientRect(root, &rootClient) && ClientToScreen(root, &rootOrigin) &&
+      GetWindowRect(mParentWnd, &parentRect) && rootClient.bottom > 0)
+  {
+    const LONG rootTop = rootOrigin.y;
+    const LONG rootBottom = rootOrigin.y + rootClient.bottom;
+    const LONG overhang = parentRect.bottom - rootBottom;
+    if (overhang > 16)
+    {
+      // Highest ancestor BELOW the root whose bottom hangs past the root's
+      // client region — in FL that is the draggable wrapper form itself
+      // (its own parent, FL's layout panel, ends at the client bottom).
+      HWND cand = NULL;
+      RECT candRect = {};
+      for (HWND cur = mParentWnd; cur && cur != root; cur = GetAncestor(cur, GA_PARENT))
+      {
+        RECT r = {};
+        if (GetWindowRect(cur, &r) && r.bottom > rootBottom + 8)
+        {
+          cand = cur;
+          candRect = r;
+        }
+      }
+      if (cand)
+      {
+        LONG newTop = candRect.top - overhang - 8;
+        if (newTop < rootTop + 4)
+          newTop = rootTop + 4; // keep the caption reachable; partial visibility beats none
+        if (newTop < candRect.top)
+        {
+          HWND candParent = GetAncestor(cand, GA_PARENT);
+          POINT target = { candRect.left, newTop };
+          if (candParent && ScreenToClient(candParent, &target) &&
+              SetWindowPos(cand, nullptr, target.x, target.y, 0, 0,
+                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE))
+          {
+            nudged = true;
+            ::WebViewInitLog("OpenSettle:nudge_up", S_OK, "hwnd=%p by=%ld overhang=%ld",
+                             (void*)cand, candRect.top - newTop, overhang);
+          }
+        }
+      }
+    }
+  }
+
+  if (pSetThreadDpiCtx)
+    pSetThreadDpiCtx(prev);
+  return nudged;
 }
 
 void IWebViewImpl::GetLocalDownloadPathForFile(const char* fileName, WDL_String& downloadPath)
