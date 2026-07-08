@@ -501,6 +501,20 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
             mWebViewCtrlr = controller;
             mWebViewCtrlr->get_CoreWebView2(&mCoreWebView);
 
+            // A fresh controller starts at 0x0 and has never been pushed to,
+            // but the push-dedup cache (mLastPushedBounds/mLastPushedZoom)
+            // survives CloseWebView -> OpenWebView on the same editor
+            // instance. When a reopen recomputes exactly the bounds of the
+            // previous session's last push (the common case: same wrapper
+            // size), ApplyWebViewBounds dedup-skipped the push and the new
+            // controller stayed 0x0 — a fully black editor until the next
+            // real resize broke the equality (measured in FL Studio 2025:
+            // warm reopens black 3 of 6, un-bricked by manually resizing the
+            // plugin window). Reset the cache at controller birth so the
+            // first apply after (re)creation always pushes.
+            mLastPushedBounds = { -1, -1, -1, -1 };
+            mLastPushedZoom = -999.0;
+
             if (mCoreWebView == nullptr)
             {
               ::WebViewInitLog("controller:get_CoreWebView2_null", E_POINTER, nullptr);
