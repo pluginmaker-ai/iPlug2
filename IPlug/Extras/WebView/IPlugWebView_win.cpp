@@ -28,7 +28,9 @@
 */
 
 #include "IPlugWebView.h"
+#include "IPlugWebView_win_lifetime.h"
 #include "IPlugPaths.h"
+#include <algorithm>
 #include <string>
 #include <windows.h>
 #include <wininet.h>
@@ -38,6 +40,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cmath>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib") // SHCreateDirectoryExW
@@ -103,6 +109,23 @@ extern float GetScaleForHWND(HWND hWnd);
 
 BEGIN_IPLUG_NAMESPACE
 
+struct WebViewSubclassContext
+{
+  std::shared_ptr<webview_win::LifetimeState> lifetime;
+  uint64_t generation = 0;
+  HWND parent = NULL;
+  HWND hwnd = NULL;
+};
+
+struct WebViewDownloadRegistration
+{
+  wil::com_ptr<ICoreWebView2DownloadOperation> operation;
+  EventRegistrationToken bytesReceivedToken {};
+  EventRegistrationToken stateChangedToken {};
+  bool hasBytesReceivedToken = false;
+  bool hasStateChangedToken = false;
+};
+
 class IWebViewImpl
 {
 public:
@@ -138,6 +161,7 @@ private:
   static LRESULT CALLBACK ParentWatchSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
   void InstallAspectRatioHook(int designWidth, int designHeight);
   void RemoveAspectRatioHook();
+  void UnregisterWebViewEventHandlers();
   bool NudgeClippedAncestorIntoView();
   bool ApplyWebViewBounds(); // returns true when the effective bounds/zoom actually changed
   void PinRasterizationScale();
@@ -148,9 +172,14 @@ private:
 
   IWebView* mIWebView;
   bool mOpaque;
+  const webview_win::RegistrationIds mRegistrationIds;
+  std::shared_ptr<webview_win::LifetimeState> mLifetime;
   HWND mParentWnd = NULL;
   HWND mSubclassedHwnd = NULL;
   HWND mSubclassedParentWnd = NULL;
+  uint64_t mHookGeneration = 0;
+  std::shared_ptr<WebViewSubclassContext> mAspectRatioContext;
+  std::shared_ptr<WebViewSubclassContext> mParentWatchContext;
   bool mInSizeMove = false;
   // Deferred post-open re-measures still owed (see the open-settle timer armed
   // at controller-ready).
@@ -172,13 +201,17 @@ private:
   wil::com_ptr<ICoreWebView2Controller> mWebViewCtrlr;
   wil::com_ptr<ICoreWebView2> mCoreWebView;
   wil::com_ptr<ICoreWebView2Environment> mWebViewEnvironment;
-  EventRegistrationToken mWebMessageReceivedToken;
-  EventRegistrationToken mNavigationStartingToken;
-  EventRegistrationToken mNavigationCompletedToken;
-  EventRegistrationToken mNewWindowRequestedToken;
-  EventRegistrationToken mDownloadStartingToken;
-  EventRegistrationToken mBytesReceivedChangedToken;
-  EventRegistrationToken mStateChangedToken;
+  EventRegistrationToken mWebMessageReceivedToken {};
+  EventRegistrationToken mNavigationStartingToken {};
+  EventRegistrationToken mNavigationCompletedToken {};
+  EventRegistrationToken mNewWindowRequestedToken {};
+  EventRegistrationToken mDownloadStartingToken {};
+  bool mHasWebMessageReceivedToken = false;
+  bool mHasNavigationStartingToken = false;
+  bool mHasNavigationCompletedToken = false;
+  bool mHasNewWindowRequestedToken = false;
+  bool mHasDownloadStartingToken = false;
+  std::vector<std::shared_ptr<WebViewDownloadRegistration>> mDownloadRegistrations;
   bool mShowOnLoad = true;
   WDL_String mWebRoot;
   WDL_String mVirtualHost; // per-instance WebView2 virtual host (see LoadFile); avoids same-host mapping collisions across instances
@@ -199,15 +232,73 @@ END_IPLUG_NAMESPACE
 using namespace iplug;
 using namespace Microsoft::WRL;
 
+namespace
+{
+std::mutex gSubclassContextsMutex;
+std::unordered_map<UINT_PTR, std::shared_ptr<WebViewSubclassContext>> gSubclassContexts;
+
+void RegisterSubclassContext(UINT_PTR id, const std::shared_ptr<WebViewSubclassContext>& context)
+{
+  std::lock_guard<std::mutex> lock(gSubclassContextsMutex);
+  const auto inserted = gSubclassContexts.emplace(id, context);
+  assert(inserted.second);
+}
+
+std::shared_ptr<WebViewSubclassContext> AcquireSubclassContext(UINT_PTR id, DWORD_PTR refData)
+{
+  std::lock_guard<std::mutex> lock(gSubclassContextsMutex);
+  const auto found = gSubclassContexts.find(id);
+  if (found == gSubclassContexts.end() ||
+      found->second.get() != reinterpret_cast<WebViewSubclassContext*>(refData))
+    return nullptr;
+  return found->second;
+}
+
+void UnregisterSubclassContext(UINT_PTR id, const WebViewSubclassContext* expected)
+{
+  std::lock_guard<std::mutex> lock(gSubclassContextsMutex);
+  const auto found = gSubclassContexts.find(id);
+  if (found != gSubclassContexts.end() && found->second.get() == expected)
+    gSubclassContexts.erase(found);
+}
+
+bool IsLiveOwnerLocked(const std::shared_ptr<webview_win::LifetimeState>& lifetime,
+                       uint64_t generation, HWND parent,
+                       const IWebViewImpl* expectedOwner)
+{
+  return lifetime->MatchesLocked(generation, parent) &&
+         lifetime->owner == expectedOwner && IsWindow(parent);
+}
+
+IWebViewImpl* AcquireLiveOwner(const std::shared_ptr<webview_win::LifetimeState>& lifetime,
+                               uint64_t generation, HWND parent,
+                               std::unique_lock<std::recursive_mutex>& lifetimeLock,
+                               const char* callbackName)
+{
+  lifetimeLock = std::unique_lock<std::recursive_mutex>(lifetime->mutex);
+  if (!lifetime->MatchesLocked(generation, parent) || !IsWindow(parent))
+  {
+    // A failed subclass removal can leave a stale callback installed until
+    // WM_NCDESTROY. Log the first rejection for a generation, not every host
+    // resize/message delivered to that stale registration.
+    if (lifetime->MarkDiscardLoggedLocked(generation))
+      ::WebViewInitLog("callback:discard_stale", S_OK,
+                       "callback=%s owner=%p expectedGen=%llu currentGen=%llu parent=%p currentParent=%p isWindow=%d",
+                       callbackName, lifetime->owner,
+                       static_cast<unsigned long long>(generation),
+                       static_cast<unsigned long long>(lifetime->generation),
+                       (void*)parent, (void*)lifetime->parent, IsWindow(parent) ? 1 : 0);
+    return nullptr;
+  }
+  return static_cast<IWebViewImpl*>(lifetime->owner);
+}
+} // anonymous namespace
+
 // Windows has no OS-level content-aspect-ratio lock like macOS's
 // NSWindow setContentAspectRatio. To get the same behavior we subclass the
 // host's top-level plugin window and intercept WM_SIZING, which fires during
 // the user's live drag gesture and lets us clamp the rect in place before
 // Windows (and the host DAW) ever see a non-proportional size.
-static const UINT_PTR kAspectRatioSubclassId = 0x1AA5BEC7;
-static const UINT_PTR kParentWatchSubclassId = 0x1AA5BEC8;
-static const UINT_PTR kFrameSnapTimerId = 0x1AA5BEC9;
-static const UINT_PTR kOpenSettleTimerId = 0x1AA5BECA;
 // Minimum controller age before a "this host isn't DPI-virtualized"
 // observation is trusted (virt-scale clear + late settle re-reconcile).
 // Measured on Ableton 12: a window born on a monitor with a different DPI
@@ -237,17 +328,50 @@ static bool IsHostAppMainFrame(HWND root)
 
 LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
+  const auto context = AcquireSubclassContext(uIdSubclass, dwRefData);
+  if (!context)
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+
   if (msg == WM_NCDESTROY)
   {
-    RemoveWindowSubclass(hWnd, &IWebViewImpl::AspectRatioSubclassProc, uIdSubclass);
+    std::lock_guard<std::recursive_mutex> lifetimeLock(context->lifetime->mutex);
+    IWebViewImpl* self = static_cast<IWebViewImpl*>(context->lifetime->owner);
+    const bool isCurrentGeneration = context->lifetime->MatchesLocked(context->generation, context->parent);
+    if (self && self->mSubclassedHwnd == hWnd &&
+        self->mRegistrationIds.aspectRatioSubclass == uIdSubclass &&
+        self->mAspectRatioContext.get() == context.get())
+    {
+      KillTimer(hWnd, self->mRegistrationIds.frameSnapTimer);
+      KillTimer(hWnd, self->mRegistrationIds.openSettleTimer);
+      self->mSubclassedHwnd = NULL;
+      self->mAspectRatioContext.reset();
+      self->mHookGeneration = 0;
+      if (self->mParentWnd == hWnd)
+        self->mParentWnd = NULL;
+      if (isCurrentGeneration)
+        context->lifetime->InvalidateGenerationLocked();
+    }
+    const BOOL removed = RemoveWindowSubclass(hWnd, &IWebViewImpl::AspectRatioSubclassProc, uIdSubclass);
+    ::WebViewInitLog("AspectHook:WM_NCDESTROY", removed ? S_OK : E_FAIL,
+                     "this=%p gen=%llu hwnd=%p subclassId=%llu removed=%d",
+                     (void*)self, static_cast<unsigned long long>(context->generation),
+                     (void*)hWnd,
+                     static_cast<unsigned long long>(uIdSubclass), removed ? 1 : 0);
+    UnregisterSubclassContext(uIdSubclass, context.get());
     return DefSubclassProc(hWnd, msg, wParam, lParam);
   }
 
   if ((msg != WM_GETMINMAXINFO && msg != WM_SIZE && msg != WM_DPICHANGED &&
-       msg != WM_ENTERSIZEMOVE && msg != WM_EXITSIZEMOVE && msg != WM_TIMER) || !dwRefData)
+       msg != WM_ENTERSIZEMOVE && msg != WM_EXITSIZEMOVE && msg != WM_TIMER))
     return DefSubclassProc(hWnd, msg, wParam, lParam);
 
-  IWebViewImpl* self = reinterpret_cast<IWebViewImpl*>(dwRefData);
+  std::unique_lock<std::recursive_mutex> lifetimeLock;
+  IWebViewImpl* self = AcquireLiveOwner(context->lifetime, context->generation,
+                                        context->parent, lifetimeLock,
+                                        "AspectRatioSubclassProc");
+  if (!self || context->hwnd != hWnd ||
+      self->mRegistrationIds.aspectRatioSubclass != uIdSubclass)
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
   const int designW = self->mDesignWidth;
   const int designH = self->mDesignHeight;
   const int minW = (self->mMinWidth > 0) ? self->mMinWidth : 1;
@@ -307,21 +431,21 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
   {
     self->mInSizeMove = false;
     ::WebViewInitLog("AspectHook:EXITSIZEMOVE", S_OK, nullptr);
-    SetTimer(hWnd, kFrameSnapTimerId, 60, nullptr);
+    SetTimer(hWnd, self->mRegistrationIds.frameSnapTimer, 60, nullptr);
     return DefSubclassProc(hWnd, msg, wParam, lParam);
   }
   if (msg == WM_TIMER)
   {
-    if (wParam == kFrameSnapTimerId)
+    if (wParam == self->mRegistrationIds.frameSnapTimer)
     {
-      KillTimer(hWnd, kFrameSnapTimerId);
+      KillTimer(hWnd, self->mRegistrationIds.frameSnapTimer);
       ::WebViewInitLog("FrameSnap:timer_fire", S_OK, nullptr);
       self->SnapFrameToContent();
       return 0;
     }
-    if (wParam == kOpenSettleTimerId)
+    if (wParam == self->mRegistrationIds.openSettleTimer)
     {
-      KillTimer(hWnd, kOpenSettleTimerId);
+      KillTimer(hWnd, self->mRegistrationIds.openSettleTimer);
       // Replay of the geometry events swallowed during async controller
       // creation (they are all gated on mWebViewCtrlr) — same body as the
       // WM_SIZE handler; the dedup guard makes stable-geometry shots free.
@@ -355,15 +479,25 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
         // chains are nudged — top-level wrappers (Studio One / FSP) never
         // enter and keep today's clamp+letterbox behavior.
         if (flPath)
+        {
           nudged = self->NudgeClippedAncestorIntoView();
+          if (!IsLiveOwnerLocked(context->lifetime, context->generation,
+                                 context->parent, self))
+            return 0;
+        }
         changed = self->ApplyWebViewBounds();
-        if (changed && self->mIWebView)
-          self->mIWebView->OnWebViewViewportChanged();
+        if (!IsLiveOwnerLocked(context->lifetime, context->generation,
+                               context->parent, self))
+          return 0;
       }
       ::WebViewInitLog("OpenSettle:timer_fire", S_OK, "changed=%d nudged=%d shotsLeft=%d",
                        changed ? 1 : 0, nudged ? 1 : 0, self->mOpenSettleShotsRemaining - 1);
       if (--self->mOpenSettleShotsRemaining > 0)
-        SetTimer(hWnd, kOpenSettleTimerId, 1400, nullptr); // last shot ~1.7s after birth — safely past kDpiSettleMinAgeMs
+        SetTimer(hWnd, self->mRegistrationIds.openSettleTimer, 1400, nullptr); // last shot ~1.7s after birth — safely past kDpiSettleMinAgeMs
+      // Delegate notification is last: it may synchronously close or destroy
+      // the editor, invalidating self while this callback is still unwinding.
+      if (changed && self->mIWebView)
+        self->mIWebView->OnWebViewViewportChanged();
       return 0;
     }
     return DefSubclassProc(hWnd, msg, wParam, lParam);
@@ -381,10 +515,16 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
   if (msg == WM_DPICHANGED)
   {
     const LRESULT res = DefSubclassProc(hWnd, msg, wParam, lParam);
+    if (!IsLiveOwnerLocked(context->lifetime, context->generation,
+                           context->parent, self))
+      return res;
     if (self->mHasLastBounds && self->mWebViewCtrlr)
     {
       ::WebViewInitLog("AspectHook:WM_DPICHANGED", S_OK, "newDpi=%u", (unsigned)HIWORD(wParam));
       self->ApplyWebViewBounds();
+      if (!IsLiveOwnerLocked(context->lifetime, context->generation,
+                             context->parent, self))
+        return res;
       if (self->mIWebView)
         self->mIWebView->OnWebViewViewportChanged();
     }
@@ -406,13 +546,16 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
     if (self->mHasLastBounds && self->mWebViewCtrlr)
     {
       self->ApplyWebViewBounds();
-      if (self->mIWebView)
-        self->mIWebView->OnWebViewViewportChanged();
+      if (!IsLiveOwnerLocked(context->lifetime, context->generation,
+                             context->parent, self))
+        return DefSubclassProc(hWnd, msg, wParam, lParam);
       // debounce a frame snap for hosts that never run the standard size-move
       // loop (no WM_ENTER/EXITSIZEMOVE) — reset on every size event, fires
       // once the layout settles
       if (!self->mInSizeMove)
-        SetTimer(hWnd, kFrameSnapTimerId, 80, nullptr);
+        SetTimer(hWnd, self->mRegistrationIds.frameSnapTimer, 80, nullptr);
+      if (self->mIWebView)
+        self->mIWebView->OnWebViewViewportChanged();
     }
     return DefSubclassProc(hWnd, msg, wParam, lParam);
   }
@@ -438,37 +581,92 @@ LRESULT CALLBACK IWebViewImpl::AspectRatioSubclassProc(HWND hWnd, UINT msg, WPAR
 // the storm-case (WM_WINDOWPOSCHANGED spam during drags) a cheap no-op.
 LRESULT CALLBACK IWebViewImpl::ParentWatchSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
+  const auto context = AcquireSubclassContext(uIdSubclass, dwRefData);
+  if (!context)
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+
   if (msg == WM_NCDESTROY)
   {
-    RemoveWindowSubclass(hWnd, &IWebViewImpl::ParentWatchSubclassProc, uIdSubclass);
+    std::lock_guard<std::recursive_mutex> lifetimeLock(context->lifetime->mutex);
+    IWebViewImpl* self = static_cast<IWebViewImpl*>(context->lifetime->owner);
+    const bool isCurrentGeneration = context->lifetime->MatchesLocked(context->generation, context->parent);
+    if (self && self->mSubclassedParentWnd == hWnd &&
+        self->mRegistrationIds.parentWatchSubclass == uIdSubclass &&
+        self->mParentWatchContext.get() == context.get())
+    {
+      self->mSubclassedParentWnd = NULL;
+      self->mParentWatchContext.reset();
+      self->mHookGeneration = 0;
+      if (self->mParentWnd == hWnd)
+        self->mParentWnd = NULL;
+      if (isCurrentGeneration)
+        context->lifetime->InvalidateGenerationLocked();
+    }
+    const BOOL removed = RemoveWindowSubclass(hWnd, &IWebViewImpl::ParentWatchSubclassProc, uIdSubclass);
+    ::WebViewInitLog("ParentWatch:WM_NCDESTROY", removed ? S_OK : E_FAIL,
+                     "this=%p gen=%llu hwnd=%p subclassId=%llu removed=%d",
+                     (void*)self, static_cast<unsigned long long>(context->generation),
+                     (void*)hWnd,
+                     static_cast<unsigned long long>(uIdSubclass), removed ? 1 : 0);
+    UnregisterSubclassContext(uIdSubclass, context.get());
     return DefSubclassProc(hWnd, msg, wParam, lParam);
   }
 
-  if ((msg != WM_WINDOWPOSCHANGED && msg != WM_SIZE && msg != WM_MOVE) || !dwRefData)
+  if (msg != WM_WINDOWPOSCHANGED && msg != WM_SIZE && msg != WM_MOVE)
     return DefSubclassProc(hWnd, msg, wParam, lParam);
 
   const LRESULT res = DefSubclassProc(hWnd, msg, wParam, lParam);
 
-  IWebViewImpl* self = reinterpret_cast<IWebViewImpl*>(dwRefData);
+  std::unique_lock<std::recursive_mutex> lifetimeLock;
+  IWebViewImpl* self = AcquireLiveOwner(context->lifetime, context->generation,
+                                        context->parent, lifetimeLock,
+                                        "ParentWatchSubclassProc");
+  if (!self || context->hwnd != hWnd ||
+      self->mRegistrationIds.parentWatchSubclass != uIdSubclass)
+    return res;
   if (self->mHasLastBounds && self->mWebViewCtrlr)
   {
-    if (self->ApplyWebViewBounds() && self->mIWebView)
-      self->mIWebView->OnWebViewViewportChanged();
+    const bool changed = self->ApplyWebViewBounds();
+    if (!IsLiveOwnerLocked(context->lifetime, context->generation,
+                           context->parent, self))
+      return res;
     // the host re-laid-out our container — debounce a frame snap so dead
     // letterbox bands (host centers a smaller view, keeps its window) collapse
     if (!self->mInSizeMove && self->mSubclassedHwnd)
-      SetTimer(self->mSubclassedHwnd, kFrameSnapTimerId, 80, nullptr);
+      SetTimer(self->mSubclassedHwnd, self->mRegistrationIds.frameSnapTimer, 80, nullptr);
+    if (changed && self->mIWebView)
+      self->mIWebView->OnWebViewViewportChanged();
   }
   return res;
 }
 
 void IWebViewImpl::InstallAspectRatioHook(int designWidth, int designHeight)
 {
-  if (mSubclassedHwnd || !mParentWnd || designWidth <= 0 || designHeight <= 0)
+  if (!mParentWnd || designWidth <= 0 || designHeight <= 0)
     return;
 
   mDesignWidth = designWidth;
   mDesignHeight = designHeight;
+
+  const uint64_t generation = mLifetime->generation;
+  if (mHookGeneration == generation)
+    return;
+
+  // A cross-thread RemoveWindowSubclass can fail while the old HWND is still
+  // alive. Keep that context registered so any stale callback remains safe,
+  // retry removal here, and never overwrite it with this generation's refData.
+  if (mSubclassedHwnd || mSubclassedParentWnd)
+  {
+    RemoveAspectRatioHook();
+    if (mSubclassedHwnd || mSubclassedParentWnd)
+    {
+      ::WebViewInitLog("AspectHook:install_blocked_stale", E_FAIL,
+                       "this=%p gen=%llu frame=%p parentWatch=%p",
+                       (void*)this, static_cast<unsigned long long>(generation),
+                       (void*)mSubclassedHwnd, (void*)mSubclassedParentWnd);
+      return;
+    }
+  }
 
   // Walk up to the top-level window — WM_SIZING only fires on the outermost
   // window of the resize drag, which is the host's plugin frame window.
@@ -476,50 +674,194 @@ void IWebViewImpl::InstallAspectRatioHook(int designWidth, int designHeight)
   if (!topLevel)
     return;
 
-  if (SetWindowSubclass(topLevel, &IWebViewImpl::AspectRatioSubclassProc, kAspectRatioSubclassId, reinterpret_cast<DWORD_PTR>(this)))
+  wchar_t rootClass[64] = {};
+  GetClassNameW(topLevel, rootClass, 64);
+  ::WebViewInitLog("AspectHook:install_start", S_OK,
+                   "this=%p gen=%llu parent=%p root=%p rootClass='%ls' aspectId=%llu parentId=%llu frameTimerId=%llu settleTimerId=%llu",
+                   (void*)this, static_cast<unsigned long long>(generation),
+                   (void*)mParentWnd, (void*)topLevel, rootClass,
+                   static_cast<unsigned long long>(mRegistrationIds.aspectRatioSubclass),
+                   static_cast<unsigned long long>(mRegistrationIds.parentWatchSubclass),
+                   static_cast<unsigned long long>(mRegistrationIds.frameSnapTimer),
+                   static_cast<unsigned long long>(mRegistrationIds.openSettleTimer));
+
+  // FL attached mode's GA_ROOT is the application main frame shared by every
+  // plugin instance. Never install an instance callback or timer there.
+  if (!IsHostAppMainFrame(topLevel))
   {
-    mSubclassedHwnd = topLevel;
+    mAspectRatioContext = std::make_shared<WebViewSubclassContext>();
+    mAspectRatioContext->lifetime = mLifetime;
+    mAspectRatioContext->generation = generation;
+    mAspectRatioContext->parent = mParentWnd;
+    mAspectRatioContext->hwnd = topLevel;
+    RegisterSubclassContext(mRegistrationIds.aspectRatioSubclass, mAspectRatioContext);
+    const BOOL installed = SetWindowSubclass(topLevel, &IWebViewImpl::AspectRatioSubclassProc,
+                                             mRegistrationIds.aspectRatioSubclass,
+                                             reinterpret_cast<DWORD_PTR>(mAspectRatioContext.get()));
+    if (installed)
+      mSubclassedHwnd = topLevel;
+    else
+    {
+      UnregisterSubclassContext(mRegistrationIds.aspectRatioSubclass, mAspectRatioContext.get());
+      mAspectRatioContext.reset();
+    }
+    ::WebViewInitLog("AspectHook:install_frame", installed ? S_OK : E_FAIL,
+                     "this=%p gen=%llu hwnd=%p subclassId=%llu installed=%d",
+                     (void*)this, static_cast<unsigned long long>(generation),
+                     (void*)topLevel,
+                     static_cast<unsigned long long>(mRegistrationIds.aspectRatioSubclass),
+                     installed ? 1 : 0);
   }
+  else
+    ::WebViewInitLog("AspectHook:skip_host_main", S_OK,
+                     "this=%p gen=%llu root=%p rootClass='%ls'",
+                     (void*)this, static_cast<unsigned long long>(generation),
+                     (void*)topLevel, rootClass);
+  assert(!IsHostAppMainFrame(topLevel) || mSubclassedHwnd != topLevel);
 
   // Watch the parent container itself for silent host re-layouts (see
   // ParentWatchSubclassProc). Skip when the parent IS the top-level window
   // (standalone app) — the frame subclass already covers it.
-  if (mParentWnd != topLevel &&
-      SetWindowSubclass(mParentWnd, &IWebViewImpl::ParentWatchSubclassProc, kParentWatchSubclassId, reinterpret_cast<DWORD_PTR>(this)))
+  if (mParentWnd != topLevel)
   {
-    mSubclassedParentWnd = mParentWnd;
+    mParentWatchContext = std::make_shared<WebViewSubclassContext>();
+    mParentWatchContext->lifetime = mLifetime;
+    mParentWatchContext->generation = generation;
+    mParentWatchContext->parent = mParentWnd;
+    mParentWatchContext->hwnd = mParentWnd;
+    RegisterSubclassContext(mRegistrationIds.parentWatchSubclass, mParentWatchContext);
+    const BOOL installed = SetWindowSubclass(mParentWnd, &IWebViewImpl::ParentWatchSubclassProc,
+                                             mRegistrationIds.parentWatchSubclass,
+                                             reinterpret_cast<DWORD_PTR>(mParentWatchContext.get()));
+    if (installed)
+      mSubclassedParentWnd = mParentWnd;
+    else
+    {
+      UnregisterSubclassContext(mRegistrationIds.parentWatchSubclass, mParentWatchContext.get());
+      mParentWatchContext.reset();
+    }
+    ::WebViewInitLog("ParentWatch:install", installed ? S_OK : E_FAIL,
+                     "this=%p gen=%llu hwnd=%p subclassId=%llu installed=%d",
+                     (void*)this, static_cast<unsigned long long>(generation),
+                     (void*)mParentWnd,
+                     static_cast<unsigned long long>(mRegistrationIds.parentWatchSubclass),
+                     installed ? 1 : 0);
   }
+
+  mHookGeneration = generation;
 }
 
 void IWebViewImpl::RemoveAspectRatioHook()
 {
   if (mSubclassedHwnd)
   {
-    KillTimer(mSubclassedHwnd, kFrameSnapTimerId);
-    KillTimer(mSubclassedHwnd, kOpenSettleTimerId);
-    RemoveWindowSubclass(mSubclassedHwnd, &IWebViewImpl::AspectRatioSubclassProc, kAspectRatioSubclassId);
-    mSubclassedHwnd = NULL;
+    const HWND hwnd = mSubclassedHwnd;
+    const auto context = mAspectRatioContext;
+    const BOOL killedFrame = KillTimer(hwnd, mRegistrationIds.frameSnapTimer);
+    const BOOL killedSettle = KillTimer(hwnd, mRegistrationIds.openSettleTimer);
+    DWORD_PTR installedRefData = 0;
+    const BOOL found = GetWindowSubclass(hwnd, &IWebViewImpl::AspectRatioSubclassProc,
+                                         mRegistrationIds.aspectRatioSubclass, &installedRefData);
+    const BOOL removed = found && context && installedRefData == reinterpret_cast<DWORD_PTR>(context.get())
+                           ? RemoveWindowSubclass(hwnd, &IWebViewImpl::AspectRatioSubclassProc,
+                                                  mRegistrationIds.aspectRatioSubclass)
+                           : FALSE;
+    const bool safeToForget = removed || !found || !IsWindow(hwnd);
+    if (context && safeToForget)
+      UnregisterSubclassContext(mRegistrationIds.aspectRatioSubclass, context.get());
+    ::WebViewInitLog("AspectHook:remove_frame", removed || !found ? S_OK : E_FAIL,
+                     "this=%p gen=%llu hwnd=%p subclassId=%llu frameTimerId=%llu settleTimerId=%llu found=%d removed=%d killedFrame=%d killedSettle=%d",
+                     (void*)this, static_cast<unsigned long long>(mLifetime->generation),
+                     (void*)hwnd,
+                     static_cast<unsigned long long>(mRegistrationIds.aspectRatioSubclass),
+                     static_cast<unsigned long long>(mRegistrationIds.frameSnapTimer),
+                     static_cast<unsigned long long>(mRegistrationIds.openSettleTimer),
+                     found ? 1 : 0, removed ? 1 : 0,
+                     killedFrame ? 1 : 0, killedSettle ? 1 : 0);
+    if (safeToForget)
+    {
+      mSubclassedHwnd = NULL;
+      mAspectRatioContext.reset();
+    }
   }
   if (mSubclassedParentWnd)
   {
-    RemoveWindowSubclass(mSubclassedParentWnd, &IWebViewImpl::ParentWatchSubclassProc, kParentWatchSubclassId);
-    mSubclassedParentWnd = NULL;
+    const HWND hwnd = mSubclassedParentWnd;
+    const auto context = mParentWatchContext;
+    DWORD_PTR installedRefData = 0;
+    const BOOL found = GetWindowSubclass(hwnd, &IWebViewImpl::ParentWatchSubclassProc,
+                                         mRegistrationIds.parentWatchSubclass, &installedRefData);
+    const BOOL removed = found && context && installedRefData == reinterpret_cast<DWORD_PTR>(context.get())
+                           ? RemoveWindowSubclass(hwnd, &IWebViewImpl::ParentWatchSubclassProc,
+                                                  mRegistrationIds.parentWatchSubclass)
+                           : FALSE;
+    const bool safeToForget = removed || !found || !IsWindow(hwnd);
+    if (context && safeToForget)
+      UnregisterSubclassContext(mRegistrationIds.parentWatchSubclass, context.get());
+    ::WebViewInitLog("ParentWatch:remove", removed || !found ? S_OK : E_FAIL,
+                     "this=%p gen=%llu hwnd=%p subclassId=%llu found=%d removed=%d",
+                     (void*)this, static_cast<unsigned long long>(mLifetime->generation),
+                     (void*)hwnd,
+                     static_cast<unsigned long long>(mRegistrationIds.parentWatchSubclass),
+                     found ? 1 : 0, removed ? 1 : 0);
+    if (safeToForget)
+    {
+      mSubclassedParentWnd = NULL;
+      mParentWatchContext.reset();
+    }
   }
+  mHookGeneration = 0;
+  mOpenSettleShotsRemaining = 0;
+  mInSizeMove = false;
 }
 
 IWebViewImpl::IWebViewImpl(IWebView* owner)
   : mIWebView(owner)
+  , mLifetime(std::make_shared<webview_win::LifetimeState>())
 {
+  assert(mRegistrationIds.AreUnique());
+  std::lock_guard<std::recursive_mutex> lifetimeLock(mLifetime->mutex);
+  mLifetime->owner = this;
+  ::WebViewInitLog("lifetime:create", S_OK,
+                   "this=%p gen=%llu aspectId=%llu parentId=%llu frameTimerId=%llu settleTimerId=%llu",
+                   (void*)this, static_cast<unsigned long long>(mLifetime->generation),
+                   static_cast<unsigned long long>(mRegistrationIds.aspectRatioSubclass),
+                   static_cast<unsigned long long>(mRegistrationIds.parentWatchSubclass),
+                   static_cast<unsigned long long>(mRegistrationIds.frameSnapTimer),
+                   static_cast<unsigned long long>(mRegistrationIds.openSettleTimer));
 }
 
 IWebViewImpl::~IWebViewImpl()
 {
   CloseWebView();
+  std::lock_guard<std::recursive_mutex> lifetimeLock(mLifetime->mutex);
+  mLifetime->owner = nullptr;
+  const uint64_t generation = mLifetime->InvalidateGenerationLocked();
+  ::WebViewInitLog("lifetime:destroy", S_OK, "this=%p gen=%llu",
+                   (void*)this, static_cast<unsigned long long>(generation));
 }
 
 void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, float)
 {
+  // Reopening without an explicit close must still invalidate the previous
+  // generation before any new callback can observe this instance.
+  CloseWebView();
+  std::lock_guard<std::recursive_mutex> lifetimeLock(mLifetime->mutex);
   mParentWnd = (HWND)pParent;
+  const uint64_t generation = mLifetime->BeginGenerationLocked(this, mParentWnd);
+  const auto lifetime = mLifetime;
+  const HWND callbackParent = mParentWnd;
+
+  if (!IsWindow(mParentWnd))
+  {
+    ::WebViewInitLog("OpenWebView:invalid_parent", E_HANDLE,
+                     "this=%p gen=%llu parentHwnd=%p",
+                     (void*)this, static_cast<unsigned long long>(generation),
+                     (void*)mParentWnd);
+    mLifetime->InvalidateGenerationLocked();
+    mParentWnd = NULL;
+    return nullptr;
+  }
 
   // Install the Win32 aspect-ratio hook now that we know the parent HWND.
   // w/h here are the design dimensions passed by IPlugWebViewEditorDelegate
@@ -556,13 +898,23 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
   options->put_AdditionalBrowserArguments(L"--disable-gpu");
 
   ::WebViewInitLog("OpenWebView:start", S_OK,
-                   "cachePath='%s' parentHwnd=%p", cachePath.Get(), (void*)mParentWnd);
+                   "this=%p gen=%llu cachePath='%s' parentHwnd=%p rootHwnd=%p",
+                   (void*)this, static_cast<unsigned long long>(generation),
+                   cachePath.Get(), (void*)mParentWnd,
+                   (void*)GetAncestor(mParentWnd, GA_ROOT));
 
   CreateCoreWebView2EnvironmentWithOptions(
     nullptr, cachePathWide.data(), options.Get(),
-    Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>([&](
+    Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>([lifetime, generation, callbackParent](
                                                                            HRESULT result,
                                                                            ICoreWebView2Environment* env) -> HRESULT {
+      std::unique_lock<std::recursive_mutex> callbackLock;
+      IWebViewImpl* self = AcquireLiveOwner(lifetime, generation, callbackParent,
+                                            callbackLock, "environment_completion");
+      if (!self)
+        return S_OK;
+      auto& mWebViewEnvironment = self->mWebViewEnvironment;
+      auto& mParentWnd = self->mParentWnd;
       // Null-check env BEFORE dereferencing. If env-creation actually
       // failed (env is null), the previous code path-faulted on the
       // CreateCoreWebView2Controller call below — a latent crash bug.
@@ -573,22 +925,62 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
         ::WebViewInitLog("env:create_failed", result, "env=%p", (void*)env);
         return result;
       }
-      ::WebViewInitLog("env:create_ok", result, nullptr);
+      ::WebViewInitLog("env:create_ok", result, "this=%p gen=%llu parent=%p",
+                       (void*)self, static_cast<unsigned long long>(generation),
+                       (void*)callbackParent);
 
       mWebViewEnvironment = env;
 
       mWebViewEnvironment->CreateCoreWebView2Controller(
         mParentWnd,
-          Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>([&](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
+          Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>([lifetime, generation, callbackParent](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
+            std::unique_lock<std::recursive_mutex> callbackLock;
+            IWebViewImpl* self = AcquireLiveOwner(lifetime, generation, callbackParent,
+                                                  callbackLock, "controller_completion");
+            if (!self)
+              return S_OK;
+            auto& mWebViewCtrlr = self->mWebViewCtrlr;
+            auto& mCoreWebView = self->mCoreWebView;
+            auto& mControllerBornTick = self->mControllerBornTick;
+            auto& mLastPushedBounds = self->mLastPushedBounds;
+            auto& mLastPushedZoom = self->mLastPushedZoom;
+            auto& mShowOnLoad = self->mShowOnLoad;
+            auto& mOpaque = self->mOpaque;
+            auto& mHasLastBounds = self->mHasLastBounds;
+            auto& mParentWnd = self->mParentWnd;
+            auto& mDesignWidth = self->mDesignWidth;
+            auto& mDesignHeight = self->mDesignHeight;
+            auto& mWebViewBounds = self->mWebViewBounds;
+            auto& mSubclassedHwnd = self->mSubclassedHwnd;
+            auto& mOpenSettleShotsRemaining = self->mOpenSettleShotsRemaining;
+            auto& mIWebView = self->mIWebView;
+            auto& mWebMessageReceivedToken = self->mWebMessageReceivedToken;
+            auto& mNavigationStartingToken = self->mNavigationStartingToken;
+            auto& mNavigationCompletedToken = self->mNavigationCompletedToken;
+            auto& mNewWindowRequestedToken = self->mNewWindowRequestedToken;
+            auto& mDownloadStartingToken = self->mDownloadStartingToken;
+            const auto& mRegistrationIds = self->mRegistrationIds;
+            auto IsStillCurrent = [lifetime, generation, callbackParent, self]() {
+              return IsLiveOwnerLocked(lifetime, generation, callbackParent, self);
+            };
+            auto PinRasterizationScale = [self]() { self->PinRasterizationScale(); };
+            auto ApplyWebViewBounds = [self]() { return self->ApplyWebViewBounds(); };
+            auto GetScaledRect = [self](float x, float y, float w, float h, float scale) {
+              return self->GetScaledRect(x, y, w, h, scale);
+            };
             if (FAILED(result) || controller == nullptr)
             {
               ::WebViewInitLog("controller:create_failed", result, "controller=%p", (void*)controller);
               return result;
             }
-            ::WebViewInitLog("controller:create_ok", result, nullptr);
+            ::WebViewInitLog("controller:create_ok", result, "this=%p gen=%llu parent=%p",
+                             (void*)self, static_cast<unsigned long long>(generation),
+                             (void*)callbackParent);
 
             mWebViewCtrlr = controller;
             mWebViewCtrlr->get_CoreWebView2(&mCoreWebView);
+            if (!IsStillCurrent())
+              return S_OK;
             mControllerBornTick = GetTickCount64();
 
             // A fresh controller starts at 0x0 and has never been pushed to,
@@ -612,24 +1004,35 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
             }
 
             mWebViewCtrlr->put_IsVisible(mShowOnLoad);
+            if (!IsStillCurrent())
+              return S_OK;
 
             const auto enableDevTools = true; // TEMP: force devtools for debugging
 
-            ICoreWebView2Settings* Settings;
-            mCoreWebView->get_Settings(&Settings);
-            Settings->put_IsScriptEnabled(TRUE);
-            Settings->put_AreDefaultScriptDialogsEnabled(TRUE);
-            Settings->put_IsWebMessageEnabled(TRUE);
-            Settings->put_AreDefaultContextMenusEnabled(enableDevTools);
-            Settings->put_AreDevToolsEnabled(enableDevTools);
+            wil::com_ptr<ICoreWebView2Settings> settings;
+            const HRESULT settingsResult = mCoreWebView->get_Settings(&settings);
+            if (FAILED(settingsResult) || !settings)
+            {
+              ::WebViewInitLog("controller:get_Settings_failed", settingsResult, nullptr);
+              return S_OK;
+            }
+            settings->put_IsScriptEnabled(TRUE);
+            settings->put_AreDefaultScriptDialogsEnabled(TRUE);
+            settings->put_IsWebMessageEnabled(TRUE);
+            settings->put_AreDefaultContextMenusEnabled(enableDevTools);
+            settings->put_AreDevToolsEnabled(enableDevTools);
+            if (!IsStillCurrent())
+              return S_OK;
 
             // this script adds a function IPlugSendMsg that is used to communicate from the WebView to the C++ side
             mCoreWebView->AddScriptToExecuteOnDocumentCreated(
               L"function IPlugSendMsg(m) {window.chrome.webview.postMessage(m)};",
-              Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>([this](HRESULT error,
+              Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>([](HRESULT error,
                                                                                                 PCWSTR id) -> HRESULT {
                 return S_OK;
               }).Get());
+            if (!IsStillCurrent())
+              return S_OK;
 
             // Forward keydown / keyup from the WebView to the C++ side. The
             // editable check is intentionally aggressive: any focused element
@@ -680,34 +1083,50 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
 
             mCoreWebView->AddScriptToExecuteOnDocumentCreated(
               kForwardKeysScript,
-              Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>([this](HRESULT error, PCWSTR id) -> HRESULT { return S_OK; }).Get());
+              Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>([](HRESULT error, PCWSTR id) -> HRESULT { return S_OK; }).Get());
+            if (!IsStillCurrent())
+              return S_OK;
 
-            mCoreWebView->add_WebMessageReceived(
-              Callback<ICoreWebView2WebMessageReceivedEventHandler>([this](
+            const HRESULT addWebMessageResult = mCoreWebView->add_WebMessageReceived(
+              Callback<ICoreWebView2WebMessageReceivedEventHandler>([lifetime, generation, callbackParent](
                                                                       ICoreWebView2* sender,
                                                                       ICoreWebView2WebMessageReceivedEventArgs* args) {
+                std::unique_lock<std::recursive_mutex> eventLock;
+                IWebViewImpl* live = AcquireLiveOwner(lifetime, generation, callbackParent,
+                                                      eventLock, "WebMessageReceived");
+                if (!live)
+                  return S_OK;
                 wil::unique_cotaskmem_string jsonString;
                 args->get_WebMessageAsJson(&jsonString);
                 std::wstring jsonWString = jsonString.get();
                 WDL_String cStr;
                 UTF16ToUTF8(cStr, jsonWString.c_str());
-                mIWebView->OnMessageFromWebView(cStr.Get());
+                if (live->mIWebView)
+                  live->mIWebView->OnMessageFromWebView(cStr.Get());
                 return S_OK;
               }).Get(),
               &mWebMessageReceivedToken);
+            if (!IsStillCurrent())
+              return S_OK;
+            self->mHasWebMessageReceivedToken = SUCCEEDED(addWebMessageResult);
 
 
-            mCoreWebView->add_NavigationStarting(
+            const HRESULT addNavigationStartingResult = mCoreWebView->add_NavigationStarting(
               Callback<ICoreWebView2NavigationStartingEventHandler>(
-                [this](ICoreWebView2* sender, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
-                  
+                [lifetime, generation, callbackParent](ICoreWebView2* sender, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                  std::unique_lock<std::recursive_mutex> eventLock;
+                  IWebViewImpl* live = AcquireLiveOwner(lifetime, generation, callbackParent,
+                                                        eventLock, "NavigationStarting");
+                  if (!live)
+                    return S_OK;
+
                   wil::unique_cotaskmem_string uri;
                   args->get_Uri(&uri);
                   std::wstring uriUTF16 = uri.get();
                   WDL_String uriUTF8;
                   UTF16ToUTF8(uriUTF8, uriUTF16.c_str());
                   
-                  if (mIWebView->OnCanNavigateToURL(uriUTF8.Get()) == false)
+                  if (live->mIWebView && live->mIWebView->OnCanNavigateToURL(uriUTF8.Get()) == false)
                   {
                     args->put_Cancel(TRUE);
                   }
@@ -715,16 +1134,25 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
                   return S_OK;
                 }).Get(),
               &mNavigationStartingToken);
+            if (!IsStillCurrent())
+              return S_OK;
+            self->mHasNavigationStartingToken = SUCCEEDED(addNavigationStartingResult);
 
-            mCoreWebView->add_NavigationCompleted(
+            const HRESULT addNavigationCompletedResult = mCoreWebView->add_NavigationCompleted(
               Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                [this](ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                [lifetime, generation, callbackParent](ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                  std::unique_lock<std::recursive_mutex> eventLock;
+                  IWebViewImpl* live = AcquireLiveOwner(lifetime, generation, callbackParent,
+                                                        eventLock, "NavigationCompleted");
+                  if (!live)
+                    return S_OK;
                   BOOL success = FALSE;
                   args->get_IsSuccess(&success);
                   if (success)
                   {
                     ::WebViewInitLog("NavigationCompleted:ok", S_OK, nullptr);
-                    mIWebView->OnWebContentLoaded();
+                    if (live->mIWebView)
+                      live->mIWebView->OnWebContentLoaded();
                   }
                   else
                   {
@@ -741,12 +1169,20 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
                 })
                 .Get(),
               &mNavigationCompletedToken);
+            if (!IsStillCurrent())
+              return S_OK;
+            self->mHasNavigationCompletedToken = SUCCEEDED(addNavigationCompletedResult);
 
-              mCoreWebView->add_NewWindowRequested(
+              const HRESULT addNewWindowResult = mCoreWebView->add_NewWindowRequested(
               Callback<ICoreWebView2NewWindowRequestedEventHandler>(
-                  [this](ICoreWebView2* sender, ICoreWebView2NewWindowRequestedEventArgs* args)
-                    -> HRESULT 
+                  [lifetime, generation, callbackParent](ICoreWebView2* sender, ICoreWebView2NewWindowRequestedEventArgs* args)
+                    -> HRESULT
               {
+                std::unique_lock<std::recursive_mutex> eventLock;
+                IWebViewImpl* live = AcquireLiveOwner(lifetime, generation, callbackParent,
+                                                      eventLock, "NewWindowRequested");
+                if (!live)
+                  return S_OK;
                 wil::com_ptr<ICoreWebView2NewWindowRequestedEventArgs2> args2;
 
                 if (SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&args2))))
@@ -758,7 +1194,7 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
 
                     args2->get_Uri(&uri);
 
-                    if (ShellExecuteW(mParentWnd, L"open", uri.get(), 0, 0, SW_SHOWNORMAL) > HINSTANCE(32))
+                    if (ShellExecuteW(live->mParentWnd, L"open", uri.get(), 0, 0, SW_SHOWNORMAL) > HINSTANCE(32))
                     {
                       args->put_Handled(true);
                     }
@@ -767,15 +1203,24 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
                 return S_OK;
               }).Get(),
                 &mNewWindowRequestedToken);
+            if (!IsStillCurrent())
+              return S_OK;
+            self->mHasNewWindowRequestedToken = SUCCEEDED(addNewWindowResult);
 
               auto webView2_4 = mCoreWebView.try_query<ICoreWebView2_4>();
               if (webView2_4)
               {
-                webView2_4->add_DownloadStarting(
+                const HRESULT addDownloadStartingResult = webView2_4->add_DownloadStarting(
                   Callback<ICoreWebView2DownloadStartingEventHandler>(
-                  [this](
+                  [lifetime, generation, callbackParent](
                     ICoreWebView2* sender,
                     ICoreWebView2DownloadStartingEventArgs* args) -> HRESULT {
+
+                    std::unique_lock<std::recursive_mutex> eventLock;
+                    IWebViewImpl* live = AcquireLiveOwner(lifetime, generation, callbackParent,
+                                                          eventLock, "DownloadStarting");
+                    if (!live)
+                      return S_OK;
 
                     // Hide the default download dialog.
                     args->put_Handled(TRUE);
@@ -792,10 +1237,14 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
                     std::wstring mimeTypeUTF16 = mimeType.get();
                     WDL_String mimeTypeUTF8;
                     UTF16ToUTF8(mimeTypeUTF8, mimeTypeUTF16.c_str());
-                    if (!mIWebView->OnCanDownloadMIMEType(mimeTypeUTF8.Get()))
+                    if (!live->mIWebView || !live->mIWebView->OnCanDownloadMIMEType(mimeTypeUTF8.Get()))
                     {
                       args->put_Cancel(TRUE);
                     }
+
+                    // A delegate may synchronously close/destroy the editor.
+                    if (!lifetime->MatchesLocked(generation, callbackParent) || !IsWindow(callbackParent))
+                      return S_OK;
 
                     wil::unique_cotaskmem_string contentDisposition;
                     download->get_ContentDisposition(&contentDisposition);
@@ -807,7 +1256,10 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
                     std::wstring initialPathUTF16 = resultFilePath.get();
                     WDL_String initialPathUTF8, downloadPathUTF8;
                     UTF16ToUTF8(initialPathUTF8, initialPathUTF16.c_str());
-                    mIWebView->OnGetLocalDownloadPathForFile(initialPathUTF8.Get(), downloadPathUTF8);
+                    live->mIWebView->OnGetLocalDownloadPathForFile(initialPathUTF8.Get(), downloadPathUTF8);
+
+                    if (!lifetime->MatchesLocked(generation, callbackParent) || !IsWindow(callbackParent))
+                      return S_OK;
 
                     int bufSize = UTF8ToUTF16Len(downloadPathUTF8.Get());
                     std::vector<WCHAR> downloadPathWide(bufSize);
@@ -815,56 +1267,83 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
 
                     args->put_ResultFilePath(downloadPathWide.data());
                     
-                    download->add_BytesReceivedChanged(Callback<ICoreWebView2BytesReceivedChangedEventHandler>([this](ICoreWebView2DownloadOperation* download, IUnknown* args) -> HRESULT {
-                                                         INT64 bytesReceived, totalNumBytes;
-                                                         download->get_BytesReceived(&bytesReceived);
-                                                         download->get_TotalBytesToReceive(&totalNumBytes);
-                                                         mIWebView->OnReceivedData(bytesReceived, totalNumBytes);
+                    auto registration = std::make_shared<WebViewDownloadRegistration>();
+                    registration->operation = download;
+                    live->mDownloadRegistrations.push_back(registration);
+
+                    const HRESULT addBytesResult = download->add_BytesReceivedChanged(
+                      Callback<ICoreWebView2BytesReceivedChangedEventHandler>(
+                        [lifetime, generation, callbackParent](ICoreWebView2DownloadOperation* operation, IUnknown*) -> HRESULT {
+                          std::unique_lock<std::recursive_mutex> progressLock;
+                          IWebViewImpl* current = AcquireLiveOwner(lifetime, generation, callbackParent,
+                                                                  progressLock, "BytesReceivedChanged");
+                          if (!current)
+                            return S_OK;
+                          INT64 bytesReceived = 0;
+                          INT64 totalNumBytes = 0;
+                          operation->get_BytesReceived(&bytesReceived);
+                          operation->get_TotalBytesToReceive(&totalNumBytes);
+                          if (current->mIWebView)
+                            current->mIWebView->OnReceivedData(bytesReceived, totalNumBytes);
                           return S_OK;
                         }).Get(),
-                        &mBytesReceivedChangedToken);
+                      &registration->bytesReceivedToken);
+                    registration->hasBytesReceivedToken = SUCCEEDED(addBytesResult);
 
-                        download->add_StateChanged(Callback<ICoreWebView2StateChangedEventHandler>([this](ICoreWebView2DownloadOperation* download, IUnknown* args) -> HRESULT {
-                                                               COREWEBVIEW2_DOWNLOAD_STATE downloadState;
-                                                               download->get_State(&downloadState);
+                    const HRESULT addStateResult = download->add_StateChanged(
+                      Callback<ICoreWebView2StateChangedEventHandler>(
+                        [lifetime, generation, callbackParent, registration](ICoreWebView2DownloadOperation* operation, IUnknown*) -> HRESULT {
+                          std::unique_lock<std::recursive_mutex> stateLock;
+                          IWebViewImpl* current = AcquireLiveOwner(lifetime, generation, callbackParent,
+                                                                  stateLock, "DownloadStateChanged");
+                          if (!current)
+                            return S_OK;
 
-                                                               auto onDownloadEnded = [&](ICoreWebView2DownloadOperation* download, bool success) {
-                                                                 download->remove_BytesReceivedChanged(mBytesReceivedChangedToken);
-                                                                 download->remove_StateChanged(mStateChangedToken);
-                                                                 wil::unique_cotaskmem_string resultFilePath;
-                                                                 download->get_ResultFilePath(&resultFilePath);
-                                                                 std::wstring downloadPathUTF16 = resultFilePath.get();
-                                                                 WDL_String downloadPathUTF8;
-                                                                 UTF16ToUTF8(downloadPathUTF8, downloadPathUTF16.c_str());
+                          COREWEBVIEW2_DOWNLOAD_STATE downloadState = COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+                          operation->get_State(&downloadState);
+                          if (downloadState == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS)
+                            return S_OK;
 
-                                                                 if (success) {
-                                                                  mIWebView->OnDownloadedFile(downloadPathUTF8.Get());
-                                                                 }
-                                                                 else {
-                                                                  mIWebView->OnFailedToDownloadFile(downloadPathUTF8.Get());
-                                                                 }
-                                                               };
+                          if (registration->hasBytesReceivedToken)
+                          {
+                            operation->remove_BytesReceivedChanged(registration->bytesReceivedToken);
+                            registration->hasBytesReceivedToken = false;
+                          }
+                          if (registration->hasStateChangedToken)
+                          {
+                            operation->remove_StateChanged(registration->stateChangedToken);
+                            registration->hasStateChangedToken = false;
+                          }
 
-                                                               switch (downloadState)
-                                                               {
-                                                               case COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS:
-                                                               // TODO
-                                                                 break;
-                                                               case COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED:
-                                                                 onDownloadEnded(download, false);
-                                                                 break;
-                                                               case COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED:
-                                                                 onDownloadEnded(download, true);
-                                                                 break;
-                                                               }
-                                                               return S_OK;
-                                                             }).Get(),
-                                                             &mStateChangedToken);
+                          current->mDownloadRegistrations.erase(
+                            std::remove(current->mDownloadRegistrations.begin(),
+                                        current->mDownloadRegistrations.end(), registration),
+                            current->mDownloadRegistrations.end());
+
+                          wil::unique_cotaskmem_string completedPath;
+                          operation->get_ResultFilePath(&completedPath);
+                          WDL_String completedPathUTF8;
+                          UTF16ToUTF8(completedPathUTF8, completedPath.get());
+                          const bool success = downloadState == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED;
+                          if (current->mIWebView)
+                          {
+                            if (success)
+                              current->mIWebView->OnDownloadedFile(completedPathUTF8.Get());
+                            else
+                              current->mIWebView->OnFailedToDownloadFile(completedPathUTF8.Get());
+                          }
+                          return S_OK;
+                        }).Get(),
+                      &registration->stateChangedToken);
+                    registration->hasStateChangedToken = SUCCEEDED(addStateResult);
 
                     return S_OK;
                   })
                   .Get(),
               &mDownloadStartingToken);
+                if (!IsStillCurrent())
+                  return S_OK;
+                self->mHasDownloadStartingToken = SUCCEEDED(addDownloadStartingResult);
             }
 
             if (!mOpaque)
@@ -873,6 +1352,8 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
               COREWEBVIEW2_COLOR color;
               memset(&color, 0, sizeof(COREWEBVIEW2_COLOR));
               controller2->put_DefaultBackgroundColor(color);
+              if (!IsStillCurrent())
+                return S_OK;
             }
 
             // Own the rasterization scale from the first frame. By default
@@ -884,6 +1365,8 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
             // page's devicePixelRatio is deterministic; re-pinned on every
             // ApplyWebViewBounds and on WM_DPICHANGED.
             PinRasterizationScale();
+            if (!IsStillCurrent())
+              return S_OK;
 
             // Replay the latest size request now that the controller exists.
             // The host may have (re)sized the parent window during the async
@@ -892,6 +1375,8 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
             if (mHasLastBounds)
             {
               ApplyWebViewBounds();
+              if (!IsStillCurrent())
+                return S_OK;
             }
             else
             {
@@ -910,9 +1395,13 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
                 seed = GetScaledRect(0.f, 0.f, static_cast<float>(mDesignWidth), static_cast<float>(mDesignHeight), dpiScale);
                 haveSeed = true;
               }
-              mWebViewCtrlr->put_Bounds(haveSeed ? seed : mWebViewBounds);
               mWebViewBounds = haveSeed ? seed : mWebViewBounds;
+              mWebViewCtrlr->put_Bounds(mWebViewBounds);
+              if (!IsStillCurrent())
+                return S_OK;
               mWebViewCtrlr->put_IsVisible(TRUE);
+              if (!IsStillCurrent())
+                return S_OK;
               ::WebViewInitLog("controller:seed_bounds", S_OK, "rect=%ldx%ld", seed.right, seed.bottom);
             }
 
@@ -930,7 +1419,7 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
             if (mSubclassedHwnd)
             {
               mOpenSettleShotsRemaining = 2;
-              SetTimer(mSubclassedHwnd, kOpenSettleTimerId, 300, nullptr);
+              SetTimer(mSubclassedHwnd, mRegistrationIds.openSettleTimer, 300, nullptr);
             }
 
 #if defined APP_API
@@ -945,11 +1434,19 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
             // See also IPlugAPP_main.cpp's message pump, which stops
             // IsDialogMessage from swallowing these keys once focus is here.
             if (mShowOnLoad)
+            {
               mWebViewCtrlr->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+              if (!IsStillCurrent())
+                return S_OK;
+            }
 #endif
 
-            ::WebViewInitLog("controller:OnWebViewReady_fire", S_OK, nullptr);
-            mIWebView->OnWebViewReady();
+            ::WebViewInitLog("controller:OnWebViewReady_fire", S_OK,
+                             "this=%p gen=%llu parent=%p",
+                             (void*)self, static_cast<unsigned long long>(generation),
+                             (void*)callbackParent);
+            if (mIWebView)
+              mIWebView->OnWebViewReady();
             return S_OK;
           })
           .Get());
@@ -957,11 +1454,85 @@ void* IWebViewImpl::OpenWebView(void* pParent, float, float, float w, float h, f
       return S_OK;
     }).Get());
 
-  return mParentWnd;
+  return callbackParent;
+}
+
+void IWebViewImpl::UnregisterWebViewEventHandlers()
+{
+  if (mCoreWebView)
+  {
+    HRESULT webMessageResult = S_FALSE;
+    HRESULT navigationStartingResult = S_FALSE;
+    HRESULT navigationCompletedResult = S_FALSE;
+    HRESULT newWindowResult = S_FALSE;
+    HRESULT downloadStartingResult = S_FALSE;
+
+    if (mHasWebMessageReceivedToken)
+      webMessageResult = mCoreWebView->remove_WebMessageReceived(mWebMessageReceivedToken);
+    if (mHasNavigationStartingToken)
+      navigationStartingResult = mCoreWebView->remove_NavigationStarting(mNavigationStartingToken);
+    if (mHasNavigationCompletedToken)
+      navigationCompletedResult = mCoreWebView->remove_NavigationCompleted(mNavigationCompletedToken);
+    if (mHasNewWindowRequestedToken)
+      newWindowResult = mCoreWebView->remove_NewWindowRequested(mNewWindowRequestedToken);
+    if (mHasDownloadStartingToken)
+    {
+      if (auto webView2_4 = mCoreWebView.try_query<ICoreWebView2_4>())
+        downloadStartingResult = webView2_4->remove_DownloadStarting(mDownloadStartingToken);
+    }
+
+    ::WebViewInitLog("events:unregister", S_OK,
+                     "this=%p gen=%llu webMessage=0x%08lX navStart=0x%08lX navComplete=0x%08lX newWindow=0x%08lX download=0x%08lX",
+                     (void*)this, static_cast<unsigned long long>(mLifetime->generation),
+                     static_cast<unsigned long>(webMessageResult),
+                     static_cast<unsigned long>(navigationStartingResult),
+                     static_cast<unsigned long>(navigationCompletedResult),
+                     static_cast<unsigned long>(newWindowResult),
+                     static_cast<unsigned long>(downloadStartingResult));
+  }
+
+  mHasWebMessageReceivedToken = false;
+  mHasNavigationStartingToken = false;
+  mHasNavigationCompletedToken = false;
+  mHasNewWindowRequestedToken = false;
+  mHasDownloadStartingToken = false;
+
+  // Download events live on their operation rather than on mCoreWebView, so
+  // they must be removed separately before the controller is closed.
+  const auto downloadRegistrations = mDownloadRegistrations;
+  mDownloadRegistrations.clear();
+  for (const auto& registration : downloadRegistrations)
+  {
+    if (!registration || !registration->operation)
+      continue;
+    if (registration->hasBytesReceivedToken)
+    {
+      registration->operation->remove_BytesReceivedChanged(registration->bytesReceivedToken);
+      registration->hasBytesReceivedToken = false;
+    }
+    if (registration->hasStateChangedToken)
+    {
+      registration->operation->remove_StateChanged(registration->stateChangedToken);
+      registration->hasStateChangedToken = false;
+    }
+    registration->operation = nullptr;
+  }
 }
 
 void IWebViewImpl::CloseWebView()
 {
+  std::lock_guard<std::recursive_mutex> lifetimeLock(mLifetime->mutex);
+  // Invalidate first. Any queued/re-entrant completion or event callback sees
+  // the new generation before hooks are removed or COM objects are released.
+  const HWND closingParent = mParentWnd;
+  const uint64_t generation = mLifetime->InvalidateGenerationLocked();
+  ::WebViewInitLog("CloseWebView:start", S_OK,
+                   "this=%p gen=%llu parent=%p frame=%p parentWatch=%p",
+                   (void*)this, static_cast<unsigned long long>(generation),
+                   (void*)closingParent, (void*)mSubclassedHwnd,
+                   (void*)mSubclassedParentWnd);
+
+  UnregisterWebViewEventHandlers();
   RemoveAspectRatioHook();
 
   if (mWebViewCtrlr.get() != nullptr)
@@ -980,10 +1551,17 @@ void IWebViewImpl::CloseWebView()
     }
 
     mWebViewCtrlr->Close();
-    mWebViewCtrlr = nullptr;
-    mCoreWebView = nullptr;
-    mWebViewEnvironment = nullptr;
   }
+  mWebViewCtrlr = nullptr;
+  mCoreWebView = nullptr;
+  mWebViewEnvironment = nullptr;
+  mParentWnd = NULL;
+  mControllerBornTick = 0;
+
+  ::WebViewInitLog("CloseWebView:complete", S_OK,
+                   "this=%p gen=%llu parent=%p",
+                   (void*)this, static_cast<unsigned long long>(generation),
+                   (void*)closingParent);
 }
 
 void IWebViewImpl::HideWebView(bool hide)
@@ -1193,6 +1771,12 @@ void IWebViewImpl::SetWebViewBounds(float x, float y, float w, float h, float sc
 
 bool IWebViewImpl::ApplyWebViewBounds()
 {
+  std::unique_lock<std::recursive_mutex> lifetimeLock(mLifetime->mutex);
+  const uint64_t generation = mLifetime->generation;
+  const HWND callbackParent = mParentWnd;
+  if (!IsLiveOwnerLocked(mLifetime, generation, callbackParent, this))
+    return false;
+
   const float x = mLastBoundsX;
   const float y = mLastBoundsY;
   const float w = mLastBoundsW;
@@ -1209,6 +1793,8 @@ bool IWebViewImpl::ApplyWebViewBounds()
   // Keep the rasterization scale in lockstep with the parent window's DPI
   // (idempotent; see the comment at the controller-ready pin).
   PinRasterizationScale();
+  if (!IsLiveOwnerLocked(mLifetime, generation, callbackParent, this))
+    return false;
 
   // scale == -1: FL Studio — zoom = 1/dpiScale, normal DPI bounds
   // scale == -2: Cubase — zoom = 1.0, skip DPI bounds (host sends physical pixels)
@@ -1436,14 +2022,17 @@ bool IWebViewImpl::ApplyWebViewBounds()
     return false;
   mLastPushedBounds = mWebViewBounds;
   mLastPushedZoom = zoom;
-
-  mWebViewCtrlr->SetBoundsAndZoomFactor(mWebViewBounds, zoom);
-
   ::WebViewInitLog("SetWebViewBounds:applied", S_OK,
                    "w=%.0f h=%.0f scale=%.2f dpiScale=%.2f rect=%ldx%ld zoom=%.3f",
                    w, h, scale, dpiScale,
                    mWebViewBounds.right - mWebViewBounds.left,
                    mWebViewBounds.bottom - mWebViewBounds.top, zoom);
+
+  // This call can synchronously pump host window messages. A nested viewport
+  // notification is allowed to close/destroy the editor, so make the COM call
+  // the final owner access in this method; callers revalidate the generation
+  // before touching the instance again.
+  mWebViewCtrlr->SetBoundsAndZoomFactor(mWebViewBounds, zoom);
   return true;
 }
 
