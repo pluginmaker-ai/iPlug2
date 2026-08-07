@@ -20,6 +20,7 @@
   #include <cstring>
   #include <mutex>
   #include <string>
+  #include <thread>
 
   #include <sentry.h>
 
@@ -344,11 +345,65 @@ namespace
 
 } // anonymous namespace
 
+namespace
+{
+  // The whole sentry-native init sequence runs on a detached background
+  // thread spawned from Init(). Reasons:
+  //
+  // 1. AU sandbox safety. In Logic's AUHostingServiceXPC_arrow process
+  //    and similar restricted hosts, `sentry_init` + Breakpad's Mach
+  //    exception-port install + 3 thread spawns happening synchronously
+  //    inside the FIRST plugin instance's constructor have been observed
+  //    to corrupt the heap mid-construction — the next allocation in
+  //    IPlugProcessor::IPlugProcessor (strdup + new IOConfig + a
+  //    WDL_PtrList::Add inside ParseChannelIOStr) returns a garbage
+  //    pointer and the plugin SIGBUSes during AU instantiation. The
+  //    Effect template's WebView fails to render for the same root
+  //    reason — its WebKit allocation hits the same corrupted heap.
+  //    Off-thread initialisation isolates the blast radius: the plugin's
+  //    own construction completes cleanly regardless of what
+  //    sentry-native does to the process state.
+  //
+  // 2. Faster plugin instance ctor. `sentry_init` blocks on database +
+  //    transport setup; previously every first-instance plugin
+  //    construction paid that latency on the host's main thread.
+  //
+  // The pluginId / pluginVersion arguments are captured by value but
+  // resolved at compile time from `#define`d string literals (PLUGIN_ID,
+  // PLUGIN_VERSION baked into the binary by the xcconfig / CMake
+  // override), so they live for the process lifetime and are safe to
+  // dereference from a thread that outlives the caller.
+  void InitBody(const char* pluginId, const char* pluginVersion);
+}
+
 void Init(const char* pluginId, const char* pluginVersion)
 {
   static std::once_flag sInitOnce;
   std::call_once(sInitOnce, [pluginId, pluginVersion]() {
+    // Detached — we never join. If sentry-native crashes the worker,
+    // the plugin still ships; if it hangs, the worker thread sits
+    // doing nothing forever (no observable effect on audio/UI threads).
+    // The thread captures both string ptrs by value; they point into
+    // the dylib's read-only data section so the lifetime is fine.
+    std::thread([pluginId, pluginVersion]() {
+      InitBody(pluginId, pluginVersion);
+    }).detach();
 
+    // A-6 probe seam anchor — kept on the calling thread because the
+    // anchor's purpose is to give the linker a strong reference from a
+    // TU that always gets pulled in, forcing IPlugSentryProbeSeam.o to
+    // be dragged into the final binary. The runtime call is a no-op;
+    // moving it onto the background thread would still satisfy the
+    // linker (the reference is the source-text presence), but keeping
+    // it here makes the linker-coupling more obvious at the call site.
+    iplug_sentry_probe_seam_anchor();
+  });
+}
+
+namespace
+{
+void InitBody(const char* pluginId, const char* pluginVersion)
+{
   #ifndef SENTRY_DSN
     return;
   #else
@@ -432,17 +487,8 @@ void Init(const char* pluginId, const char* pluginVersion)
     // file yet (sentry-native silently skips a missing attachment), and
     // by the time any real hang fires the drain has populated it.
     iplug::sentry::eventring::StartDrainThread();
-
-    // A-6 probe seam anchor — IPlugSentryProbeSeam.cpp lives in a static
-    // archive. Without a reference from a TU we actually pull in, neither
-    // macOS ld64 nor MSVC link.exe drags the seam's .o into the plugin DLL
-    // when eve's weakly-defined stub already resolves the symbol from
-    // Plugin.cpp.o. Calling the dummy anchor here forces the linker to
-    // pull the TU, which in turn drags the strong override of
-    // `iplug_sentry_probe_on_stage_event` that wins over the weak stub.
-    iplug_sentry_probe_seam_anchor();
-  });
 }
+} // anonymous namespace
 
 } // namespace sentry
 } // namespace iplug
