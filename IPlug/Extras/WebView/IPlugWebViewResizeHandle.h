@@ -105,13 +105,15 @@
 
 - (void) mouseDown:(NSEvent*)event
 {
-  mDragStart = [NSEvent mouseLocation];
+  mDragStart = [mTargetView.window convertPointToScreen:event.locationInWindow];
   mSizeAtDragStart = mTargetView.frame.size;
 }
 
 - (void) mouseDragged:(NSEvent*)event
 {
-  NSPoint current = [NSEvent mouseLocation];
+  // Use this event's position, not a later global cursor sample. Screen
+  // coordinates stay stable when the AU host moves its window during a drag.
+  NSPoint current = [mTargetView.window convertPointToScreen:event.locationInWindow];
   CGFloat dx = current.x - mDragStart.x;
   [self resizeTargetToWidth:mSizeAtDragStart.width + dx];
 }

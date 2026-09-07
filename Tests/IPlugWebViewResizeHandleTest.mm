@@ -30,11 +30,24 @@ static void CheckFrame(NSView* pTarget, IPlugTestResizeHandle* pHandle, NSSize e
   assert([pTarget hitTest:NSMakePoint(expected.width - 1, 1)] == pHandle);
 }
 
+static NSEvent* MouseEvent(NSView* pTarget, NSEventType type, NSPoint screenPoint)
+{
+  return [NSEvent mouseEventWithType:type
+                           location:[pTarget.window convertPointFromScreen:screenPoint]
+                      modifierFlags:0 timestamp:0 windowNumber:pTarget.window.windowNumber
+                            context:nil eventNumber:0 clickCount:1 pressure:1];
+}
+
 int main()
 {
   @autoreleasepool
   {
+    [NSApplication sharedApplication];
+    NSWindow* pHost = [[NSWindow alloc] initWithContentRect:NSMakeRect(100, 100, 800, 520)
+                                                styleMask:NSWindowStyleMaskBorderless
+                                                  backing:NSBackingStoreBuffered defer:NO];
     NSView* pTarget = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 800, 520)];
+    pHost.contentView = pTarget;
     [pTarget setPostsFrameChangedNotifications:YES];
     ResizeObserver* pObserver = [[ResizeObserver alloc] init];
     [[NSNotificationCenter defaultCenter] addObserver:pObserver selector:@selector(frameChanged:)
@@ -46,11 +59,19 @@ int main()
 
     for (int repeat = 0; repeat < 10; ++repeat)
     {
-      [pHandle resizeTargetToWidth:200];
+      const NSPoint dragStart{900, 100};
+      const CGFloat startWidth = pTarget.frame.size.width;
+      [pHandle mouseDown:MouseEvent(pTarget, NSEventTypeLeftMouseDown, dragStart)];
+      [pHandle mouseDragged:MouseEvent(pTarget, NSEventTypeLeftMouseDragged,
+                                       NSMakePoint(dragStart.x + 200 - startWidth, 100))];
       CheckFrame(pTarget, pHandle, NSMakeSize(462, 300));
-      [pHandle resizeTargetToWidth:1120];
+      // Simulate an AU host moving its window between two drag events.
+      [pHost setFrameOrigin:NSMakePoint(100, 100 + repeat * 10)];
+      [pHandle mouseDragged:MouseEvent(pTarget, NSEventTypeLeftMouseDragged,
+                                       NSMakePoint(dragStart.x + 1120 - startWidth, 100))];
       CheckFrame(pTarget, pHandle, NSMakeSize(1120, 728));
-      [pHandle resizeTargetToWidth:10000];
+      [pHandle mouseDragged:MouseEvent(pTarget, NSEventTypeLeftMouseDragged,
+                                       NSMakePoint(dragStart.x + 10000 - startWidth, 100))];
       CheckFrame(pTarget, pHandle, NSMakeSize(3200, 2080));
     }
 
@@ -66,6 +87,7 @@ int main()
     [[NSNotificationCenter defaultCenter] removeObserver:pObserver];
     [pHandle release];
     [pTarget release];
+    [pHost release];
     [pObserver release];
   }
   std::cout << "IPlugWebViewResizeHandleTest passed\n";
