@@ -1,9 +1,27 @@
-#define IPLUG_RESIZE_HANDLE IPlugTestResizeHandle
+#import <AppKit/AppKit.h>
+
+// Model the original, unprefixed class and its incompatible initializer in
+// another plugin loaded by the same host process.
+@interface IPLUG_RESIZE_HANDLE : NSView
+- (id) initWithTarget:(NSView*)target aspectRatio:(CGFloat)aspect;
+@end
+@implementation IPLUG_RESIZE_HANDLE
+- (id) initWithTarget:(NSView*)target aspectRatio:(CGFloat)aspect
+{
+  return [super initWithFrame:NSZeroRect];
+}
+@end
+
+#define OBJC_PREFIX ResizeProbe
+#define AU_API
+#include "../IPlug/IPlugOBJCPrefix.pch"
 #include "../IPlug/Extras/WebView/IPlugWebViewResizeHandle.h"
 
 #include <cassert>
 #include <iostream>
 #include <vector>
+
+NSView* CreateVST3ResizeHandle(NSView* pTarget, iplug::webview::CornerResizeLimits limits);
 
 @interface ResizeObserver : NSObject
 {
@@ -20,7 +38,7 @@
 }
 @end
 
-static void CheckFrame(NSView* pTarget, IPlugTestResizeHandle* pHandle, NSSize expected)
+static void CheckFrame(NSView* pTarget, IPLUG_RESIZE_HANDLE* pHandle, NSSize expected)
 {
   assert(NSEqualSizes(pTarget.frame.size, expected));
   assert(NSEqualSizes(pHandle.frame.size, NSMakeSize(24, 24)));
@@ -53,7 +71,16 @@ int main()
     [[NSNotificationCenter defaultCenter] addObserver:pObserver selector:@selector(frameChanged:)
                                                 name:NSViewFrameDidChangeNotification object:pTarget];
     const iplug::webview::CornerResizeLimits limits{{800, 520}, {400, 300}, {3200, 2400}};
-    IPlugTestResizeHandle* pHandle = [[IPlugTestResizeHandle alloc] initWithTarget:pTarget limits:limits];
+    IPLUG_RESIZE_HANDLE* pHandle = [[IPLUG_RESIZE_HANDLE alloc] initWithTarget:pTarget limits:limits];
+    NSView* pVST3Handle = CreateVST3ResizeHandle(pTarget, limits);
+    Class legacyClass = NSClassFromString(@"IPLUG_RESIZE_HANDLE");
+    assert(legacyClass != Nil);
+    assert([legacyClass instancesRespondToSelector:@selector(initWithTarget:aspectRatio:)]);
+    assert(![legacyClass instancesRespondToSelector:@selector(initWithTarget:limits:)]);
+    assert([pHandle class] != legacyClass);
+    assert([pVST3Handle class] != legacyClass);
+    assert([pVST3Handle class] != [pHandle class]);
+    [pVST3Handle release];
     [pTarget addSubview:pHandle positioned:NSWindowAbove relativeTo:nil];
     CheckFrame(pTarget, pHandle, NSMakeSize(800, 520));
 

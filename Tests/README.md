@@ -9,10 +9,12 @@ This is the location of various tests, which are currently just a few iPlug2 Pro
 
 ## Native WebView corner resizing
 
-Run `bash Tests/run-webview-resize-tests.sh` from any directory. The portable
+Run `bash Tests/run-webview-resize-tests.sh` from the repository root. The portable
 C++ test checks minimum and maximum dimensions, custom design sizes, aspect
 ratios, integer rounding, and repeated negotiation. On macOS it also compiles
 the actual native resize handle and verifies its fixed 24-point hit area and
 the bounded frames delivered to AppKit observers during shrink/grow cycles.
+It exercises mouse events while the host moves its window and loads legacy,
+AU, and VST3 handle classes together to detect Objective-C name collisions.
 These checks use no audio files. Actual AU/VST3 editor behavior still needs
 verification inside DAWs, including Logic's window chrome.

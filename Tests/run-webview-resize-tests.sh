@@ -12,6 +12,7 @@ compiler=${CXX:-c++}
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   "$compiler" -std=c++17 -fno-objc-arc -Wall -Wextra -Werror -Wno-unused-parameter \
-    -framework AppKit "$test_dir/IPlugWebViewResizeHandleTest.mm" -o "$build_dir/resize-handle"
+    -framework AppKit "$test_dir/IPlugWebViewResizeHandleTest.mm" \
+    "$test_dir/IPlugWebViewResizeHandlePeerTest.mm" -o "$build_dir/resize-handle"
   "$build_dir/resize-handle"
 fi
