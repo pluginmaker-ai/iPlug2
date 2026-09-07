@@ -33,6 +33,7 @@
 
 #import <AppKit/AppKit.h>
 #include "IPlugWebViewCornerResize.h"
+#include <functional>
 
 // Native resize handle — sits outside CSS transform so it's always visible and draggable.
 // Dragging calls setFrameSize: on the helper view, which posts NSViewFrameDidChangeNotification
@@ -43,9 +44,11 @@
   NSSize mSizeAtDragStart;
   iplug::webview::CornerResizeLimits mLimits;
   NSView* mTargetView;
+  std::function<void(iplug::webview::CornerSize)> mResizeRequest;
 }
 - (id) initWithTarget:(NSView*)target limits:(iplug::webview::CornerResizeLimits)limits;
 - (void) resizeTargetToWidth:(CGFloat)width;
+- (void) setResizeRequest:(std::function<void(iplug::webview::CornerSize)>)request;
 @end
 
 @implementation IPLUG_RESIZE_HANDLE
@@ -121,9 +124,21 @@
 - (void) resizeTargetToWidth:(CGFloat)width
 {
   const auto size = iplug::webview::ConstrainCornerWidth(width, mLimits);
+  if (mResizeRequest)
+  {
+    // VST3 asks its host first. Only the host's onSize callback commits the
+    // frame and size memory, including when it defers or rejects the request.
+    mResizeRequest(size);
+    return;
+  }
   // AU hosts observe this frame change. Apply one bounded frame, so the host
   // and embedded page never receive conflicting sizes during the callback.
   [mTargetView setFrameSize:NSMakeSize(size.width, size.height)];
+}
+
+- (void) setResizeRequest:(std::function<void(iplug::webview::CornerSize)>)request
+{
+  mResizeRequest = std::move(request);
 }
 
 - (BOOL) acceptsFirstMouse:(NSEvent*)event

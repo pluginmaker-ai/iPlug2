@@ -217,6 +217,12 @@ void IPlugVST3::InformHostOfParameterDetailsChange()
 
 bool IPlugVST3::EditorResize(int viewWidth, int viewHeight)
 {
+#ifdef OS_MAC
+  // A native corner request must reach the host before the child view changes
+  // size. Let onSize commit the accepted dimensions; a rejected or deferred
+  // request must not overwrite the currently visible size or its memory.
+  return HasUI() && mView && mView->Resize(viewWidth, viewHeight);
+#else
   if (HasUI())
   {
     if (viewWidth != GetEditorWidth() || viewHeight != GetEditorHeight())
@@ -226,6 +232,7 @@ bool IPlugVST3::EditorResize(int viewWidth, int viewHeight)
   }
   
   return true;
+#endif
 }
 
 #pragma mark IEditorDelegate overrides

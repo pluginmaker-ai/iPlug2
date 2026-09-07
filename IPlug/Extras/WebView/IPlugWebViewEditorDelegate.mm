@@ -88,6 +88,11 @@ using namespace iplug;
   if (w > 0 && h > 0)
   {
     IPLUG_RESIZE_HANDLE* resizeHandle = [[IPLUG_RESIZE_HANDLE alloc] initWithTarget:self limits:pDelegate->GetCornerResizeLimits()];
+#ifdef VST3_API
+    [resizeHandle setResizeRequest:[pDelegate](webview::CornerSize size) {
+      pDelegate->EditorResizeFromUI(size.width, size.height, true);
+    }];
+#endif
     [self addSubview:resizeHandle positioned:NSWindowAbove relativeTo:nil];
     [resizeHandle release];
   }

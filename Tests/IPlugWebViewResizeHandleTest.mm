@@ -111,6 +111,21 @@ int main()
       assert(size.width <= 3200 && size.height <= 2400);
     }
 
+    // A VST3-style request can be declined or deferred. The handle must not
+    // change the view or publish a frame notification before the host commits.
+    iplug::webview::CornerSize requested{0, 0};
+    [pHandle setResizeRequest:[&requested](iplug::webview::CornerSize size) {
+      requested = size;
+    }];
+    [pHandle resizeTargetToWidth:200];
+    assert(requested.width == 462 && requested.height == 300);
+    CheckFrame(pTarget, pHandle, NSMakeSize(3200, 2080));
+    assert(pObserver->mFrames.size() == 30);
+    // Simulate the later host callback accepting the bounded request.
+    [pTarget setFrameSize:NSMakeSize(requested.width, requested.height)];
+    CheckFrame(pTarget, pHandle, NSMakeSize(462, 300));
+    assert(pObserver->mFrames.size() == 31);
+
     [[NSNotificationCenter defaultCenter] removeObserver:pObserver];
     [pHandle release];
     [pTarget release];
