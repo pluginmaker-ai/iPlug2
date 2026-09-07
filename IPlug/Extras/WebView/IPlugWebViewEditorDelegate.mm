@@ -57,105 +57,7 @@ using namespace iplug;
 @end
 
 #ifdef OS_MAC
-// Native resize handle — sits outside CSS transform so it's always visible and draggable.
-// Dragging calls setFrameSize: on the helper view, which posts NSViewFrameDidChangeNotification
-// so AU hosts (Logic Pro) resize their container to match.
-@interface IPLUG_RESIZE_HANDLE : NSView
-{
-  NSPoint mDragStart;
-  NSSize mSizeAtDragStart;
-  CGFloat mAspectRatio;
-  NSView* mTargetView;
-}
-- (id) initWithTarget:(NSView*)target aspectRatio:(CGFloat)ratio;
-@end
-
-@implementation IPLUG_RESIZE_HANDLE
-
-- (id) initWithTarget:(NSView*)target aspectRatio:(CGFloat)ratio
-{
-  CGFloat handleSize = 16.0;
-  NSRect frame = NSMakeRect(target.frame.size.width - handleSize,
-                            0,
-                            handleSize, handleSize);
-  self = [super initWithFrame:frame];
-  if (self)
-  {
-    mTargetView = target;
-    mAspectRatio = ratio;
-    self.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-  }
-  return self;
-}
-
-- (BOOL) isFlipped { return YES; }
-
-- (void) drawRect:(NSRect)dirtyRect
-{
-  CGFloat w = self.bounds.size.width;
-  CGFloat h = self.bounds.size.height;
-
-  // Draw standard resize grip: three diagonal lines ⟍
-  // With isFlipped=YES, (0,0) is top-left, (w,h) is bottom-right.
-  // Use paired dark + light strokes for contrast on any background.
-  NSBezierPath* path = [NSBezierPath bezierPath];
-  [path setLineWidth:1.5];
-
-  [path moveToPoint:NSMakePoint(4,  h)];
-  [path lineToPoint:NSMakePoint(w,  4)];
-
-  [path moveToPoint:NSMakePoint(8,  h)];
-  [path lineToPoint:NSMakePoint(w,  8)];
-
-  [path moveToPoint:NSMakePoint(12, h)];
-  [path lineToPoint:NSMakePoint(w, 12)];
-
-  // Dark stroke first, slightly offset for a subtle drop-shadow effect that
-  // gives readable contrast against light plugin backgrounds.
-  [[NSColor colorWithWhite:0.0 alpha:0.45] setStroke];
-  NSAffineTransform* offset = [NSAffineTransform transform];
-  [offset translateXBy:1.0 yBy:1.0];
-  NSBezierPath* shadow = [path copy];
-  [shadow transformUsingAffineTransform:offset];
-  [shadow stroke];
-
-  // Light stroke on top — visible against dark backgrounds.
-  [[NSColor colorWithWhite:1.0 alpha:0.6] setStroke];
-  [path stroke];
-}
-
-- (void) mouseDown:(NSEvent*)event
-{
-  mDragStart = [NSEvent mouseLocation];
-  mSizeAtDragStart = mTargetView.frame.size;
-}
-
-- (void) mouseDragged:(NSEvent*)event
-{
-  NSPoint current = [NSEvent mouseLocation];
-  CGFloat dx = current.x - mDragStart.x;
-  // macOS y is flipped — dragging down = negative dy, but we want width to grow
-  CGFloat newWidth = MAX(200.0, mSizeAtDragStart.width + dx);
-  CGFloat newHeight = round(newWidth / mAspectRatio);
-
-  [mTargetView setFrameSize:NSMakeSize(newWidth, newHeight)];
-}
-
-- (BOOL) acceptsFirstMouse:(NSEvent*)event
-{
-  return YES;
-}
-
-- (void) resetCursorRects
-{
-  // Use private API for diagonal resize cursor (nwse), fall back to arrow
-  NSCursor* resizeCursor = nil;
-  if ([NSCursor respondsToSelector:@selector(_windowResizeNorthWestSouthEastCursor)])
-    resizeCursor = [NSCursor performSelector:@selector(_windowResizeNorthWestSouthEastCursor)];
-  [self addCursorRect:self.bounds cursor:(resizeCursor ?: [NSCursor arrowCursor])];
-}
-
-@end
+#include "IPlugWebViewResizeHandle.h"
 #endif
 
 @implementation IPLUG_WKWEBVIEW_EDITOR_HELPER
@@ -185,8 +87,9 @@ using namespace iplug;
   // Add native resize handle on top of the WebView
   if (w > 0 && h > 0)
   {
-    IPLUG_RESIZE_HANDLE* resizeHandle = [[IPLUG_RESIZE_HANDLE alloc] initWithTarget:self aspectRatio:(w / h)];
+    IPLUG_RESIZE_HANDLE* resizeHandle = [[IPLUG_RESIZE_HANDLE alloc] initWithTarget:self limits:pDelegate->GetCornerResizeLimits()];
     [self addSubview:resizeHandle positioned:NSWindowAbove relativeTo:nil];
+    [resizeHandle release];
   }
 #endif
 

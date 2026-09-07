@@ -12,6 +12,9 @@ on:
       - 'IGraphics/**'
       - 'Examples/**/CMakeLists.txt'
       - 'Tests/**/CMakeLists.txt'
+      - 'Tests/IPlugWebViewCornerResizeTest.cpp'
+      - 'Tests/IPlugWebViewResizeHandleTest.mm'
+      - 'Tests/run-webview-resize-tests.sh'
       - '.github/workflows/cmake-ci.yml'
   pull_request:
     branches: [master]
@@ -24,6 +27,9 @@ on:
       - 'IGraphics/**'
       - 'Examples/**/CMakeLists.txt'
       - 'Tests/**/CMakeLists.txt'
+      - 'Tests/IPlugWebViewCornerResizeTest.cpp'
+      - 'Tests/IPlugWebViewResizeHandleTest.mm'
+      - 'Tests/run-webview-resize-tests.sh'
       - '.github/workflows/cmake-ci.yml'
   issue_comment:
     types: [created]
@@ -64,6 +70,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  webview-corner-resize:
+    name: WebView corner resize (${{ matrix.os }})
+    if: github.event_name != 'issue_comment'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test bounds and the native corner
+        run: bash Tests/run-webview-resize-tests.sh
+
   # ============================================================================
   # Parse PR commands from comments
   # ============================================================================

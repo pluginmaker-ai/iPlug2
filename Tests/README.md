@@ -6,3 +6,13 @@ This is the location of various tests, which are currently just a few iPlug2 Pro
 - **[IGraphicsStressTest](https://iplug2.github.io/NANOVG/IGraphicsStressTest/)** : An IPlug project to test drawing lots of things
 
 - **[MetaParamTest]((https://iplug2.github.io/NANOVG/MetaParamTest/))** : An IPlug project to test parameters that affect other parameters, a.k.a. Meta Parameters
+
+## Native WebView corner resizing
+
+Run `bash Tests/run-webview-resize-tests.sh` from any directory. The portable
+C++ test checks minimum and maximum dimensions, custom design sizes, aspect
+ratios, integer rounding, and repeated negotiation. On macOS it also compiles
+the actual native resize handle and verifies its fixed 24-point hit area and
+the bounded frames delivered to AppKit observers during shrink/grow cycles.
+These checks use no audio files. Actual AU/VST3 editor behavior still needs
+verification inside DAWs, including Logic's window chrome.
