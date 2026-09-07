@@ -376,12 +376,12 @@ public:
     return keyPress;
   }
 
-  void Resize(int w, int h)
+  bool Resize(int w, int h)
   {
     TRACE
     
     Steinberg::ViewRect newSize = Steinberg::ViewRect(0, 0, w, h);
-    plugFrame->resizeView(this, &newSize);
+    return plugFrame && plugFrame->resizeView(this, &newSize) == Steinberg::kResultTrue;
   }
 
   T& mOwner;
