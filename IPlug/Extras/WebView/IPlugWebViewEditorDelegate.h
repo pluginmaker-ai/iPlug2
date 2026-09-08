@@ -31,6 +31,9 @@
 
 #include "IPlugEditorDelegate.h"
 #include "IPlugWebView.h"
+#ifdef OS_MAC
+#include "IPlugWebViewCornerResize.h"
+#endif
 #include "wdl_base64.h"
 #include "json.hpp"
 #include <functional>
@@ -206,6 +209,14 @@ public:
     }
 #endif
   }
+
+#ifdef OS_MAC
+  webview::CornerResizeLimits GetCornerResizeLimits() const
+  {
+    return {{mDesignWidth, mDesignHeight},
+            {GetMinWidth(), GetMinHeight()}, {GetMaxWidth(), GetMaxHeight()}};
+  }
+#endif
 
   void Resize(int width, int height);
 
