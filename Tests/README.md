@@ -67,3 +67,11 @@ selection, sustain/audio, validators and final integrated DAW testing remain
 part of PLU-861 after PLU-896 imports the reviewed fork commit and updates the
 alexh pin/provenance pair. This regression does not update that pin or rebuild
 customer artifacts.
+
+## VST3 MIDI controller queues
+
+Run `VST3_SDK_ROOT=/path/to/VST3_SDK bash Tests/run-midi-queue-tests.sh` to test
+all controller points, sample ordering with notes, and sustain/patch behavior
+through both the adapter and the actual built VST3 binary. The runner also
+builds a synthetic AU control on macOS. See [MidiQueueTest](MidiQueueTest/README.md)
+for the headless host matrix and the Pedalboard VST3 queue limitation.

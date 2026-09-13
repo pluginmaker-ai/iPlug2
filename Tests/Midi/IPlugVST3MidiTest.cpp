@@ -120,6 +120,7 @@ void CheckDelivery(CaptureProcessor& processor, IPlugQueue<IMidiMsg>& queue,
 void CheckControllers(CaptureProcessor& processor, IPlugQueue<IMidiMsg>& queue)
 {
   ParameterChanges changes;
+  IPlugQueue<IMidiMsg> editorQueue(8);
   ProcessData data {};
   data.inputParameterChanges = &changes;
   for (int value = 0; value < 128; ++value)
@@ -139,7 +140,8 @@ void CheckControllers(CaptureProcessor& processor, IPlugQueue<IMidiMsg>& queue)
           changes.mQueue.mID = kMIDICCParamStartIdx + channel * kCountCtrlNumber + controller;
           changes.mQueue.mValue = normalized;
           changes.mQueue.mOffset = 1 + value;
-          processor.ProcessParameterChanges(data, queue);
+          processor.ProcessParameterChanges(data);
+          processor.ProcessMidiIn(nullptr, editorQueue, queue, &changes);
           const bool aftertouch = controller == kAfterTouch;
           CheckDelivery(processor, queue, aftertouch ? IMidiMsg::kChannelAftertouch : IMidiMsg::kControlChange,
                         channel, aftertouch ? value : controller, aftertouch ? 0 : value, 1 + value);
