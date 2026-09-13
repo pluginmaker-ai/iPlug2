@@ -56,7 +56,7 @@ void MidiQueueProbe::Apply(const IMidiMsg& msg)
     {
       mLevel -= voice.mLevel;
       voice.mHeld = true;
-      voice.mLevel = 0.02 * (1 + mPatch[channel]);
+      voice.mLevel = 0.02 * (1. + mPatch[channel] / 127.);
       mLevel += voice.mLevel;
     }
     else
@@ -72,7 +72,7 @@ void MidiQueueProbe::Apply(const IMidiMsg& msg)
   else if (status == IMidiMsg::kControlChange)
   {
     if (msg.mData1 == 22)
-      mPatch[channel] = msg.mData2 >= 64 ? 1 : 0;
+      mPatch[channel] = msg.mData2;
     else if (msg.mData1 == 64)
     {
       mPedal[channel] = msg.mData2 >= 64;

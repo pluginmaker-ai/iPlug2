@@ -315,10 +315,17 @@ static void TestFlushAndSinglePoint()
 
 static void TestMusicalBlocks()
 {
-  for (const int mode : {kRealtime, kOffline})
+  for (const bool ordinaryValues : {false, true})
+   for (const int mode : {kRealtime, kOffline})
     for (const int blockSize : {32, 512, 1024, 8192})
     {
       Host host(blockSize, mode);
+      // Float normalization reproduces host conversion loss as well as queue loss.
+      const double pedalDown = ordinaryValues ? 64.f / 127.f : 1.;
+      const double pedalUp = ordinaryValues ? 63.f / 127.f : 0.;
+      const double patchBeforeNote = ordinaryValues ? 7.f / 127.f : 1.;
+      const double patchAfterNote = ordinaryValues ? 4.f / 127.f : 0.;
+      const float latchedLevel = static_cast<float>(0.02 * (1. + (ordinaryValues ? 7. / 127. : 1.)));
       // The audit's pedal sequence: down at 1ms, note 2-4ms, up at 141ms.
       // The second note must latch the high patch even when CC22 is later reset.
       const int total = 16384;
@@ -327,9 +334,9 @@ static void TestMusicalBlocks()
         Changes changes;
         auto& pedal = changes.Add(CC(0, 64), {});
         auto& patch = changes.Add(CC(0, 22), {});
-        for (const TestPoint p : {TestPoint{48, 1.}, TestPoint{6768, 0.}})
+        for (const TestPoint p : {TestPoint{48, pedalDown}, TestPoint{6768, pedalUp}})
           if (p.offset >= start && p.offset < start + blockSize) pedal.points.push_back({p.offset - start, p.value});
-        for (const TestPoint p : {TestPoint{480, 1.}, TestPoint{5760, 0.}})
+        for (const TestPoint p : {TestPoint{480, patchBeforeNote}, TestPoint{5760, patchAfterNote}})
           if (p.offset >= start && p.offset < start + blockSize) patch.points.push_back({p.offset - start, p.value});
         Events events;
         const int offsets[] {96, 192, 960, 7200};
@@ -341,7 +348,7 @@ static void TestMusicalBlocks()
         {
           const int sample = start + i;
           const float expected = (sample >= 96 && sample < 6768 ? 0.02f : 0.f)
-                               + (sample >= 960 && sample < 7200 ? 0.04f : 0.f);
+                               + (sample >= 960 && sample < 7200 ? latchedLevel : 0.f);
           Check(std::abs(host.left[i] - expected) < 1.e-6f, "sustain/patch depends on block size or mode");
           Check(host.left[i] == host.right[i], "stereo mismatch");
         }
@@ -365,7 +372,7 @@ int main(int argc, char** argv)
     TestOtherMessages(); std::cout << "PASS: pitch bend, pressure, SysEx and same-offset note order\n";
     TestDenseAndAllChannels(); std::cout << "PASS: full MIDI namespace and 20,000-point allocation-free block\n";
     TestFlushAndSinglePoint(); std::cout << "PASS: zero-frame flush and single-point controller\n";
-    TestMusicalBlocks(); std::cout << "PASS: sustain/patch at 32/512/1024/8192 frames, realtime/offline\n";
+    TestMusicalBlocks(); std::cout << "PASS: sustain/patch with endpoints and ordinary CC values at 32/512/1024/8192 frames, realtime/offline\n";
     std::cout << "RESULT: pass\n";
     return 0;
   }

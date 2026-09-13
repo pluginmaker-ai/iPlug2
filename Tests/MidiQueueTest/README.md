@@ -54,9 +54,9 @@ for assertions; it is absent from production plugins. Cases cover:
 `MidiQueueProbe` is a synchronous, asset-free test instrument. Its output level
 encodes notes: CC64 holds released notes; CC22 chooses the level latched by the
 next note. It needs no license, sample library, audio files, device or warmup.
-CC endpoints 0/127 deliberately isolate scheduling from integer reconstruction.
-Run `Tests/Midi` as well to verify PLU-894's conversion of all 128 integer values
-through the combined adapter.
+The musical matrix runs both CC endpoints and float-normalized CC64=63/64
+plus CC22=7/4, so the cumulative pin checks PLU-894 reconstruction together
+with PLU-895 scheduling. The note level preserves all 128 patch values.
 
 ## Headless host and AU control
 

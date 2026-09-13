@@ -1,5 +1,27 @@
 This is the location of various tests, which are currently just a few iPlug2 Projects
 
+`bash Tests/run-au-sample-rate-tests.sh` builds the production AUv2 adapter on
+macOS and registers an in-process AudioComponent with Apple's AudioToolbox.
+It checks initialization before activation, repeated 44.1/48/96 kHz transitions,
+active stream-format changes, invalid format/channel/bus rejection, block size,
+explicit reset, host gain retention and stereo output for an instrument and an
+effect. Tone generation, host input and render measurements remain in memory;
+it uses no audio files, installed plug-ins, DAW or hardware device.
+
+For an optional external-host check, build a new bundle with
+`bash Tests/run-au-sample-rate-tests.sh --bundle /absolute/new/IPlugAURateTest.component`.
+Copy the complete bundle (not a symlink) into the user Audio Unit Components
+folder, then refresh the macOS AudioComponentRegistrar before scanning it.
+Do not replace an existing plug-in. Run
+`python Tests/au-sample-rate-host.py /installed/path/IPlugAURateTest.component`
+in an environment with Pedalboard, NumPy and Mido, and validate the same bundle
+with `auval -v aumu Rate IpTs` and pluginval. Remove only this test bundle after
+validation. The Python check keeps one host instance, reacquires parameter
+handles after renders and checks pitch, gain and stereo with varying rates and
+block sizes; all audio stays in memory. Pedalboard manages its own lifecycle,
+so the direct AudioToolbox test remains the proof that no explicit reset is
+required. PluginMaker workstation runs must use the mac-heavy command wrapper.
+
 - **[IGraphicsTest](https://iplug2.github.io/NANOVG/IGraphicsTest/)** : An IPlug project that includes many controls to test different functionality 
   of IGraphics, with different drawing and platform backends.
   
