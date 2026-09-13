@@ -1175,6 +1175,7 @@ OSStatus IPlugAU::SetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
     NO_OP(kAudioUnitProperty_CPULoad);                   // 6,
     case kAudioUnitProperty_StreamFormat:                // 8,
     {
+      const double previousSampleRate = GetSampleRate();
       AudioStreamBasicDescription* pASBD = (AudioStreamBasicDescription*) pData;
       int nHostChannels = pASBD->mChannelsPerFrame;
       BusChannels* pBus = GetBus(scope, element);
@@ -1210,6 +1211,12 @@ OSStatus IPlugAU::SetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
         pBus->mNHostChannels = pBus->mNPlugChannels;
       }
       AssessInputConnections();
+      // StreamFormat is a host's normal sample-rate negotiation path. Keep
+      // the processor in sync just as kAudioUnitProperty_SampleRate does.
+      if (connectionOK && GetSampleRate() != previousSampleRate)
+      {
+        OnReset();
+      }
       return (connectionOK ? noErr : (int) kAudioUnitErr_InvalidProperty); // casting to int avoids gcc error
     }
     NO_OP(kAudioUnitProperty_ElementCount);              // 11,
@@ -2261,6 +2268,9 @@ OSStatus IPlugAU::DoInitialize(IPlugAU* _this)
 
   _this->mActive = true;
   _this->OnParamReset(kReset);
+  // Initialization must configure DSP even when the host did not issue a
+  // separate AudioUnitReset (including uninitialize/format/initialize).
+  _this->OnReset();
   _this->OnActivate(true);
   
   return noErr;
@@ -2482,4 +2492,3 @@ OSStatus IPlugAU::DoSysEx(IPlugAU* _this, const UInt8* inData, UInt32 inLength)
   else
     return badComponentSelector;
 }
-
