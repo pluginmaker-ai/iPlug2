@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <algorithm>
 
 #include "IPlugLogger.h"
@@ -178,9 +179,21 @@ struct IMidiMsg
     mOffset = offset;
   }
   
+  /** Convert a normalized MIDI value to the nearest 7-bit integer (half steps round up).
+   * Values outside [0, 1], including infinities, saturate to [0, 127]; NaN becomes zero. */
+  static uint8_t NormalizedTo7Bit(double value)
+  {
+    // This comparison also handles NaN before any floating-to-integer conversion.
+    if (!(value > 0.0))
+      return 0;
+    if (value >= 1.0)
+      return 127;
+    return static_cast<uint8_t>(std::lround(value * 127.0));
+  }
+
   /** Create a CC message
    * @param idx Controller index
-   * @param value Range [0, 1]
+   * @param value Normalized value, rounded and saturated by NormalizedTo7Bit()
    * @param channel MIDI channel [0, 15]
    * @param offset Sample offset in block */
   void MakeControlChangeMsg(EControlChangeMsg idx, double value, int channel = 0, int offset = 0)
@@ -188,7 +201,7 @@ struct IMidiMsg
     Clear();
     mStatus = channel | (kControlChange << 4);
     mData1 = idx;
-    mData2 = (int) (value * 127.0);
+    mData2 = NormalizedTo7Bit(value);
     mOffset = offset;
   }
 
