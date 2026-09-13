@@ -8,6 +8,10 @@ target_compile_features(iplug-midi-test PRIVATE cxx_std_17)
 # The production header includes existing framework/WDL utilities. Keep their
 # unrelated warnings out of this standalone test's strict diagnostics.
 target_include_directories(iplug-midi-test SYSTEM PRIVATE ../../IPlug ../../WDL)
+if(WIN32)
+  # Match the plugin builds: Windows min/max macros conflict with the C++ APIs.
+  target_compile_definitions(iplug-midi-test PRIVATE NOMINMAX)
+endif()
 
 if(MSVC)
   target_compile_options(iplug-midi-test PRIVATE /W4 /WX)
