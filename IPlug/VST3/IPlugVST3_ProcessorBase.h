@@ -14,6 +14,7 @@
 #include "public.sdk/source/vst/vstbus.h"
 #include "pluginterfaces/base/ustring.h"
 #include "pluginterfaces/vst/ivstevents.h"
+#include "pluginterfaces/vst/ivstparameterchanges.h"
 
 #include "IPlugAPIBase.h"
 #include "IPlugProcessor.h"
@@ -98,7 +99,7 @@ public:
   }
   
   // MIDI Processing
-  void ProcessMidiIn(Steinberg::Vst::IEventList* pEventList, IPlugQueue<IMidiMsg>& editorQueue, IPlugQueue<IMidiMsg>& processorQueue);
+  void ProcessMidiIn(Steinberg::Vst::IEventList* pEventList, IPlugQueue<IMidiMsg>& editorQueue, IPlugQueue<IMidiMsg>& processorQueue, Steinberg::Vst::IParameterChanges* pParamChanges = nullptr);
   void ProcessMidiOut(IPlugQueue<SysExData>& sysExQueue, SysExData& sysExBuf, Steinberg::Vst::IEventList* pOutputEvents, Steinberg::int32 numSamples);
   
   // Audio Processing Setup
@@ -184,7 +185,7 @@ public:
   
   // Audio Processing
   void PrepareProcessContext(Steinberg::Vst::ProcessData& data, Steinberg::Vst::ProcessSetup& setup);
-  void ProcessParameterChanges(Steinberg::Vst::ProcessData& data, IPlugQueue<IMidiMsg>& fromProcessor);
+  void ProcessParameterChanges(Steinberg::Vst::ProcessData& data);
   void ProcessAudio(Steinberg::Vst::ProcessData& data, Steinberg::Vst::ProcessSetup& setup, const Steinberg::Vst::BusList& ins, const Steinberg::Vst::BusList& outs);
   void Process(Steinberg::Vst::ProcessData& data, Steinberg::Vst::ProcessSetup& setup, const Steinberg::Vst::BusList& ins, const Steinberg::Vst::BusList& outs, IPlugQueue<IMidiMsg>& fromEditor, IPlugQueue<IMidiMsg>& fromProcessor, IPlugQueue<SysExData>& sysExFromEditor, SysExData& sysExBuf);
   
