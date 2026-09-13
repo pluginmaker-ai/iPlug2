@@ -40,7 +40,7 @@ if(IPLUG_VST3_SDK_DIR)
     ../../IPlug/IPlugTimer.cpp
     ../../IPlug/Extras/Sentry/IPlugSentry.cpp)
   target_compile_features(iplug-vst3-midi-test PRIVATE cxx_std_17)
-  target_compile_definitions(iplug-vst3-midi-test PRIVATE NO_IGRAPHICS VST3_API $<$<CONFIG:Debug>:_DEBUG>)
+  target_compile_definitions(iplug-vst3-midi-test PRIVATE NO_IGRAPHICS VST3_API VST3_NUM_CC_CHANS=16 $<$<CONFIG:Debug>:_DEBUG>)
   target_include_directories(iplug-vst3-midi-test SYSTEM PRIVATE
     ../../IPlug ../../IPlug/VST3 ../../IPlug/Extras ../../WDL "${IPLUG_VST3_SDK_DIR}")
   if(APPLE)
