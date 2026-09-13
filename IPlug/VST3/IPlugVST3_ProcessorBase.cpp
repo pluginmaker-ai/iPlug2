@@ -416,7 +416,6 @@ void IPlugVST3ProcessorBase::ProcessParameterChanges(ProcessData& data)
 #endif
               }
 
-
             }
               break;
           }

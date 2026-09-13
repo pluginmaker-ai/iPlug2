@@ -90,10 +90,11 @@ complement the musical assertions; validators alone cannot prove event fidelity.
 
 ## Integration boundary
 
-This fork PR targets `alexh.bob-feat/plu-861-songkeys-native-audit` at deployed
-base `5dc27d51119fa80dfb070263f35761d2f34b84fd`. It does not change alexh's pin or
-provenance; PLU-896 owns the cumulative update. Preserve PLU-894's integer
-conversion changes when integrating its edits to the same conversion block.
+This fork PR targets `alexh.bob-feat/plu-861-songkeys-native-audit`, including
+PLU-894's integer conversion changes from `b6711369bfe1f35cef28d91103669f74aefb01f9`.
+The queue merge retains those conversions, including channel aftertouch, in the
+new MIDI dispatch path. It does not change alexh's pin or provenance; PLU-896
+owns the cumulative update.
 
 Song Keys library playback with ordinary CC values after PLU-894, Windows native
 validation, and the customer candidate remain integration checks. DAW GUI,
