@@ -81,7 +81,7 @@ void IPlugVST3ProcessorBase::ProcessMidiIn(IEventList* pEventList, IPlugQueue<IM
         {
           case Event::kNoteOnEvent:
           {
-            msg.MakeNoteOnMsg(event.noteOn.pitch, event.noteOn.velocity * 127, event.sampleOffset, event.noteOn.channel);
+            msg.MakeNoteOnMsg(event.noteOn.pitch, IMidiMsg::NormalizedTo7Bit(event.noteOn.velocity), event.sampleOffset, event.noteOn.channel);
             ProcessMidiMsg(msg);
             processorQueue.Push(msg);
             break;
@@ -96,7 +96,7 @@ void IPlugVST3ProcessorBase::ProcessMidiIn(IEventList* pEventList, IPlugQueue<IM
           }
           case Event::kPolyPressureEvent:
           {
-            msg.MakePolyATMsg(event.polyPressure.pitch, event.polyPressure.pressure * 127., event.sampleOffset, event.polyPressure.channel);
+            msg.MakePolyATMsg(event.polyPressure.pitch, IMidiMsg::NormalizedTo7Bit(event.polyPressure.pressure), event.sampleOffset, event.polyPressure.channel);
             ProcessMidiMsg(msg);
             processorQueue.Push(msg);
             break;
@@ -327,7 +327,7 @@ void IPlugVST3ProcessorBase::ProcessParameterChanges(ProcessData& data, IPlugQue
                 IMidiMsg msg;
 
                 if (ctrlr == kAfterTouch)
-                  msg.MakeChannelATMsg((int) (value * 127.), offsetSamples, channel);
+                  msg.MakeChannelATMsg(IMidiMsg::NormalizedTo7Bit(value), offsetSamples, channel);
                 else if (ctrlr == kPitchBend)
                   msg.MakePitchWheelMsg((value * 2.)-1., channel, offsetSamples);
                 else

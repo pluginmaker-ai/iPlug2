@@ -1,0 +1,42 @@
+name: MIDI conversion tests
+
+on:
+  push:
+    branches: [master, alexh.bob-feat/plu-861-songkeys-native-audit]
+    paths:
+      - 'IPlug/**'
+      - 'WDL/**'
+      - 'Tests/Midi/**'
+      - '.github/workflows/midi-tests.yml'
+  pull_request:
+    paths:
+      - 'IPlug/**'
+      - 'WDL/**'
+      - 'Tests/Midi/**'
+      - '.github/workflows/midi-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  midi:
+    name: MIDI (${{ matrix.os }}, ${{ matrix.configuration }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+        configuration: [Debug, Release]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          sparse-checkout: |
+            IPlug
+            WDL
+            Tests/Midi
+      - name: Configure
+        run: cmake -S Tests/Midi -B build/midi-tests -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
+      - name: Compile
+        run: cmake --build build/midi-tests --config ${{ matrix.configuration }}
+      - name: Run production-header regression
+        run: ctest --test-dir build/midi-tests -C ${{ matrix.configuration }} --output-on-failure -V
