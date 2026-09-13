@@ -18,3 +18,11 @@ It exercises mouse events while the host moves its window and loads legacy,
 AU, and VST3 handle classes together to detect Objective-C name collisions.
 These checks use no audio files. Actual AU/VST3 editor behavior still needs
 verification inside DAWs, including Logic's window chrome.
+
+## VST3 MIDI controller queues
+
+Run `VST3_SDK_ROOT=/path/to/VST3_SDK bash Tests/run-midi-queue-tests.sh` to test
+all controller points, sample ordering with notes, and sustain/patch behavior
+through both the adapter and the actual built VST3 binary. The runner also
+builds a synthetic AU control on macOS. See [MidiQueueTest](MidiQueueTest/README.md)
+for the headless host matrix and the Pedalboard VST3 queue limitation.
