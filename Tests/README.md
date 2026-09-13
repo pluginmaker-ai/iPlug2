@@ -42,8 +42,9 @@ and the unchanged 14-bit pitch-wheel convention. VST3 note-on velocity and both
 aftertouch inputs use the same normalized-to-7-bit helper: the old casts also
 lost values there (including note velocities from VST3's reciprocal output path).
 
-To also compile and execute the real `IPlugVST3ProcessorBase`, supply an existing
-VST3 SDK (including `pluginterfaces`, `base` and `public.sdk`) at configure time:
+On macOS, also compile and execute the real `IPlugVST3ProcessorBase` by supplying
+an existing VST3 SDK (including `pluginterfaces`, `base` and `public.sdk`) at
+configure time:
 
 ```sh
 cmake -S Tests/Midi -B build/vst3-midi-tests -DCMAKE_BUILD_TYPE=Release \
@@ -57,6 +58,9 @@ lists through the production adapter and checks both the plugin MIDI callback
 and the editor-forwarding queue. It covers all integer values and channels for
 CC22, CC64, channel aftertouch, note velocity and poly aftertouch. It does not
 test multi-point queue traversal or use audio files.
+This optional processor target is macOS-only: it uses the framework's native
+timer/platform sources. Omit `IPLUG_VST3_SDK_DIR` on Linux and Windows to run
+the portable production-header regression, which CI checks on all three systems.
 
 These are numeric/framework checks. For Song Keys, actual built VST3 slot
 selection, sustain/audio, validators and final integrated DAW testing remain
