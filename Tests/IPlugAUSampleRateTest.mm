@@ -33,11 +33,14 @@ class RateTestPlugin final : public IPlugAU
 {
 public:
   RateTestPlugin()
-  : IPlugAU(InstanceInfo(), Config(1, 1, gEffect ? "2-2" : "0-2", "AU Rate Test", "AU Rate Test",
+  : IPlugAU(InstanceInfo(), Config(4, 1, gEffect ? "2-2" : "0-2", "AU Rate Test", "AU Rate Test",
             "iPlug2 Tests", 0x10000, 'Rate', 'IpTs', 0, !gEffect, false, false,
             true, gEffect ? 0 : 1, false, 0, 0, false, 0, 0, 0, 0, "org.iplug2.rate-test", ""))
   {
     GetParam(0)->InitDouble("Gain", 0.25, 0., 1., 0.001);
+    GetParam(1)->InitDouble("Retired middle", 0.4, 0., 1., 0.001, "", IParam::kFlagInternal);
+    GetParam(2)->InitDouble("Surviving later ID", 0.6, 0., 1., 0.001);
+    GetParam(3)->InitDouble("Retired last", 0.8, 0., 1., 0.001, "", IParam::kFlagInternal);
     MakeDefaultPreset();
   }
 
@@ -51,6 +54,11 @@ public:
   void OnActivate(bool active) override
   {
     if (active) mRateAtActivation = mDSPRate;
+  }
+
+  void OnParamChange(int paramIdx, EParamSource source, int sampleOffset) override
+  {
+    if (source == kHost) mHostChanges.push_back({paramIdx, sampleOffset, GetParam(paramIdx)->Value()});
   }
 
   void ProcessMidiMsg(const IMidiMsg& msg) override
@@ -82,6 +90,8 @@ public:
   int mResets = 0;
   bool mPlaying = false;
   double mPhase = 0.;
+  struct HostChange { int id; int offset; double value; };
+  std::vector<HostChange> mHostChanges;
 };
 
 RateTestPlugin* gPlugin = nullptr;
@@ -118,6 +128,86 @@ OSStatus SetFormat(AudioUnit unit, const AudioStreamBasicDescription& format,
 {
   return AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
                              kAudioUnitScope_Output, bus, &format, sizeof(format));
+}
+
+void VerifyInternalParameters(AudioUnit unit)
+{
+  UInt32 size = 0;
+  Check(AudioUnitGetPropertyInfo(unit, kAudioUnitProperty_ParameterList,
+      kAudioUnitScope_Global, 0, &size, nullptr), "parameter list size");
+  Require(size == 2 * sizeof(AudioUnitParameterID), "internal parameters advertised");
+  AudioUnitParameterID ids[2]{};
+  Check(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterList,
+      kAudioUnitScope_Global, 0, ids, &size), "sparse parameter list");
+  Require(ids[0] == 0 && ids[1] == 2, "surviving IDs changed");
+  for (AudioUnitParameterID id : {1u, 3u, 4u, 0xffffffffu})
+  {
+    AudioUnitParameterValue value = -1;
+    Require(AudioUnitGetParameter(unit, id, kAudioUnitScope_Global, 0, &value)
+        == kAudioUnitErr_InvalidParameter, "retired or invalid read accepted");
+    Require(AudioUnitSetParameter(unit, id, kAudioUnitScope_Global, 0, 0.99, 0)
+        == kAudioUnitErr_InvalidParameter, "retired automation accepted");
+    if (id < 4)
+    {
+      AudioUnitParameterInfo info{};
+      size = sizeof(info);
+      Require(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterInfo,
+          kAudioUnitScope_Global, id, &info, &size) == kAudioUnitErr_InvalidParameter,
+          "retired metadata remains public");
+    }
+  }
+  Require(gPlugin->GetParam(2)->Value() == 0.6, "obsolete automation reached a surviving ID");
+  Check(AudioUnitSetParameter(unit, 2, kAudioUnitScope_Global, 0, 0.75, 0), "sparse active write");
+  IByteChunk legacy;
+  for (double value : {0.2, 0.3, 0.7, 0.9}) legacy.Put(&value);
+  Require(gPlugin->UnserializeParams(legacy, 0) == 4 * sizeof(double), "legacy state cursor changed");
+  IByteChunk saved;
+  Require(gPlugin->SerializeParams(saved) && saved.Size() == legacy.Size(), "internal state slots lost");
+  Require(std::memcmp(saved.GetData(), legacy.GetData(), legacy.Size()) == 0, "legacy state values moved");
+  AudioUnitParameterValue restored = 0;
+  Check(AudioUnitGetParameter(unit, 2, kAudioUnitScope_Global, 0, &restored), "restored sparse read");
+  Require(std::abs(restored - 0.7) < 1.e-6, "surviving value restored from wrong slot");
+
+  auto immediate = [](AudioUnitParameterID id, float value, UInt32 offset) {
+    AudioUnitParameterEvent event{};
+    event.scope = kAudioUnitScope_Global;
+    event.parameter = id;
+    event.eventType = kParameterEvent_Immediate;
+    event.eventValues.immediate.value = value;
+    event.eventValues.immediate.bufferOffset = offset;
+    return event;
+  };
+  auto verifyBatch = [&](std::vector<AudioUnitParameterEvent> events,
+                         std::vector<RateTestPlugin::HostChange> expected) {
+    gPlugin->mHostChanges.clear();
+    Check(AudioUnitScheduleParameters(unit, events.data(), events.size()), "mixed scheduled automation");
+    Require(gPlugin->mHostChanges.size() == expected.size(), "active scheduled events lost or internal events delivered");
+    for (size_t i = 0; i < expected.size(); ++i)
+    {
+      const auto& got = gPlugin->mHostChanges[i];
+      Require(got.id == expected[i].id && got.offset == expected[i].offset
+          && std::abs(got.value - expected[i].value) < 1.e-6, "scheduled event value, order or offset changed");
+      Require(std::abs(gPlugin->GetParam(got.id)->Value() - expected[i].value) < 1.e-6,
+          "scheduled active value not applied");
+    }
+    Require(gPlugin->GetParam(1)->Value() == 0.3 && gPlugin->GetParam(3)->Value() == 0.9,
+        "scheduled automation changed internal state");
+  };
+  verifyBatch({immediate(1, 0.99f, 7), immediate(2, 0.45f, 19)}, {{2, 19, 0.45}});
+  verifyBatch({immediate(0, 0.35f, 3), immediate(3, 0.99f, 11), immediate(2, 0.65f, 27)},
+      {{0, 3, 0.35}, {2, 27, 0.65}});
+  for (AudioUnitParameterID id : {4u, 0xffffffffu})
+  {
+    auto invalid = immediate(id, 0.99f, 0);
+    Require(AudioUnitScheduleParameters(unit, &invalid, 1) == kAudioUnitErr_InvalidParameter,
+        "invalid scheduled ID accepted");
+  }
+  auto wrongScope = immediate(1, 0.99f, 0);
+  wrongScope.scope = kAudioUnitScope_Input;
+  Require(AudioUnitScheduleParameters(unit, &wrongScope, 1) == kAudioUnitErr_InvalidProperty,
+      "invalid scheduled scope accepted");
+  std::puts("PASS: mixed retired/active AU automation preserves active values and offsets");
+  std::puts("PASS: sparse AU IDs, rejected obsolete automation, compatible legacy state");
 }
 
 void VerifyTone(AudioUnit unit, double rate, double& sampleTime)
@@ -243,6 +333,7 @@ int main()
           0x10000, reinterpret_cast<AudioComponentFactoryFunction>(factory));
       Require(component != nullptr, "register component");
       Check(AudioComponentInstanceNew(component, &unit), "create instance");
+      VerifyInternalParameters(unit);
       std::printf("Testing %s\n", effect ? "effect" : "instrument");
       RunLifecycle(unit);
       Check(AudioComponentInstanceDispose(unit), "dispose instance");

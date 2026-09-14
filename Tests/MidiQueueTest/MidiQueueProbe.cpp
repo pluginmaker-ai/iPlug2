@@ -4,9 +4,12 @@
 using namespace iplug;
 
 MidiQueueProbe::MidiQueueProbe(const InstanceInfo& info)
-: Plugin(info, MakeConfig(1, 1))
+: Plugin(info, MakeConfig(4, 1))
 {
   GetParam(0)->InitDouble("Gain", 1., 0., 1., 0.01);
+  GetParam(1)->InitDouble("Retired middle", 0.4, 0., 1., 0.01, "", IParam::kFlagInternal);
+  GetParam(2)->InitDouble("Surviving later ID", 0.6, 0., 1., 0.01);
+  GetParam(3)->InitDouble("Retired last", 0.8, 0., 1., 0.01, "", IParam::kFlagInternal);
   MakeDefaultPreset("Default", 1);
 }
 

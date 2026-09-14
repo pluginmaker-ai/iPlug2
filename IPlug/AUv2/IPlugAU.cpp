@@ -504,14 +504,17 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
     }
     case kAudioUnitProperty_ParameterList:               // 3,  listenable
     {
-      int n = (scope == kAudioUnitScope_Global ? NParams() : 0);
+      int n = 0;
+      if (scope == kAudioUnitScope_Global)
+        for (int i = 0; i < NParams(); ++i)
+          if (IsHostParameter(i)) ++n;
       *pDataSize = n * sizeof(AudioUnitParameterID);
       if (pData && n)
       {
         AudioUnitParameterID* pParamID = (AudioUnitParameterID*) pData;
-        for (int i = 0; i < n; ++i, ++pParamID)
+        for (int i = 0; i < NParams(); ++i)
         {
-          *pParamID = (AudioUnitParameterID) i;
+          if (IsHostParameter(i)) *pParamID++ = (AudioUnitParameterID) i;
         }
       }
       return noErr;
@@ -520,6 +523,7 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
     {
       ASSERT_SCOPE(kAudioUnitScope_Global);
       ASSERT_ELEMENT(NParams());
+      if (!IsHostParameter(element)) return kAudioUnitErr_InvalidParameter;
       *pDataSize = sizeof(AudioUnitParameterInfo);
       if (pData)
       {
@@ -746,6 +750,7 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
     {
       ASSERT_SCOPE(kAudioUnitScope_Global);
       ASSERT_ELEMENT(NParams());
+      if (!IsHostParameter(element)) return kAudioUnitErr_InvalidParameter;
       ENTER_PARAMS_MUTEX
       IParam* pParam = GetParam(element);
       int n = pParam->NDisplayTexts();
@@ -963,6 +968,7 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
       if (pData && scope == kAudioUnitScope_Global)
       {
         AudioUnitParameterIDName* pIDName = (AudioUnitParameterIDName*) pData;
+        if (!IsHostParameter(pIDName->inID)) return kAudioUnitErr_InvalidParameter;
         char cStr[MAX_PARAM_NAME_LEN];
         ENTER_PARAMS_MUTEX
         strcpy(cStr, GetParam(pIDName->inID)->GetName());
@@ -1012,6 +1018,7 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
       if (pData && scope == kAudioUnitScope_Global)
       {
         AudioUnitParameterStringFromValue* pSFV = (AudioUnitParameterStringFromValue*) pData;
+        if (!IsHostParameter(pSFV->inParamID)) return kAudioUnitErr_InvalidParameter;
         ENTER_PARAMS_MUTEX
         GetParam(pSFV->inParamID)->GetDisplay(*(pSFV->inValue), false, mParamDisplayStr);
         LEAVE_PARAMS_MUTEX
@@ -1025,6 +1032,7 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
       if (pData)
       {
         AudioUnitParameterValueFromString* pVFS = (AudioUnitParameterValueFromString*) pData;
+        if (!IsHostParameter(pVFS->inParamID)) return kAudioUnitErr_InvalidParameter;
         if (scope == kAudioUnitScope_Global)
         {
           CStrLocal cStr(pVFS->inString);
@@ -1566,6 +1574,7 @@ OSStatus IPlugAU::GetParamProc(void* pPlug, AudioUnitParameterID paramID, AudioU
   ASSERT_SCOPE(kAudioUnitScope_Global);
   IPlugAU* _this = (IPlugAU*) pPlug;
   assert(_this != NULL);
+  if (!_this->IsHostParameter(paramID)) return kAudioUnitErr_InvalidParameter;
   ENTER_PARAMS_MUTEX_STATIC
   *pValue = _this->GetParam(paramID)->Value();
   LEAVE_PARAMS_MUTEX_STATIC
@@ -1580,6 +1589,7 @@ OSStatus IPlugAU::SetParamProc(void* pPlug, AudioUnitParameterID paramID, AudioU
   // In the SDK, offset frames is only looked at in group scope.
   ASSERT_SCOPE(kAudioUnitScope_Global);
   IPlugAU* _this = (IPlugAU*) pPlug;
+  if (!_this->IsHostParameter(paramID)) return kAudioUnitErr_InvalidParameter;
   ENTER_PARAMS_MUTEX_STATIC
   _this->GetParam(paramID)->Set(value);
   _this->SendParameterValueFromAPI(paramID, value, false);
@@ -1895,6 +1905,7 @@ IPlugAU::~IPlugAU()
 
 void IPlugAU::SendAUEvent(AudioUnitEventType type, AudioComponentInstance ci, int idx)
 {
+  if (!IsHostParameter(idx)) return;
   AudioUnitEvent auEvent;
   memset(&auEvent, 0, sizeof(AudioUnitEvent));
   auEvent.mEventType = type;
@@ -2435,6 +2446,12 @@ OSStatus IPlugAU::DoScheduleParameters(IPlugAU* _this, const AudioUnitParameterE
   {
     if (pEvent->eventType == kParameterEvent_Immediate)
     {
+      // Old projects may batch retired automation with surviving parameters.
+      // Ignore only known internal IDs; keep normal scope and invalid-ID errors.
+      if (pEvent->scope == kAudioUnitScope_Global
+          && pEvent->parameter < static_cast<UInt32>(_this->NParams())
+          && _this->GetParam(pEvent->parameter)->GetInternal())
+        continue;
       OSStatus r = SetParamProc(_this, pEvent->parameter, pEvent->scope, pEvent->element,
                                 pEvent->eventValues.immediate.value, pEvent->eventValues.immediate.bufferOffset);
       if (r != noErr)

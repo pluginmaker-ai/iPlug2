@@ -193,18 +193,21 @@ Steinberg::tresult PLUGIN_API IPlugVST3::setChannelContextInfos(Steinberg::Vst::
 
 void IPlugVST3::BeginInformHostOfParamChange(int idx)
 {
+  if (!IsHostParameter(idx)) return;
   Trace(TRACELOC, "%d", idx);
   beginEdit(idx);
 }
 
 void IPlugVST3::InformHostOfParamChange(int idx, double normalizedValue)
 {
+  if (!IsHostParameter(idx)) return;
   Trace(TRACELOC, "%d:%f", idx, normalizedValue);
   performEdit(idx, normalizedValue);
 }
 
 void IPlugVST3::EndInformHostOfParamChange(int idx)
 {
+  if (!IsHostParameter(idx)) return;
   Trace(TRACELOC, "%d", idx);
   endEdit(idx);
 }
