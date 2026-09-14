@@ -180,6 +180,48 @@ static void Expect(const MidiQueueProbe& plug, int index, int offset, int status
   }
 }
 
+static void TestInternalParameters()
+{
+  Host host;
+  IEditController* controller = nullptr;
+  Check(host.component->queryInterface(IEditController::iid, reinterpret_cast<void**>(&controller)) == kResultOk,
+        "controller unavailable");
+  std::vector<ParamID> ids;
+  for (int index = 0; index < controller->getParameterCount(); ++index)
+  {
+    ParameterInfo info {};
+    Check(controller->getParameterInfo(index, info) == kResultOk, "parameter info failed");
+    if (info.id < kBypassParam) ids.push_back(info.id);
+  }
+  Check(ids == std::vector<ParamID>({0, 2}), "internal IDs advertised or surviving IDs renumbered");
+  for (const ParamID id : {1u, 3u, 4u})
+  {
+    Check(controller->setParamNormalized(id, 0.99) != kResultOk, "retired controller write accepted");
+    Changes changes;
+    changes.Add(id, {{12, 0.99}});
+    host.plug->mParamOffset = -1;
+    host.Run(&changes);
+    Check(host.plug->mParamOffset == -1, "retired automation dispatched");
+  }
+  Check(host.plug->GetParam(1)->Value() == 0.4 && host.plug->GetParam(2)->Value() == 0.6,
+        "retired automation changed state or surviving control");
+  Changes active;
+  active.Add(2, {{23, 0.75}});
+  host.Run(&active);
+  Check(host.plug->mParamOffset == 23 && host.plug->GetParam(2)->Value() == 0.75,
+        "sparse active automation failed");
+  IByteChunk legacy;
+  for (double value : {0.2, 0.3, 0.7, 0.9}) legacy.Put(&value);
+  Check(host.plug->UnserializeParams(legacy, 0) == 4 * sizeof(double), "legacy state cursor changed");
+  // The real state adapter invokes this refresh after decoding every internal slot.
+  host.plug->UpdateParams(host.plug, 0);
+  Check(std::abs(controller->getParamNormalized(2) - 0.7) < 1.e-6, "state refreshed wrong sparse ID");
+  IByteChunk saved;
+  Check(host.plug->SerializeParams(saved) && saved.Size() == legacy.Size(), "state slots lost");
+  Check(std::memcmp(saved.GetData(), legacy.GetData(), saved.Size()) == 0, "state values moved");
+  controller->release();
+}
+
 static void TestOrdering()
 {
   Host host;
@@ -367,6 +409,7 @@ int main(int argc, char** argv)
       gNativeModule = module.get();
       std::cout << "Testing actual VST3 binary: " << argv[1] << '\n';
     }
+    TestInternalParameters(); std::cout << "PASS: sparse VST3 IDs, rejected obsolete automation, compatible legacy state\n";
     TestOrdering(); std::cout << "PASS: all CC points, channels, chronological merge and stable ties\n";
     TestParametersAndErrors(); std::cout << "PASS: ordinary params, bypass, empty queues and failed getters\n";
     TestOtherMessages(); std::cout << "PASS: pitch bend, pressure, SysEx and same-offset note order\n";

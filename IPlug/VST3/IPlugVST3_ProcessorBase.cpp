@@ -402,7 +402,7 @@ void IPlugVST3ProcessorBase::ProcessParameterChanges(ProcessData& data)
             }
             default:
             {
-              if (idx >= 0 && idx < mPlug.NParams())
+              if (mPlug.IsHostParameter(idx))
               {
 #ifdef PARAMS_MUTEX
                 mPlug.mParams_mutex.Enter();

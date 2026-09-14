@@ -108,6 +108,12 @@ public:
   const char* GetAppGroupID() const { return mAppGroupID.Get(); }
 
 #pragma mark - Parameters
+
+  /** Host IDs remain internal slot indices, including gaps for retired slots. */
+  bool IsHostParameter(int idx) const
+  {
+    return idx >= 0 && idx < NParams() && !GetParam(idx)->GetInternal();
+  }
   
   /** @return The number of unique parameter groups identified */
   int NParamGroups() const { return mParamGroups.GetSize(); }
