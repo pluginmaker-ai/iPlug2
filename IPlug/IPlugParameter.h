@@ -55,6 +55,9 @@ public:
     kFlagSignDisplay      = 0x8,
     /** Indicates that the parameter may influence the state of other parameters */
     kFlagMeta             = 0x10,
+    /** Internal state slot: AUv2/VST3 do not publish it or accept host writes.
+     * Set during construction; keep the slot for saved-state compatibility. */
+    kFlagInternal         = 0x20,
   };
   
   /** IDs for the shapes */
@@ -489,6 +492,8 @@ public:
 
   /** @return \c true If the parameter is flagged as a "meta" parameter, e.g. one that could modify other parameters */
   bool GetMeta() const { return mFlags & kFlagMeta; }
+
+  bool GetInternal() const { return mFlags & kFlagInternal; }
   
   /** @return Shape ID */
   EShapeIDs GetShapeID() const;

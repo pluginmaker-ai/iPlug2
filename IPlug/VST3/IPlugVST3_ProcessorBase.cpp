@@ -8,6 +8,10 @@
  ==============================================================================
  */
 
+#include <algorithm>
+#include <array>
+#include <limits>
+
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "pluginterfaces/vst/vstspeaker.h"
 #include "pluginterfaces/vst/ivstmidicontrollers.h"
@@ -65,8 +69,95 @@ IPlugVST3ProcessorBase::IPlugVST3ProcessorBase(Config c, IPlugAPIBase& plug)
   memset(&mProcessContext, 0, sizeof(ProcessContext));
 }
 
-void IPlugVST3ProcessorBase::ProcessMidiIn(IEventList* pEventList, IPlugQueue<IMidiMsg>& editorQueue, IPlugQueue<IMidiMsg>& processorQueue)
+void IPlugVST3ProcessorBase::ProcessMidiIn(IEventList* pEventList, IPlugQueue<IMidiMsg>& editorQueue, IPlugQueue<IMidiMsg>& processorQueue, IParameterChanges* pParamChanges)
 {
+  // One cursor per advertised MIDI proxy, not one allocation per MIDI point.
+  // Host queues and the event list are ordered by sample offset. Merge their
+  // heads so later controllers cannot overtake earlier notes (or other CCs).
+  struct Cursor
+  {
+    IParamValueQueue* mQueue;
+    int32 mQueueIndex;
+    int32 mNextPoint;
+    int32 mPointCount;
+    int32 mOffset;
+    ParamValue mValue;
+    ParamID mID;
+
+    bool Advance()
+    {
+      while (mNextPoint < mPointCount)
+      {
+        if (mQueue->getPoint(mNextPoint++, mOffset, mValue) == kResultTrue)
+          return true;
+      }
+      return false;
+    }
+  };
+
+  constexpr int kMaxQueues = VST3_NUM_CC_CHANS * kCountCtrlNumber;
+  std::array<Cursor, kMaxQueues> cursors;
+  int nCursors = 0;
+  const auto later = [](const Cursor& a, const Cursor& b) {
+    return a.mOffset != b.mOffset ? a.mOffset > b.mOffset : a.mQueueIndex > b.mQueueIndex;
+  };
+
+  if (pParamChanges)
+  {
+    const int32 nQueues = pParamChanges->getParameterCount();
+    for (int32 i = 0; i < nQueues; i++)
+    {
+      auto* pQueue = pParamChanges->getParameterData(i);
+      if (!pQueue)
+        continue;
+
+      const ParamID id = pQueue->getParameterId();
+      if (id < kMIDICCParamStartIdx || id >= kMIDICCParamStartIdx + kMaxQueues)
+        continue;
+
+      // IParameterChanges has one queue per ID. Also bound malformed host input.
+      if (nCursors == kMaxQueues)
+        break;
+
+      Cursor cursor {pQueue, i, 0, pQueue->getPointCount(), 0, 0., id};
+      if (cursor.Advance())
+      {
+        cursors[nCursors++] = cursor;
+        std::push_heap(cursors.begin(), cursors.begin() + nCursors, later);
+      }
+    }
+  }
+
+  const auto dispatchControllers = [&](int32 untilOffset) {
+    while (nCursors && cursors[0].mOffset <= untilOffset)
+    {
+      std::pop_heap(cursors.begin(), cursors.begin() + nCursors, later);
+      Cursor& cursor = cursors[--nCursors];
+      const int index = cursor.mID - kMIDICCParamStartIdx;
+      const int channel = index / kCountCtrlNumber;
+      const int ctrlr = index % kCountCtrlNumber;
+      const double value = cursor.mValue;
+      const int offsetSamples = cursor.mOffset;
+      IMidiMsg msg;
+
+      if (ctrlr == kAfterTouch)
+        msg.MakeChannelATMsg(IMidiMsg::NormalizedTo7Bit(value), offsetSamples, channel);
+      else if (ctrlr == kPitchBend)
+        msg.MakePitchWheelMsg((value * 2.)-1., channel, offsetSamples);
+      else
+        msg.MakeControlChangeMsg((IMidiMsg::EControlChangeMsg) ctrlr, value, channel, offsetSamples);
+
+      processorQueue.Push(msg);
+      ProcessMidiMsg(msg);
+
+      if (cursor.Advance())
+      {
+        ++nCursors;
+        std::push_heap(cursors.begin(), cursors.begin() + nCursors, later);
+      }
+    }
+  };
+
   IMidiMsg msg;
     
   if (pEventList)
@@ -77,11 +168,14 @@ void IPlugVST3ProcessorBase::ProcessMidiIn(IEventList* pEventList, IPlugQueue<IM
       Event event;
       if (pEventList->getEvent(i, event) == kResultOk)
       {
+        // VST3 has no cross-list ordering token. Preserve controller-before-note
+        // precedence at equal offsets; controller ties follow host queue order.
+        dispatchControllers(event.sampleOffset);
         switch (event.type)
         {
           case Event::kNoteOnEvent:
           {
-            msg.MakeNoteOnMsg(event.noteOn.pitch, event.noteOn.velocity * 127, event.sampleOffset, event.noteOn.channel);
+            msg.MakeNoteOnMsg(event.noteOn.pitch, IMidiMsg::NormalizedTo7Bit(event.noteOn.velocity), event.sampleOffset, event.noteOn.channel);
             ProcessMidiMsg(msg);
             processorQueue.Push(msg);
             break;
@@ -96,7 +190,7 @@ void IPlugVST3ProcessorBase::ProcessMidiIn(IEventList* pEventList, IPlugQueue<IM
           }
           case Event::kPolyPressureEvent:
           {
-            msg.MakePolyATMsg(event.polyPressure.pitch, event.polyPressure.pressure * 127., event.sampleOffset, event.polyPressure.channel);
+            msg.MakePolyATMsg(event.polyPressure.pitch, IMidiMsg::NormalizedTo7Bit(event.polyPressure.pressure), event.sampleOffset, event.polyPressure.channel);
             ProcessMidiMsg(msg);
             processorQueue.Push(msg);
             break;
@@ -112,6 +206,8 @@ void IPlugVST3ProcessorBase::ProcessMidiIn(IEventList* pEventList, IPlugQueue<IM
     }
   }
   
+  dispatchControllers(std::numeric_limits<int32>::max());
+
   while (editorQueue.Pop(msg))
   {
     ProcessMidiMsg(msg);
@@ -271,7 +367,7 @@ void IPlugVST3ProcessorBase::PrepareProcessContext(ProcessData& data, ProcessSet
   SetRenderingOffline(offline);
 }
 
-void IPlugVST3ProcessorBase::ProcessParameterChanges(ProcessData& data, IPlugQueue<IMidiMsg>& fromProcessor)
+void IPlugVST3ProcessorBase::ProcessParameterChanges(ProcessData& data)
 {
   IParameterChanges* paramChanges = data.inputParameterChanges;
   
@@ -288,7 +384,8 @@ void IPlugVST3ProcessorBase::ProcessParameterChanges(ProcessData& data, IPlugQue
         int32 offsetSamples;
         double value;
         
-        if (paramQueue->getPoint(numPoints - 1,  offsetSamples, value) == kResultTrue)
+        if (numPoints > 0 && paramQueue->getParameterId() < kMIDICCParamStartIdx
+            && paramQueue->getPoint(numPoints - 1, offsetSamples, value) == kResultTrue)
         {
           int idx = paramQueue->getParameterId();
           
@@ -305,7 +402,7 @@ void IPlugVST3ProcessorBase::ProcessParameterChanges(ProcessData& data, IPlugQue
             }
             default:
             {
-              if (idx >= 0 && idx < mPlug.NParams())
+              if (mPlug.IsHostParameter(idx))
               {
 #ifdef PARAMS_MUTEX
                 mPlug.mParams_mutex.Enter();
@@ -318,24 +415,7 @@ void IPlugVST3ProcessorBase::ProcessParameterChanges(ProcessData& data, IPlugQue
                 mPlug.mParams_mutex.Leave();
 #endif
               }
-              else if (idx >= kMIDICCParamStartIdx)
-              {
-                int index = idx - kMIDICCParamStartIdx;
-                int channel = index / kCountCtrlNumber;
-                int ctrlr = index % kCountCtrlNumber;
 
-                IMidiMsg msg;
-
-                if (ctrlr == kAfterTouch)
-                  msg.MakeChannelATMsg((int) (value * 127.), offsetSamples, channel);
-                else if (ctrlr == kPitchBend)
-                  msg.MakePitchWheelMsg((value * 2.)-1., channel, offsetSamples);
-                else
-                  msg.MakeControlChangeMsg((IMidiMsg::EControlChangeMsg) ctrlr, value, channel, offsetSamples);
-
-                fromProcessor.Push(msg);
-                ProcessMidiMsg(msg);
-              }
             }
               break;
           }
@@ -422,11 +502,11 @@ void IPlugVST3ProcessorBase::ProcessAudio(ProcessData& data, ProcessSetup& setup
 void IPlugVST3ProcessorBase::Process(ProcessData& data, ProcessSetup& setup, const BusList& ins, const BusList& outs, IPlugQueue<IMidiMsg>& fromEditor, IPlugQueue<IMidiMsg>& fromProcessor, IPlugQueue<SysExData>& sysExFromEditor, SysExData& sysExBuf)
 {
   PrepareProcessContext(data, setup);
-  ProcessParameterChanges(data, fromProcessor);
+  ProcessParameterChanges(data);
   
   if (DoesMIDIIn())
   {
-    ProcessMidiIn(data.inputEvents, fromEditor, fromProcessor);
+    ProcessMidiIn(data.inputEvents, fromEditor, fromProcessor, data.inputParameterChanges);
   }
   
   ProcessAudio(data, setup, ins, outs);

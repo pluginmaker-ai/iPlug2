@@ -86,6 +86,7 @@ public:
     for (int i = 0; i < pPlug->NParams(); i++)
     {
       IParam* pParam = pPlug->GetParam(i);
+      if (pParam->GetInternal()) continue;
       unitID = Steinberg::Vst::kRootUnitId; // reset unitID
     
       const char* paramGroupName = pParam->GetGroup();
@@ -338,7 +339,7 @@ public:
     for (int i = 0; i < pPlug->NParams(); i++)
     {
       double normalized = pPlug->GetParam(i)->GetNormalized();
-      mParameters.getParameter(i)->setNormalized(normalized);
+      SetVST3ParamNormalized(i, normalized);
     }
     
     if (mBypassParameter)
