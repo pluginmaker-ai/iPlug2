@@ -56,6 +56,11 @@ public:
     if (active) mRateAtActivation = mDSPRate;
   }
 
+  void OnParamChange(int paramIdx, EParamSource source, int sampleOffset) override
+  {
+    if (source == kHost) mHostChanges.push_back({paramIdx, sampleOffset, GetParam(paramIdx)->Value()});
+  }
+
   void ProcessMidiMsg(const IMidiMsg& msg) override
   {
     if (msg.StatusMsg() == IMidiMsg::kNoteOn) mPlaying = msg.Velocity() > 0;
@@ -85,6 +90,8 @@ public:
   int mResets = 0;
   bool mPlaying = false;
   double mPhase = 0.;
+  struct HostChange { int id; int offset; double value; };
+  std::vector<HostChange> mHostChanges;
 };
 
 RateTestPlugin* gPlugin = nullptr;
@@ -160,6 +167,46 @@ void VerifyInternalParameters(AudioUnit unit)
   AudioUnitParameterValue restored = 0;
   Check(AudioUnitGetParameter(unit, 2, kAudioUnitScope_Global, 0, &restored), "restored sparse read");
   Require(std::abs(restored - 0.7) < 1.e-6, "surviving value restored from wrong slot");
+
+  auto immediate = [](AudioUnitParameterID id, float value, UInt32 offset) {
+    AudioUnitParameterEvent event{};
+    event.scope = kAudioUnitScope_Global;
+    event.parameter = id;
+    event.eventType = kParameterEvent_Immediate;
+    event.eventValues.immediate.value = value;
+    event.eventValues.immediate.bufferOffset = offset;
+    return event;
+  };
+  auto verifyBatch = [&](std::vector<AudioUnitParameterEvent> events,
+                         std::vector<RateTestPlugin::HostChange> expected) {
+    gPlugin->mHostChanges.clear();
+    Check(AudioUnitScheduleParameters(unit, events.data(), events.size()), "mixed scheduled automation");
+    Require(gPlugin->mHostChanges.size() == expected.size(), "active scheduled events lost or internal events delivered");
+    for (size_t i = 0; i < expected.size(); ++i)
+    {
+      const auto& got = gPlugin->mHostChanges[i];
+      Require(got.id == expected[i].id && got.offset == expected[i].offset
+          && std::abs(got.value - expected[i].value) < 1.e-6, "scheduled event value, order or offset changed");
+      Require(std::abs(gPlugin->GetParam(got.id)->Value() - expected[i].value) < 1.e-6,
+          "scheduled active value not applied");
+    }
+    Require(gPlugin->GetParam(1)->Value() == 0.3 && gPlugin->GetParam(3)->Value() == 0.9,
+        "scheduled automation changed internal state");
+  };
+  verifyBatch({immediate(1, 0.99f, 7), immediate(2, 0.45f, 19)}, {{2, 19, 0.45}});
+  verifyBatch({immediate(0, 0.35f, 3), immediate(3, 0.99f, 11), immediate(2, 0.65f, 27)},
+      {{0, 3, 0.35}, {2, 27, 0.65}});
+  for (AudioUnitParameterID id : {4u, 0xffffffffu})
+  {
+    auto invalid = immediate(id, 0.99f, 0);
+    Require(AudioUnitScheduleParameters(unit, &invalid, 1) == kAudioUnitErr_InvalidParameter,
+        "invalid scheduled ID accepted");
+  }
+  auto wrongScope = immediate(1, 0.99f, 0);
+  wrongScope.scope = kAudioUnitScope_Input;
+  Require(AudioUnitScheduleParameters(unit, &wrongScope, 1) == kAudioUnitErr_InvalidProperty,
+      "invalid scheduled scope accepted");
+  std::puts("PASS: mixed retired/active AU automation preserves active values and offsets");
   std::puts("PASS: sparse AU IDs, rejected obsolete automation, compatible legacy state");
 }
 

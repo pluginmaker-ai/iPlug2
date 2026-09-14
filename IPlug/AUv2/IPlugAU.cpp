@@ -2446,6 +2446,12 @@ OSStatus IPlugAU::DoScheduleParameters(IPlugAU* _this, const AudioUnitParameterE
   {
     if (pEvent->eventType == kParameterEvent_Immediate)
     {
+      // Old projects may batch retired automation with surviving parameters.
+      // Ignore only known internal IDs; keep normal scope and invalid-ID errors.
+      if (pEvent->scope == kAudioUnitScope_Global
+          && pEvent->parameter < static_cast<UInt32>(_this->NParams())
+          && _this->GetParam(pEvent->parameter)->GetInternal())
+        continue;
       OSStatus r = SetParamProc(_this, pEvent->parameter, pEvent->scope, pEvent->element,
                                 pEvent->eventValues.immediate.value, pEvent->eventValues.immediate.bufferOffset);
       if (r != noErr)
