@@ -1174,6 +1174,7 @@ OSStatus IPlugAU::SetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
     case kAudioUnitProperty_SampleRate:                  // 2,
     {
       SetSampleRate(*((Float64*) pData));
+      ClearRenderEvents();
       OnReset();
       return noErr;
     }
@@ -1223,7 +1224,8 @@ OSStatus IPlugAU::SetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
       // the processor in sync just as kAudioUnitProperty_SampleRate does.
       if (connectionOK && GetSampleRate() != previousSampleRate)
       {
-        OnReset();
+        ClearRenderEvents();
+      OnReset();
       }
       return (connectionOK ? noErr : (int) kAudioUnitErr_InvalidProperty); // casting to int avoids gcc error
     }
@@ -1234,6 +1236,7 @@ OSStatus IPlugAU::SetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
     {
       SetBlockSize(*((UInt32*) pData));
       ResizeScratchBuffers();
+      ClearRenderEvents();
       OnReset();
       return noErr;
     }
@@ -1249,6 +1252,7 @@ OSStatus IPlugAU::SetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
       
       // TODO: should the following be called here?
       OnActivate(!bypassed);
+      ClearRenderEvents();
       OnReset();
       return noErr;
     }
@@ -1619,6 +1623,50 @@ OSStatus IPlugAU::RenderProc(void* pPlug, AudioUnitRenderActionFlags* pFlags, co
     return kAudioUnitErr_InvalidPropertyValue;
   }
 
+  if (_this->UsesRenderAdmission())
+  {
+    if (outputBusIdx >= static_cast<UInt32>(_this->mOutBuses.GetSize()) || outputBusIdx >= 64)
+      return kAudioUnitErr_InvalidElement;
+    const uint64_t busBit = uint64_t{1} << outputBusIdx;
+    // Cache admission for all output buses of this block. Ready becoming true
+    // between bus callbacks must not split a block into silent/audible halves.
+    if (pTimestamp->mSampleTime != _this->mAdmissionSampleTime || (_this->mAdmissionBuses & busBit))
+    {
+      _this->mAdmissionSampleTime = pTimestamp->mSampleTime;
+      _this->mAdmissionFrames = nFrames;
+      _this->mAdmissionBuses = 0;
+      _this->ObserveRenderMode(_this->GetRenderingOffline() ? 1 : 0);
+      _this->mAdmission = _this->PrepareRender(nFrames, _this->GetRenderingOffline());
+    }
+    _this->mAdmissionBuses |= busBit;
+    if (nFrames != _this->mAdmissionFrames)
+      return kAudioUnitErr_InvalidPropertyValue;
+    if (_this->mAdmission != ERenderAdmission::Ready)
+    {
+      IMidiMsg discarded;
+      const auto hostCount = _this->mRenderEvents.ElementsAvailable();
+      for (size_t i = 0; i < hostCount; ++i) _this->mRenderEvents.Pop(discarded);
+      const auto editorCount = _this->mMidiMsgsFromEditor.ElementsAvailable();
+      for (size_t i = 0; i < editorCount; ++i) _this->mMidiMsgsFromEditor.Pop(discarded);
+      for (UInt32 channel = 0; channel < pOutBufList->mNumberBuffers; ++channel)
+      {
+        auto& buffer = pOutBufList->mBuffers[channel];
+        if (!buffer.mData)
+        {
+          const auto* bus = _this->mOutBuses.Get(outputBusIdx);
+          if (channel >= static_cast<UInt32>(bus->mNPlugChannels))
+            return kAudioUnitErr_InvalidPropertyValue;
+          buffer.mData = _this->mOutScratchBuf.Get() + (bus->mPlugChannelStartIdx + channel) * nFrames;
+          buffer.mDataByteSize = nFrames * sizeof(AudioSampleType);
+        }
+        if (buffer.mData) memset(buffer.mData, 0, buffer.mDataByteSize);
+      }
+      *pFlags |= kAudioUnitRenderAction_OutputIsSilence;
+      return _this->mAdmission == ERenderAdmission::Error
+          ? kAudioUnitErr_CannotDoInCurrentContext : noErr;
+    }
+  }
+
   int nRenderNotify = _this->mRenderNotify.GetSize();
 
   if (nRenderNotify)
@@ -1756,11 +1804,15 @@ OSStatus IPlugAU::RenderProc(void* pPlug, AudioUnitRenderActionFlags* pFlags, co
 
     if (_this->GetBypassed())
     {
+      if (_this->UsesRenderAdmission()) _this->ClearRenderEvents();
       _this->PassThroughBuffers((AudioSampleType) 0, nFrames);
     }
     else
     {
-      if(_this->mMidiMsgsFromEditor.ElementsAvailable())
+      if (_this->UsesRenderAdmission() && !_this->DispatchRenderEvents(nFrames))
+        return kAudioUnitErr_CannotDoInCurrentContext;
+
+      if(!_this->UsesRenderAdmission() && _this->mMidiMsgsFromEditor.ElementsAvailable())
       {
         IMidiMsg msg;
         
@@ -1774,6 +1826,11 @@ OSStatus IPlugAU::RenderProc(void* pPlug, AudioUnitRenderActionFlags* pFlags, co
       ENTER_PARAMS_MUTEX_STATIC
       _this->ProcessBuffers((AudioSampleType) 0, nFrames);
       LEAVE_PARAMS_MUTEX_STATIC
+      if (!_this->RenderSucceeded())
+      {
+        _this->mAdmission = ERenderAdmission::Error;
+        return kAudioUnitErr_CannotDoInCurrentContext;
+      }
     }
   }
 
@@ -1790,6 +1847,61 @@ OSStatus IPlugAU::RenderProc(void* pPlug, AudioUnitRenderActionFlags* pFlags, co
   _this->OutputSysexFromEditor();
 
   return noErr;
+}
+
+void IPlugAU::ClearRenderEvents()
+{
+  IMidiMsg discarded;
+  const auto count = mRenderEvents.ElementsAvailable();
+  for (size_t i = 0; i < count; ++i) mRenderEvents.Pop(discarded);
+  if (UsesRenderAdmission())
+  {
+    const auto editorCount = mMidiMsgsFromEditor.ElementsAvailable();
+    for (size_t i = 0; i < editorCount; ++i) mMidiMsgsFromEditor.Pop(discarded);
+  }
+  mAdmissionSampleTime = std::numeric_limits<double>::quiet_NaN();
+  mAdmissionBuses = 0;
+}
+
+bool IPlugAU::DispatchRenderEvents(UInt32 nFrames)
+{
+  const auto hostCount = mRenderEvents.ElementsAvailable();
+  const auto editorCount = mMidiMsgsFromEditor.ElementsAvailable();
+  const auto count = hostCount + editorCount;
+  if (count > kRenderEventCapacity)
+  {
+    OnRenderEventOverflow();
+    ClearRenderEvents();
+    return false;
+  }
+  bool valid = true;
+  for (size_t i = 0; i < count; ++i)
+  {
+    auto& msg = mRenderEventScratch[i];
+    if (i < hostCount) mRenderEvents.Pop(msg);
+    else mMidiMsgsFromEditor.Pop(msg);
+    valid = valid && msg.mOffset >= 0 && static_cast<UInt32>(msg.mOffset) < nFrames;
+  }
+  if (!valid)
+  {
+    OnRenderEventOverflow();
+    return false;
+  }
+  // Stable insertion sort has bounded storage and preserves ties. std::stable_sort
+  // may allocate in an audio callback. Host events keep their original offsets.
+  for (size_t i = 1; i < count; ++i)
+  {
+    const auto event = mRenderEventScratch[i];
+    size_t j = i;
+    while (j && mRenderEventScratch[j - 1].mOffset > event.mOffset)
+    {
+      mRenderEventScratch[j] = mRenderEventScratch[j - 1];
+      --j;
+    }
+    mRenderEventScratch[j] = event;
+  }
+  for (size_t i = 0; i < count; ++i) ProcessMidiMsg(mRenderEventScratch[i]);
+  return true;
 }
 
 IPlugAU::BusChannels* IPlugAU::GetBus(AudioUnitScope scope, AudioUnitElement busIdx)
@@ -2281,6 +2393,7 @@ OSStatus IPlugAU::DoInitialize(IPlugAU* _this)
   _this->OnParamReset(kReset);
   // Initialization must configure DSP even when the host did not issue a
   // separate AudioUnitReset (including uninitialize/format/initialize).
+  _this->ClearRenderEvents();
   _this->OnReset();
   _this->OnActivate(true);
   
@@ -2290,6 +2403,7 @@ OSStatus IPlugAU::DoInitialize(IPlugAU* _this)
 //static
 OSStatus IPlugAU::DoUninitialize(IPlugAU* _this)
 {
+  _this->ClearRenderEvents();
   _this->mActive = false;
   _this->OnActivate(false);
   return noErr;
@@ -2472,6 +2586,7 @@ OSStatus IPlugAU::DoRender(IPlugAU* _this, AudioUnitRenderActionFlags* ioActionF
 //static
 OSStatus IPlugAU::DoReset(IPlugAU* _this)
 {
+  _this->ClearRenderEvents();
   _this->OnReset();
   return noErr;
 }
@@ -2486,7 +2601,15 @@ OSStatus IPlugAU::DoMIDIEvent(IPlugAU* _this, UInt32 inStatus, UInt32 inData1, U
     msg.mData1 = inData1;
     msg.mData2 = inData2;
     msg.mOffset = inOffsetSampleFrame;
-    _this->ProcessMidiMsg(msg);
+    if (_this->UsesRenderAdmission())
+    {
+      if (!_this->mRenderEvents.Push(msg))
+      {
+        _this->OnRenderEventOverflow();
+        return kAudioUnitErr_CannotDoInCurrentContext;
+      }
+    }
+    else _this->ProcessMidiMsg(msg);
     _this->mMidiMsgsFromProcessor.Push(msg);
     return noErr;
   }

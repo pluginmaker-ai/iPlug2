@@ -69,6 +69,16 @@ public:
    * @param nFrames The block size for this block: number of samples per channel.*/
   virtual void ProcessBlock(sample** inputs, sample** outputs, int nFrames);
 
+  // PluginMaker alteration: opt-in admission before a block's engine events.
+  // Only explicitly offline rendering may wait, and that wait must be bounded.
+  // Silence consumes this block without replay; Error invalidates its output.
+  enum class ERenderAdmission { Ready, Silence, Error };
+  virtual bool UsesRenderAdmission() const { return false; }
+  virtual void ObserveRenderMode(int mode) { (void) mode; }
+  virtual ERenderAdmission PrepareRender(int, bool) { return ERenderAdmission::Ready; }
+  virtual bool RenderSucceeded() const { return true; }
+  virtual void OnRenderEventOverflow() {}
+
   /** Override this method to handle incoming MIDI messages. The method is called prior to ProcessBlock().
    * You can use IMidiQueue in combination with this method in order to queue the message and process at the appropriate time in ProcessBlock()
    * THIS METHOD IS CALLED BY THE HIGH PRIORITY AUDIO THREAD - You should be careful not to do any unbounded, blocking operations such as file I/O which could cause audio dropouts

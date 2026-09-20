@@ -14,6 +14,16 @@ public:
   void ProcessBlock(iplug::sample** inputs, iplug::sample** outputs, int nFrames) override;
   void OnParamChange(int idx, iplug::EParamSource source, int offset) override;
 
+  bool UsesRenderAdmission() const override { return mAdmissionTest; }
+  ERenderAdmission PrepareRender(int, bool offline) override {
+    mPrepared = true; mLastOffline = offline;
+    return mAdmissionTest ? mRequestedAdmission : ERenderAdmission::Ready;
+  }
+  bool RenderSucceeded() const override { return mRenderSucceeded; }
+  bool mAdmissionTest = false, mPrepared = false, mLastOffline = false;
+  bool mAdmissionViolation = false, mRenderSucceeded = true;
+  ERenderAdmission mRequestedAdmission = ERenderAdmission::Ready;
+
   static constexpr int kCapacity = 65536;
   std::array<iplug::IMidiMsg, kCapacity> mReceived;
   int mReceivedCount = 0;

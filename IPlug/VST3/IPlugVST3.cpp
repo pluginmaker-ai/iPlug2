@@ -103,8 +103,7 @@ tresult PLUGIN_API IPlugVST3::process(ProcessData& data)
 {
   TRACE
 
-  Process(data, processSetup, audioInputs, audioOutputs, mMidiMsgsFromEditor, mMidiMsgsFromProcessor, mSysExDataFromEditor, mSysexBuf);
-  return kResultOk;
+  return Process(data, processSetup, audioInputs, audioOutputs, mMidiMsgsFromEditor, mMidiMsgsFromProcessor, mSysExDataFromEditor, mSysexBuf) ? kResultOk : kResultFalse;
 }
 
 tresult PLUGIN_API IPlugVST3::canProcessSampleSize(int32 symbolicSampleSize)

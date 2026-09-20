@@ -22,6 +22,7 @@
 #include <AudioUnit/AudioUnitProperties.h>
 #include <AudioToolbox/AudioUnitUtilities.h>
 #include <AvailabilityMacros.h>
+#include <array>
 
 #include "IPlugAPIBase.h"
 #include "IPlugProcessor.h"
@@ -127,6 +128,8 @@ private:
   
   int NHostChannelsConnected(WDL_PtrList<BusChannels>* pBuses, int excludeIdx = -1);
   void ClearConnections();
+  void ClearRenderEvents();
+  bool DispatchRenderEvents(UInt32 nFrames);
   BusChannels* GetBus(AudioUnitScope scope, AudioUnitElement busIdx);
   bool CheckLegalIO(AudioUnitScope scope, int busIdx, int nChannels);
   bool CheckLegalIO();
@@ -212,6 +215,15 @@ private:
 #pragma mark -
 
   bool mActive = false; // TODO: is this necessary? is it correct?
+  // PluginMaker alteration: a bounded forthcoming-block queue for instruments
+  // which opt into render admission. No elapsed realtime block is retained.
+  static constexpr size_t kRenderEventCapacity = 2048;
+  IPlugQueue<IMidiMsg> mRenderEvents{static_cast<int>(kRenderEventCapacity)};
+  std::array<IMidiMsg, kRenderEventCapacity> mRenderEventScratch;
+  double mAdmissionSampleTime = std::numeric_limits<double>::quiet_NaN();
+  UInt32 mAdmissionFrames = 0;
+  uint64_t mAdmissionBuses = 0;
+  ERenderAdmission mAdmission = ERenderAdmission::Ready;
   double mLastRenderSampleTime = -1.0;
   WDL_String mCocoaViewFactoryClassName;
   AudioComponentInstance mCI = nullptr;
@@ -323,5 +335,3 @@ public:
 END_IPLUG_NAMESPACE
 
 #endif
-
-
