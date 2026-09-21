@@ -3,6 +3,9 @@
 #include <cstdio>
 #include <stdexcept>
 #include <vector>
+#include <atomic>
+#include <thread>
+#include <chrono>
 
 #include "IPlugAU.h"
 
@@ -14,6 +17,7 @@ constexpr double kTwoPi = 6.28318530717958647692;
 bool gEffect = false;
 double gInputPhase = 0.;
 double gInputRate = 48000.;
+bool gAdmissionTest = false;
 
 void Require(bool condition, const char* message)
 {
@@ -61,8 +65,28 @@ public:
     if (source == kHost) mHostChanges.push_back({paramIdx, sampleOffset, GetParam(paramIdx)->Value()});
   }
 
+  bool UsesRenderAdmission() const override { return gAdmissionTest; }
+  ERenderAdmission PrepareRender(int, bool offline) override
+  {
+    mLastOffline = offline;
+    ++mAdmissions;
+    if (offline && mWaitForReady) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (mRequestedAdmission == ERenderAdmission::Silence && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return mRequestedAdmission;
+  }
+  void OnRenderEventOverflow() override { mRequestedAdmission = ERenderAdmission::Error; }
+  std::atomic<ERenderAdmission> mRequestedAdmission{ERenderAdmission::Ready};
+  bool mWaitForReady = false;
+  bool mLastOffline = false;
+  int mAdmissions = 0;
+  std::vector<IMidiMsg> mReceived;
+
   void ProcessMidiMsg(const IMidiMsg& msg) override
   {
+    if (gAdmissionTest) mReceived.push_back(msg);
     if (msg.StatusMsg() == IMidiMsg::kNoteOn) mPlaying = msg.Velocity() > 0;
     if (msg.StatusMsg() == IMidiMsg::kNoteOff) mPlaying = false;
   }
@@ -249,6 +273,77 @@ void VerifyTone(AudioUnit unit, double rate, double& sampleTime)
   if (!gEffect) Check(MusicDeviceMIDIEvent(unit, 0x80, 69, 0, 0), "note off");
 }
 
+void VerifyAdmission(AudioUnit unit)
+{
+  using Admission = IPlugProcessor::ERenderAdmission;
+  gAdmissionTest = true;
+  Check(AudioUnitInitialize(unit), "admission initialize");
+  constexpr UInt32 frames = 128;
+  float left[frames]{}, right[frames]{};
+  struct { UInt32 count; AudioBuffer buffers[2]; } buffers{
+    2, {{1, sizeof(left), left}, {1, sizeof(right), right}}};
+  AudioTimeStamp time{};
+  time.mFlags = kAudioTimeStampSampleTimeValid;
+  auto render = [&] {
+    AudioUnitRenderActionFlags flags = 0;
+    const auto result = AudioUnitRender(unit, &flags, &time, 0, frames,
+        reinterpret_cast<AudioBufferList*>(&buffers));
+    time.mSampleTime += frames;
+    return result;
+  };
+  gPlugin->mRequestedAdmission = Admission::Silence;
+  Check(MusicDeviceMIDIEvent(unit, 0x90, 60, 90, 37), "stage live note");
+  Require(gPlugin->mReceived.empty(), "MIDI reached engine before admission");
+  Check(render(), "silent realtime block");
+  Require(gPlugin->mReceived.empty(), "unready realtime MIDI delivered");
+  for (float value : left) Require(value == 0, "unready block not silent");
+  gPlugin->mRequestedAdmission = Admission::Ready;
+  Check(render(), "ready block after dropped live note");
+  Require(gPlugin->mReceived.empty(), "elapsed realtime note replayed");
+
+  UInt32 offline = 1;
+  Check(AudioUnitSetProperty(unit, kAudioUnitProperty_OfflineRender,
+      kAudioUnitScope_Global, 0, &offline, sizeof(offline)), "offline property");
+  gPlugin->mRequestedAdmission = Admission::Silence;
+  gPlugin->mWaitForReady = true;
+  Check(MusicDeviceMIDIEvent(unit, 0x90, 60, 90, 37), "first queued note");
+  Check(MusicDeviceMIDIEvent(unit, 0xb0, 64, 127, 0), "earlier queued sustain");
+  Check(MusicDeviceMIDIEvent(unit, 0x80, 60, 0, 37), "same-offset note off");
+  std::thread loader([] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    gPlugin->mRequestedAdmission = Admission::Ready;
+  });
+  const auto result = render();
+  loader.join();
+  Check(result, "delayed offline render");
+  Require(gPlugin->mLastOffline, "offline flag not observed at admission");
+  Require(gPlugin->mReceived.size() == 3, "offline events lost");
+  Require(gPlugin->mReceived[0].mOffset == 0 && gPlugin->mReceived[0].mStatus == 0xb0,
+      "event offsets not sorted");
+  Require(gPlugin->mReceived[1].mOffset == 37 && gPlugin->mReceived[1].mStatus == 0x90 &&
+      gPlugin->mReceived[2].mOffset == 37 && gPlugin->mReceived[2].mStatus == 0x80,
+      "original offsets or stable ties changed");
+  gPlugin->mReceived.clear();
+  Check(MusicDeviceMIDIEvent(unit, 0x90, 60, 90, 2), "note before reset");
+  Check(AudioUnitReset(unit, kAudioUnitScope_Global, 0), "reset pending events");
+  Check(render(), "render after reset");
+  Require(gPlugin->mReceived.empty(), "reset retained prior events");
+  for (int i = 0; i < 2048; ++i)
+    Check(MusicDeviceMIDIEvent(unit, 0x90, 60, 90, 0), "fill bounded queue");
+  Require(MusicDeviceMIDIEvent(unit, 0x90, 60, 90, 0) != noErr, "overflow was silent");
+  Require(render() == kAudioUnitErr_CannotDoInCurrentContext, "render error swallowed");
+  Require(gPlugin->mReceived.empty(), "overflow partially delivered notes");
+  gPlugin->mRequestedAdmission = Admission::Ready;
+  offline = 0;
+  Check(AudioUnitSetProperty(unit, kAudioUnitProperty_OfflineRender,
+      kAudioUnitScope_Global, 0, &offline, sizeof(offline)), "back to realtime");
+  Check(render(), "live after offline");
+  Require(!gPlugin->mLastOffline && gPlugin->mReceived.empty(), "mode transition replayed old events");
+  Check(AudioUnitUninitialize(unit), "admission uninitialize");
+  gAdmissionTest = false;
+  std::puts("PASS: AU admission precedes MIDI, preserves offsets, drops elapsed live blocks, clears reset, reports overflow");
+}
+
 void RunLifecycle(AudioUnit unit)
 {
   Check(AudioUnitSetParameter(unit, 0, kAudioUnitScope_Global, 0, 0.37, 0), "set gain");
@@ -336,6 +431,7 @@ int main()
       VerifyInternalParameters(unit);
       std::printf("Testing %s\n", effect ? "effect" : "instrument");
       RunLifecycle(unit);
+      if (!effect) VerifyAdmission(unit);
       Check(AudioComponentInstanceDispose(unit), "dispose instance");
       unit = nullptr;
     }

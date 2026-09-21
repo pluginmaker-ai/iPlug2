@@ -120,7 +120,8 @@ struct Host
   IAudioProcessor* processor = nullptr;
   IComponent* component = nullptr;
   std::vector<float> left, right;
-  explicit Host(int frames = 8192, int mode = kRealtime) : left(frames), right(frames)
+  int processMode;
+  explicit Host(int frames = 8192, int mode = kRealtime) : left(frames), right(frames), processMode(mode)
   {
     if (gNativeModule)
       plug = gNativeModule->Create(processor);
@@ -145,7 +146,7 @@ struct Host
     component->release();
     processor->release();
   }
-  void Run(Changes* changes = nullptr, Events* events = nullptr, int frames = -1)
+  void Run(Changes* changes = nullptr, Events* events = nullptr, int frames = -1, int mode = -1, tresult expected = kResultOk, bool withContext = false)
   {
     float* buffers[] {left.data(), right.data()};
     AudioBusBuffers output {};
@@ -153,6 +154,10 @@ struct Host
     output.channelBuffers32 = buffers;
     ProcessData data {};
     data.symbolicSampleSize = kSample32;
+    data.processMode = mode < 0 ? processMode : mode;
+    ProcessContext context{};
+    data.processContext = withContext ? &context : nullptr;
+    plug->mPrepared = false;
     data.numSamples = frames < 0 ? static_cast<int32>(left.size()) : frames;
     data.numOutputs = 1;
     data.outputs = &output;
@@ -162,7 +167,8 @@ struct Host
     gInProcess = true;
     const auto result = processor->process(data);
     gInProcess = false;
-    Check(result == kResultOk, "process failed");
+    Check(result == expected, "process result mismatch");
+    Check(!plug->mAdmissionViolation, "engine event preceded render admission");
     Check(gAllocations == 0, "C++ allocation during process");
     Check(!plug->mOverflow, "probe pending buffer overflow");
   }
@@ -398,6 +404,39 @@ static void TestMusicalBlocks()
     }
 }
 
+static void TestRenderAdmission()
+{
+  using Admission = IPlugProcessor::ERenderAdmission;
+  Host host(512, kOffline);
+  host.plug->mAdmissionTest = true;
+  host.plug->mRequestedAdmission = Admission::Silence;
+  Changes parameters;
+  parameters.Add(0, {{0, 0.5}});
+  Events notes;
+  notes.Note(37, 0, true);
+  host.Run(&parameters, &notes, 128, kRealtime);
+  Check(host.plug->mReceivedCount == 0, "unready MIDI reached engine");
+  Check(host.plug->GetParam(0)->Value() == 0.5, "latest host control value lost while loading");
+  for (int i = 0; i < 128; ++i) Check(host.left[i] == 0.f, "loading output not zero");
+  Check(!host.plug->mLastOffline, "setup mode overrode realtime ProcessData");
+  host.Run(nullptr, &notes, 128, kPrefetch, kResultOk, true);
+  Check(!host.plug->mLastOffline, "prefetch treated as offline");
+  host.plug->mRequestedAdmission = Admission::Ready;
+  host.Run(nullptr, nullptr, 128, kOffline);
+  Check(host.plug->mLastOffline && host.plug->mReceivedCount == 0, "dropped block replayed after ready");
+  host.Run(&parameters, &notes, 128, kOffline, kResultOk, true);
+  Expect(*host.plug, 0, 37, 0x90, 60, 127);
+  host.plug->mRequestedAdmission = Admission::Error;
+  host.Run(nullptr, &notes, 128, kOffline, kResultFalse);
+  Check(host.plug->mReceivedCount == 1, "failed block consumed MIDI");
+  host.plug->mRequestedAdmission = Admission::Ready;
+  host.plug->mRenderSucceeded = false;
+  host.Run(nullptr, nullptr, 128, kOffline, kResultFalse);
+  host.plug->mRenderSucceeded = true;
+  host.Run(nullptr, nullptr, 128, kRealtime);
+  Check(!host.plug->mLastOffline, "offline state stuck after mode transition");
+}
+
 int main(int argc, char** argv)
 {
   try
@@ -409,6 +448,7 @@ int main(int argc, char** argv)
       gNativeModule = module.get();
       std::cout << "Testing actual VST3 binary: " << argv[1] << '\n';
     }
+    TestRenderAdmission(); std::cout << "PASS: VST3 admission, per-call mode with/null context, no late MIDI, error propagation\n";
     TestInternalParameters(); std::cout << "PASS: sparse VST3 IDs, rejected obsolete automation, compatible legacy state\n";
     TestOrdering(); std::cout << "PASS: all CC points, channels, chronological merge and stable ties\n";
     TestParametersAndErrors(); std::cout << "PASS: ordinary params, bypass, empty queues and failed getters\n";

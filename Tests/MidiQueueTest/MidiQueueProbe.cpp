@@ -26,11 +26,13 @@ void MidiQueueProbe::OnReset()
 
 void MidiQueueProbe::OnParamChange(int, EParamSource, int offset)
 {
+  if (mAdmissionTest && !mPrepared) mAdmissionViolation = true;
   mParamOffset = offset;
 }
 
 void MidiQueueProbe::ProcessMidiMsg(const IMidiMsg& msg)
 {
+  if (mAdmissionTest && (!mPrepared || mRequestedAdmission != ERenderAdmission::Ready)) mAdmissionViolation = true;
   if (mReceivedCount < kCapacity)
     mReceived[mReceivedCount++] = msg;
   // Capture may fill during a long validator run; only pending overflow loses

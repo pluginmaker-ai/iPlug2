@@ -344,7 +344,7 @@ bool IPlugVST3ProcessorBase::CanProcessSampleSize(int32 symbolicSampleSize)
   }
 }
 
-void IPlugVST3ProcessorBase::PrepareProcessContext(ProcessData& data, ProcessSetup& setup)
+void IPlugVST3ProcessorBase::PrepareProcessContext(ProcessData& data, ProcessSetup&)
 {
   ITimeInfo timeInfo;
   
@@ -362,7 +362,9 @@ void IPlugVST3ProcessorBase::PrepareProcessContext(ProcessData& data, ProcessSet
   timeInfo.mDenominator = mProcessContext.timeSigDenominator;
   timeInfo.mTransportIsRunning = mProcessContext.state & ProcessContext::kPlaying;
   timeInfo.mTransportLoopEnabled = mProcessContext.state & ProcessContext::kCycleActive;
-  const bool offline = setup.processMode == Steinberg::Vst::kOffline;
+  // ProcessData is authoritative even with a null context and when the host
+  // changes between realtime and prefetch without setupProcessing.
+  const bool offline = data.processMode == Steinberg::Vst::kOffline;
   SetTimeInfo(timeInfo);
   SetRenderingOffline(offline);
 }
@@ -499,10 +501,33 @@ void IPlugVST3ProcessorBase::ProcessAudio(ProcessData& data, ProcessSetup& setup
   }
 }
 
-void IPlugVST3ProcessorBase::Process(ProcessData& data, ProcessSetup& setup, const BusList& ins, const BusList& outs, IPlugQueue<IMidiMsg>& fromEditor, IPlugQueue<IMidiMsg>& fromProcessor, IPlugQueue<SysExData>& sysExFromEditor, SysExData& sysExBuf)
+bool IPlugVST3ProcessorBase::Process(ProcessData& data, ProcessSetup& setup, const BusList& ins, const BusList& outs, IPlugQueue<IMidiMsg>& fromEditor, IPlugQueue<IMidiMsg>& fromProcessor, IPlugQueue<SysExData>& sysExFromEditor, SysExData& sysExBuf)
 {
   PrepareProcessContext(data, setup);
+  ObserveRenderMode(static_cast<int>(data.processMode));
+  const auto admission = PrepareRender(data.numSamples, GetRenderingOffline());
+  // Admission-aware instruments publish host parameters into control mirrors;
+  // OnParamChange must not touch their worker-owned engine while loading.
   ProcessParameterChanges(data);
+  if (admission != ERenderAdmission::Ready)
+  {
+    IMidiMsg discarded;
+    const auto count = fromEditor.ElementsAvailable();
+    for (size_t i = 0; i < count; ++i) fromEditor.Pop(discarded);
+    for (int bus = 0; bus < data.numOutputs; ++bus)
+    {
+      auto& output = data.outputs[bus];
+      output.silenceFlags = ~uint64(0);
+      for (int channel = 0; channel < output.numChannels; ++channel)
+      {
+        if (data.symbolicSampleSize == kSample32 && output.channelBuffers32 && output.channelBuffers32[channel])
+          memset(output.channelBuffers32[channel], 0, data.numSamples * sizeof(float));
+        else if (data.symbolicSampleSize == kSample64 && output.channelBuffers64 && output.channelBuffers64[channel])
+          memset(output.channelBuffers64[channel], 0, data.numSamples * sizeof(double));
+      }
+    }
+    return admission != ERenderAdmission::Error;
+  }
   
   if (DoesMIDIIn())
   {
@@ -510,11 +535,13 @@ void IPlugVST3ProcessorBase::Process(ProcessData& data, ProcessSetup& setup, con
   }
   
   ProcessAudio(data, setup, ins, outs);
+  if (!RenderSucceeded()) return false;
   
   if (DoesMIDIOut())
   {
     ProcessMidiOut(sysExFromEditor, sysExBuf, data.outputEvents, data.numSamples);
   }
+  return true;
 }
 
 bool IPlugVST3ProcessorBase::SendMidiMsg(const IMidiMsg& msg)
