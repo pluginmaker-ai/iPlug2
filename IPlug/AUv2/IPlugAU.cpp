@@ -1612,6 +1612,13 @@ static inline OSStatus RenderCallback(AURenderCallbackStruct* pCB, AudioUnitRend
 OSStatus IPlugAU::RenderProc(void* pPlug, AudioUnitRenderActionFlags* pFlags, const AudioTimeStamp* pTimestamp,
                                     UInt32 outputBusIdx, UInt32 nFrames, AudioBufferList* pOutBufList)
 {
+  // Render action flags are optional for the caller (Apple's AUPlugInDispatch
+  // substitutes local flags); Logic on Intel passes NULL. The admission branch
+  // below marks silent blocks through pFlags, so give it somewhere to write.
+  AudioUnitRenderActionFlags unusedFlags = 0;
+  if (!pFlags) pFlags = &unusedFlags;
+  if (!pTimestamp || !pOutBufList) return kAudio_ParamError;
+
   Trace(TRACELOC, "%d:%d:%d", outputBusIdx, pOutBufList->mNumberBuffers, nFrames);
 
   IPlugAU* _this = (IPlugAU*) pPlug;

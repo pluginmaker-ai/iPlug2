@@ -1,5 +1,7 @@
 #include <AudioToolbox/AudioToolbox.h>
+#include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <cstdio>
 #include <stdexcept>
 #include <vector>
@@ -273,6 +275,49 @@ void VerifyTone(AudioUnit unit, double rate, double& sampleTime)
   if (!gEffect) Check(MusicDeviceMIDIEvent(unit, 0x80, 69, 0, 0), "note off");
 }
 
+// AudioUnitRender's ioActionFlags is optional (Apple's AUPlugInDispatch
+// substitutes local flags); Logic on Intel passes NULL. Buffers may also
+// arrive without mData, asking the unit to supply its own.
+void VerifyNullHostPointers(AudioUnit unit, AudioTimeStamp& time)
+{
+  using Admission = IPlugProcessor::ERenderAdmission;
+  constexpr UInt32 frames = 128;
+  float left[frames], right[frames];
+  struct { UInt32 count; AudioBuffer buffers[2]; } buffers{
+    2, {{1, sizeof(left), left}, {1, sizeof(right), right}}};
+  auto renderWith = [&](AudioUnitRenderActionFlags* flags, AudioBufferList* list) {
+    const auto result = AudioUnitRender(unit, flags, &time, 0, frames, list);
+    time.mSampleTime += frames;
+    return result;
+  };
+  auto* list = reinterpret_cast<AudioBufferList*>(&buffers);
+
+  gPlugin->mRequestedAdmission = Admission::Silence;
+  std::fill(std::begin(left), std::end(left), 1.f);
+  Check(renderWith(nullptr, list), "unready block without host flags");
+  for (float value : left) Require(value == 0, "unready block without host flags not silent");
+  AudioUnitRenderActionFlags flags = 0;
+  Check(renderWith(&flags, list), "unready block with host flags");
+  Require(flags & kAudioUnitRenderAction_OutputIsSilence, "unready block not flagged silent");
+
+  struct { UInt32 count; AudioBuffer buffers[2]; } unowned{
+    2, {{1, sizeof(left), nullptr}, {1, sizeof(right), nullptr}}};
+  Check(renderWith(nullptr, reinterpret_cast<AudioBufferList*>(&unowned)), "unready block without host buffers");
+  Require(unowned.buffers[0].mData && unowned.buffers[1].mData, "unready block supplied no buffers");
+  for (UInt32 i = 0; i < frames; ++i)
+    Require(static_cast<float*>(unowned.buffers[0].mData)[i] == 0, "unready supplied buffer not silent");
+
+  gPlugin->mRequestedAdmission = Admission::Ready;
+  Check(renderWith(nullptr, list), "ready block without host flags");
+  unowned.buffers[0].mData = unowned.buffers[1].mData = nullptr;
+  Check(renderWith(nullptr, reinterpret_cast<AudioBufferList*>(&unowned)), "ready block without host buffers");
+  Require(unowned.buffers[0].mData && unowned.buffers[1].mData, "ready block supplied no buffers");
+
+  Require(AudioUnitRender(unit, &flags, nullptr, 0, frames, list) != noErr, "missing timestamp accepted");
+  Require(AudioUnitRender(unit, &flags, &time, 0, frames, nullptr) != noErr, "missing buffer list accepted");
+  std::puts("PASS: AU render accepts NULL host flags and buffers, rejects missing timestamp/list");
+}
+
 void VerifyAdmission(AudioUnit unit)
 {
   using Admission = IPlugProcessor::ERenderAdmission;
@@ -300,6 +345,7 @@ void VerifyAdmission(AudioUnit unit)
   gPlugin->mRequestedAdmission = Admission::Ready;
   Check(render(), "ready block after dropped live note");
   Require(gPlugin->mReceived.empty(), "elapsed realtime note replayed");
+  VerifyNullHostPointers(unit, time);
 
   UInt32 offline = 1;
   Check(AudioUnitSetProperty(unit, kAudioUnitProperty_OfflineRender,
@@ -332,6 +378,9 @@ void VerifyAdmission(AudioUnit unit)
     Check(MusicDeviceMIDIEvent(unit, 0x90, 60, 90, 0), "fill bounded queue");
   Require(MusicDeviceMIDIEvent(unit, 0x90, 60, 90, 0) != noErr, "overflow was silent");
   Require(render() == kAudioUnitErr_CannotDoInCurrentContext, "render error swallowed");
+  Require(AudioUnitRender(unit, nullptr, &time, 0, frames, reinterpret_cast<AudioBufferList*>(&buffers))
+      == kAudioUnitErr_CannotDoInCurrentContext, "render error without host flags swallowed");
+  time.mSampleTime += frames;
   Require(gPlugin->mReceived.empty(), "overflow partially delivered notes");
   gPlugin->mRequestedAdmission = Admission::Ready;
   offline = 0;

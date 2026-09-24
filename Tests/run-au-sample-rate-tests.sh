@@ -14,6 +14,13 @@ compiler=${CXX:-clang++}
 output="$build_dir/au-rate-test"
 # Keep this array nonempty: macOS Bash 3 treats an empty array as unset with -u.
 compiler_args=(-std=c++17 -O1 -x objective-c++ -fno-objc-arc)
+# IPLUG_TEST_ARCHS="arm64 x86_64" builds those slices; the CLI run executes each
+# one (x86_64 runs under Rosetta on Apple Silicon). Default: the host arch only.
+arch_args=(-arch "$(uname -m)")
+if [[ -n "${IPLUG_TEST_ARCHS:-}" ]]; then
+  arch_args=()
+  for arch in $IPLUG_TEST_ARCHS; do arch_args+=(-arch "$arch"); done
+fi
 bundle_dir=
 if [[ "$#" == 2 && "$1" == --bundle ]]; then
   bundle_dir=$2
@@ -29,10 +36,10 @@ elif [[ "$#" != 0 ]]; then
   exit 2
 fi
 
-clang -Wno-deprecated-declarations -c "$iplug_dir/IPlug/AUv2/dfx-au-utilities.c" \
+clang "${arch_args[@]}" -Wno-deprecated-declarations -c "$iplug_dir/IPlug/AUv2/dfx-au-utilities.c" \
   -o "$build_dir/dfx-au-utilities.o"
 
-"$compiler" "${compiler_args[@]}" \
+"$compiler" "${arch_args[@]}" "${compiler_args[@]}" \
   -Wno-deprecated-declarations -Wno-deprecated-register -Wno-#warnings \
   -DAU_API -DAU_NO_COMPONENT_ENTRY -DIPLUG_DSP=1 -DIPLUG_EDITOR=0 -DNO_IGRAPHICS \
   -I"$iplug_dir/IPlug" -I"$iplug_dir/IPlug/AUv2" -I"$iplug_dir/WDL" \
@@ -72,5 +79,8 @@ PY
   codesign --force --sign - "$bundle_dir"
   echo "Built AU fixture: $bundle_dir"
 else
-  "$output"
+  for arch in ${IPLUG_TEST_ARCHS:-$(uname -m)}; do
+    echo "== $arch"
+    arch "-$arch" "$output"
+  done
 fi
