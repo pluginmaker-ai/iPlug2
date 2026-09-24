@@ -9,6 +9,7 @@
 */
 
 #include <algorithm>
+#include <climits>
 #include <CoreMIDI/CoreMIDI.h>
 
 #include "heapbuf.h"
@@ -1612,6 +1613,13 @@ static inline OSStatus RenderCallback(AURenderCallbackStruct* pCB, AudioUnitRend
 OSStatus IPlugAU::RenderProc(void* pPlug, AudioUnitRenderActionFlags* pFlags, const AudioTimeStamp* pTimestamp,
                                     UInt32 outputBusIdx, UInt32 nFrames, AudioBufferList* pOutBufList)
 {
+  // PluginMaker alteration: render action flags are optional for the caller
+  // (Apple's AUPlugInDispatch substitutes local flags); Logic on Intel passes
+  // NULL. The admission branch below marks silent blocks through pFlags.
+  AudioUnitRenderActionFlags unusedFlags = 0;
+  if (!pFlags) pFlags = &unusedFlags;
+  if (!pTimestamp || !pOutBufList) return kAudio_ParamError;
+
   Trace(TRACELOC, "%d:%d:%d", outputBusIdx, pOutBufList->mNumberBuffers, nFrames);
 
   IPlugAU* _this = (IPlugAU*) pPlug;
@@ -1874,21 +1882,19 @@ bool IPlugAU::DispatchRenderEvents(UInt32 nFrames)
     ClearRenderEvents();
     return false;
   }
-  bool valid = true;
+  // PluginMaker alteration: a host offset outside this block is clamped into
+  // it, as JUCE does. Failing the block would drop its note-offs and put an
+  // admission-aware sampler into its failed state.
+  const int lastFrame = nFrames ? static_cast<int>(nFrames) - 1 : 0;
   for (size_t i = 0; i < count; ++i)
   {
     auto& msg = mRenderEventScratch[i];
     if (i < hostCount) mRenderEvents.Pop(msg);
     else mMidiMsgsFromEditor.Pop(msg);
-    valid = valid && msg.mOffset >= 0 && static_cast<UInt32>(msg.mOffset) < nFrames;
-  }
-  if (!valid)
-  {
-    OnRenderEventOverflow();
-    return false;
+    msg.mOffset = std::clamp(msg.mOffset, 0, lastFrame);
   }
   // Stable insertion sort has bounded storage and preserves ties. std::stable_sort
-  // may allocate in an audio callback. Host events keep their original offsets.
+  // may allocate in an audio callback. In-block offsets are never changed.
   for (size_t i = 1; i < count; ++i)
   {
     const auto event = mRenderEventScratch[i];
@@ -2600,7 +2606,9 @@ OSStatus IPlugAU::DoMIDIEvent(IPlugAU* _this, UInt32 inStatus, UInt32 inData1, U
     msg.mStatus = inStatus;
     msg.mData1 = inData1;
     msg.mData2 = inData2;
-    msg.mOffset = inOffsetSampleFrame;
+    // PluginMaker alteration: saturate rather than wrap an offset >= 2^31 negative,
+    // so render clamps it to the block's last frame, not before in-block events.
+    msg.mOffset = static_cast<int>(std::min<UInt32>(inOffsetSampleFrame, INT_MAX));
     if (_this->UsesRenderAdmission())
     {
       if (!_this->mRenderEvents.Push(msg))

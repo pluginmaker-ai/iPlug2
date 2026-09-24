@@ -7,6 +7,11 @@ active stream-format changes, invalid format/channel/bus rejection, block size,
 explicit reset, host gain retention and stereo output for an instrument and an
 effect. Tone generation, host input and render measurements remain in memory;
 it uses no audio files, installed plug-ins, DAW or hardware device.
+It also renders with a NULL `ioActionFlags` (what Logic on Intel sends), a NULL
+`mData` buffer, and a missing timestamp or buffer list, while render admission
+is silent, ready and failed, and host MIDI offsets past either end of the block,
+which must be clamped into it. `IPLUG_TEST_ARCHS="arm64 x86_64"` builds and runs
+both macOS slices; x86_64 runs under Rosetta on Apple Silicon.
 
 For an optional external-host check, build a new bundle with
 `bash Tests/run-au-sample-rate-tests.sh --bundle /absolute/new/IPlugAURateTest.component`.
