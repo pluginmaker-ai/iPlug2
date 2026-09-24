@@ -347,6 +347,23 @@ void VerifyAdmission(AudioUnit unit)
   Require(gPlugin->mReceived.empty(), "elapsed realtime note replayed");
   VerifyNullHostPointers(unit, time);
 
+  // Offsets outside the block are clamped into it; the block and its note-off
+  // survive, and admission never flips to Error.
+  gPlugin->mReceived.clear();
+  Check(MusicDeviceMIDIEvent(unit, 0x90, 60, 90, 37), "in-block note");
+  Check(MusicDeviceMIDIEvent(unit, 0x80, 60, 0, 5000), "note-off past the block");
+  Check(MusicDeviceMIDIEvent(unit, 0xb0, 64, 0, 0xffffffffu), "offset past INT_MAX");
+  Check(render(), "block with out-of-range offsets");
+  Require(gPlugin->mRequestedAdmission == Admission::Ready, "out-of-range offset failed admission");
+  Require(gPlugin->mReceived.size() == 3, "out-of-range events dropped");
+  Require(gPlugin->mReceived[0].mOffset == 0 && gPlugin->mReceived[0].mStatus == 0xb0 &&
+      gPlugin->mReceived[1].mOffset == 37 && gPlugin->mReceived[1].mStatus == 0x90 &&
+      gPlugin->mReceived[2].mOffset == static_cast<int>(frames) - 1 && gPlugin->mReceived[2].mStatus == 0x80,
+      "out-of-range offsets not clamped into the block");
+  gPlugin->mReceived.clear();
+  Check(render(), "block after clamped offsets");
+  std::puts("PASS: AU clamps out-of-range MIDI offsets into the block without failing it");
+
   UInt32 offline = 1;
   Check(AudioUnitSetProperty(unit, kAudioUnitProperty_OfflineRender,
       kAudioUnitScope_Global, 0, &offline, sizeof(offline)), "offline property");
