@@ -9,6 +9,7 @@
 */
 
 #include <algorithm>
+#include <climits>
 #include <CoreMIDI/CoreMIDI.h>
 
 #include "heapbuf.h"
@@ -1893,7 +1894,7 @@ bool IPlugAU::DispatchRenderEvents(UInt32 nFrames)
     msg.mOffset = std::clamp(msg.mOffset, 0, lastFrame);
   }
   // Stable insertion sort has bounded storage and preserves ties. std::stable_sort
-  // may allocate in an audio callback. Host events keep their original offsets.
+  // may allocate in an audio callback. In-block offsets are never changed.
   for (size_t i = 1; i < count; ++i)
   {
     const auto event = mRenderEventScratch[i];
@@ -2605,7 +2606,9 @@ OSStatus IPlugAU::DoMIDIEvent(IPlugAU* _this, UInt32 inStatus, UInt32 inData1, U
     msg.mStatus = inStatus;
     msg.mData1 = inData1;
     msg.mData2 = inData2;
-    msg.mOffset = inOffsetSampleFrame;
+    // PluginMaker alteration: saturate rather than wrap an offset >= 2^31 negative,
+    // so render clamps it to the block's last frame, not before in-block events.
+    msg.mOffset = static_cast<int>(std::min<UInt32>(inOffsetSampleFrame, INT_MAX));
     if (_this->UsesRenderAdmission())
     {
       if (!_this->mRenderEvents.Push(msg))

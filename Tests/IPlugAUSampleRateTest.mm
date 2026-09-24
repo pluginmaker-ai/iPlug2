@@ -356,10 +356,12 @@ void VerifyAdmission(AudioUnit unit)
   Check(render(), "block with out-of-range offsets");
   Require(gPlugin->mRequestedAdmission == Admission::Ready, "out-of-range offset failed admission");
   Require(gPlugin->mReceived.size() == 3, "out-of-range events dropped");
-  Require(gPlugin->mReceived[0].mOffset == 0 && gPlugin->mReceived[0].mStatus == 0xb0 &&
-      gPlugin->mReceived[1].mOffset == 37 && gPlugin->mReceived[1].mStatus == 0x90 &&
-      gPlugin->mReceived[2].mOffset == static_cast<int>(frames) - 1 && gPlugin->mReceived[2].mStatus == 0x80,
-      "out-of-range offsets not clamped into the block");
+  // Both late events land on the last frame, after the in-block note, in arrival order.
+  const int last = static_cast<int>(frames) - 1;
+  Require(gPlugin->mReceived[0].mOffset == 37 && gPlugin->mReceived[0].mStatus == 0x90 &&
+      gPlugin->mReceived[1].mOffset == last && gPlugin->mReceived[1].mStatus == 0x80 &&
+      gPlugin->mReceived[2].mOffset == last && gPlugin->mReceived[2].mStatus == 0xb0,
+      "out-of-range offsets not clamped to the block's last frame");
   gPlugin->mReceived.clear();
   Check(render(), "block after clamped offsets");
   std::puts("PASS: AU clamps out-of-range MIDI offsets into the block without failing it");
