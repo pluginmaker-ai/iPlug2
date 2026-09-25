@@ -29,6 +29,12 @@ bool gAdmissionTest = false;
 // A generated Song Keys-style name, 63 bytes, with a two-byte "ü" across the
 // 51-byte limit of AudioUnitParameterInfo::name.
 constexpr const char* kLongName = "grand_piano_release_trigger_volume_upper_register_überblendung";
+// An 82-byte current preset name: GetState writes it, SetState must read it back.
+constexpr const char* kLongPresetName = "Grand Piano – warm felt, long release tail, soft pedal noise (Flügel preset) 80";
+// Enum-style display texts longer than the old 32-byte field; the first has a
+// two-byte "ü" across bytes 30-31.
+constexpr const char* kLongLabelHigh = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaü — upper register";
+constexpr const char* kLongLabelLow = "Lower register – soft felt and hammer noise";
 
 void Require(bool condition, const char* message)
 {
@@ -55,8 +61,10 @@ public:
     GetParam(0)->InitDouble("Gain", 0.25, 0., 1., 0.001);
     GetParam(1)->InitDouble("Retired middle", 0.4, 0., 1., 0.001, "", IParam::kFlagInternal);
     GetParam(2)->InitDouble(kLongName, 0.6, 0., 1., 0.001, "dB");
+    GetParam(2)->SetDisplayText(0., kLongLabelLow);
+    GetParam(2)->SetDisplayText(1., kLongLabelHigh);
     GetParam(3)->InitDouble("Retired last", 0.8, 0., 1., 0.001, "", IParam::kFlagInternal);
-    MakeDefaultPreset();
+    MakeDefaultPreset(kLongPresetName, 1);
   }
 
   void OnReset() override
@@ -311,12 +319,111 @@ void VerifyParamNameStorage()
       Require(stored(name, "dB", "Rhodes") == std::make_tuple(name.substr(0, 127), std::string("dB"),
           std::string("Rhodes")), "200-byte name not cut to 127 bytes");
     }},
+    {"display-text-over-31-bytes", [&] {
+      auto param = std::make_unique<IParam>();
+      param->InitEnum("Model", 0, {"Rhodes Mark I stage piano, 1973 edition", "Rhodes Mark II suitcase piano, 1979 edition",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaü — upper register"});
+      Require(std::string(param->GetDisplayText(0)) == "Rhodes Mark I stage piano, 1973 edition"
+          && std::string(param->GetDisplayText(1)) == "Rhodes Mark II suitcase piano, 1979 edition"
+          && std::string(param->GetDisplayText(2)) == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaü — upper register",
+          "long enum labels truncated, collided or overran");
+    }},
     {"name-cut-at-utf8-boundary", [&] {
       const std::string name = std::string(126, 'a') + "\xC3\xBC" + "tail"; // "ü" across byte 127
       Require(std::get<0>(stored(name, "", "")) == std::string(126, 'a'), "UTF-8 character cut in half");
     }},
   });
   std::puts("PASS: IParam stores long names, labels and groups whole, bounded and UTF-8 safe");
+}
+
+CFStringRef MakeCFString(const char* utf8) { return CFStringCreateWithCString(nullptr, utf8, kCFStringEncodingUTF8); }
+
+bool SameCFString(CFStringRef value, const char* utf8)
+{
+  CFStringRef expected = MakeCFString(utf8);
+  const bool same = value && expected && CFStringCompare(value, expected, 0) == kCFCompareEqualTo;
+  if (expected) CFRelease(expected);
+  return same;
+}
+
+// Saved state (ClassInfo) and display strings: a project saved with a long
+// preset reopens, malformed ClassInfo is refused, and every string a host reads
+// is whole, valid UTF-8.
+void VerifyStateAndStrings(AudioUnit unit)
+{
+  auto classInfo = [&] {
+    CFPropertyListRef state = nullptr;
+    UInt32 size = sizeof(state);
+    Check(AudioUnitGetProperty(unit, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0, &state, &size), "read ClassInfo");
+    return state;
+  };
+  auto setClassInfo = [&](CFPropertyListRef state) {
+    return AudioUnitSetProperty(unit, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0, &state, sizeof(state));
+  };
+  RunCases("AU saved state and strings", {
+    {"long-preset-state-round-trip", [&] {
+      CFPropertyListRef state = classInfo();
+      const OSStatus result = setClassInfo(state);
+      CFRelease(state);
+      Check(result, "reopen state saved with a long preset name");
+      AUPreset preset{};
+      UInt32 size = sizeof(preset);
+      Check(AudioUnitGetProperty(unit, kAudioUnitProperty_PresentPreset, kAudioUnitScope_Global, 0, &preset, &size), "present preset");
+      const bool same = SameCFString(preset.presetName, kLongPresetName);
+      if (preset.presetName) CFRelease(preset.presetName);
+      Require(same, "long preset name not restored");
+    }},
+    {"null-class-info", [&] {
+      Require(setClassInfo(nullptr) == kAudioUnitErr_InvalidPropertyValue, "NULL ClassInfo accepted");
+    }},
+    {"non-dictionary-class-info", [&] {
+      Require(setClassInfo(CFSTR("not a dictionary")) == kAudioUnitErr_InvalidPropertyValue, "non-dictionary ClassInfo accepted");
+    }},
+    {"wrong-typed-class-info", [&] {
+      CFPropertyListRef state = classInfo();
+      CFMutableDictionaryRef bad = CFDictionaryCreateMutableCopy(nullptr, 0, static_cast<CFDictionaryRef>(state));
+      CFRelease(state);
+      const int number = 7;
+      CFNumberRef notAName = CFNumberCreate(nullptr, kCFNumberIntType, &number);
+      CFDictionarySetValue(bad, CFSTR(kAUPresetNameKey), notAName);
+      CFRelease(notAName);
+      const OSStatus nameResult = setClassInfo(bad);
+      CFDictionarySetValue(bad, CFSTR(kAUPresetNameKey), CFSTR("Default"));
+      CFDictionarySetValue(bad, CFSTR(kAUPresetDataKey), CFSTR("not data"));
+      const OSStatus dataResult = setClassInfo(bad);
+      CFRelease(bad);
+      Require(nameResult == kAudioUnitErr_InvalidPropertyValue, "number as preset name accepted");
+      Require(dataResult == kAudioUnitErr_InvalidPropertyValue, "string as preset data accepted");
+    }},
+    {"short-name-utf8-cut", [&] {
+      AudioUnitParameterIDName idName{2, 51, nullptr};
+      UInt32 size = sizeof(idName);
+      Check(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterIDName, kAudioUnitScope_Global, 0, &idName, &size),
+          "51-byte short name");
+      const bool cut = SameCFString(idName.outName, std::string(kLongName, 50).c_str());
+      if (idName.outName) CFRelease(idName.outName);
+      Require(cut, "short name through a UTF-8 character not cut before it");
+    }},
+    {"preset-name-over-255-bytes", [&] {
+      const std::string name(300, 'p');
+      gPlugin->ModifyCurrentPreset(name.c_str());
+      const std::string stored = gPlugin->GetPresetName(gPlugin->GetCurrentPresetIdx());
+      gPlugin->ModifyCurrentPreset(kLongPresetName);
+      Require(stored == name.substr(0, MAX_PRESET_NAME_LEN - 1), "300-byte preset name not bounded to its field");
+    }},
+    {"value-strings-utf8", [&] {
+      CFArrayRef strings = nullptr;
+      UInt32 size = sizeof(strings);
+      Check(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterValueStrings, kAudioUnitScope_Global, 2, &strings, &size),
+          "value strings");
+      const bool whole = strings && CFArrayGetCount(strings) == 2
+          && SameCFString(static_cast<CFStringRef>(CFArrayGetValueAtIndex(strings, 0)), kLongLabelLow)
+          && SameCFString(static_cast<CFStringRef>(CFArrayGetValueAtIndex(strings, 1)), kLongLabelHigh);
+      if (strings) CFRelease(strings);
+      Require(whole, "long display texts not delivered whole");
+    }},
+  });
+  std::puts("PASS: AU reopens long-preset state, refuses malformed ClassInfo, delivers whole UTF-8 strings");
 }
 
 // The host sees a long generated name in full; the fixed 52-byte ParameterInfo
@@ -754,6 +861,7 @@ int main()
       VerifyInternalParameters(unit);
       VerifyHostPropertyInputs(unit);
       VerifyLongParameterName(unit);
+      VerifyStateAndStrings(unit);
       std::printf("Testing %s\n", effect ? "effect" : "instrument");
       RunLifecycle(unit);
       if (!effect) VerifyAdmission(unit);

@@ -9,9 +9,10 @@ MidiQueueProbe::MidiQueueProbe(const InstanceInfo& info)
   GetParam(0)->InitDouble("Gain", 1., 0., 1., 0.01);
   GetParam(1)->InitDouble("Retired middle", 0.4, 0., 1., 0.01, "", IParam::kFlagInternal);
   // A 63-byte generated-style name with a non-ASCII character, as hosts must show it.
-  GetParam(2)->InitDouble("grand_piano_release_trigger_volume_upper_register_überblendung", 0.6, 0., 1., 0.01, "dB");
+  GetParam(2)->InitDouble("grand_piano_release_trigger_volume_upper_register_überblendung", 0.6, 0., 1., 0.01, "µs");
+  GetParam(2)->SetDisplayText(0.5, "Flügel – obere Lage");
   GetParam(3)->InitDouble("Retired last", 0.8, 0., 1., 0.01, "", IParam::kFlagInternal);
-  MakeDefaultPreset("Default", 1);
+  MakeDefaultPreset("Flügel – Voreinstellung", 1);
 }
 
 void MidiQueueProbe::OnReset()

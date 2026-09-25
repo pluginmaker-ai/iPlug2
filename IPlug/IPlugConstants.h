@@ -92,7 +92,7 @@ static const int MAX_PRESET_NAME_LEN = 256;
 // them whole (CLAP allows 256, VST3 titles hold 128 UTF-16 units).
 #define MAX_PARAM_NAME_LEN 128 // e.g. "Gain"
 #define MAX_PARAM_LABEL_LEN 128 // e.g. "Percent"
-#define MAX_PARAM_DISPLAY_LEN 32 // e.g. "100" / "Mute"
+#define MAX_PARAM_DISPLAY_LEN 128 // e.g. "100" / "Mute" (PluginMaker alteration: was 32; generated enum labels run longer)
 #define MAX_PARAM_GROUP_LEN 128 // e.g. "oscillator section"
 #define MAX_BUS_NAME_LEN 32 // e.g. "sidechain input"
 #define MAX_CHAN_NAME_LEN 32 // e.g. "input 1"

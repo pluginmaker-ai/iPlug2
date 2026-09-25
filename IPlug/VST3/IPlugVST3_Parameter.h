@@ -52,13 +52,15 @@ public:
   {
     WDL_String display;
     mIPlugParam->GetDisplay(valueNormalized, true, display);
-    Steinberg::UString(string, 128).fromAscii(display.Get());
+    // PluginMaker alteration: decode UTF-8 display text (fromAscii widened each byte).
+    Steinberg::UString(string, 128).assign(UTF8ToUTF16String(display.Get()).c_str());
   }
 
   bool fromString(const Steinberg::Vst::TChar* string, Steinberg::Vst::ParamValue& valueNormalized) const override
   {
-    Steinberg::String str((Steinberg::Vst::TChar*) string);
-    valueNormalized = mIPlugParam->ToNormalized(mIPlugParam->StringToValue(str.text8()));
+    // PluginMaker alteration: encode UTF-8 (text8() narrowed each UTF-16 unit).
+    const std::string utf8 = UTF16ToUTF8String(std::u16string(reinterpret_cast<const char16_t*>(string)));
+    valueNormalized = mIPlugParam->ToNormalized(mIPlugParam->StringToValue(utf8.c_str()));
 
     return true;
   }

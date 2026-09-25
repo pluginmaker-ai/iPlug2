@@ -254,7 +254,9 @@ void IParam::SetDisplayText(double value, const char* str)
   mDisplayTexts.Resize(n + 1);
   DisplayText* pDT = mDisplayTexts.Get() + n;
   pDT->mValue = value;
-  strcpy(pDT->mText, str);
+  // PluginMaker alteration: bounded and UTF-8 safe. A longer label ran into
+  // the next entry and, for the last one, past the heap buffer.
+  CopyUTF8Truncated(pDT->mText, sizeof(pDT->mText), str);
 }
 
 void IParam::SetDisplayPrecision(int precision)

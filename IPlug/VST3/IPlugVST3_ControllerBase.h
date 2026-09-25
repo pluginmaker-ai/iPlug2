@@ -57,7 +57,8 @@ public:
 
       for (int programIdx=0; programIdx<pPlug->NPresets(); programIdx++)
       {
-        Steinberg::UString(programName, str16BufferSize(Steinberg::Vst::String128)).assign(pPlug->GetPresetName(programIdx));
+        // PluginMaker alteration: decode UTF-8 preset and pitch names.
+        Steinberg::UString(programName, str16BufferSize(Steinberg::Vst::String128)).assign(UTF8ToUTF16String(pPlug->GetPresetName(programIdx)).c_str());
         pList->addProgram (programName);
         
         //Set named notes. This could be different per-preset in VST3
@@ -66,7 +67,7 @@ public:
           char pNoteText[32] = "";
           if(pPlug->GetMidiNoteText(pitch, pNoteText))
           {
-            Steinberg::UString(pitchName, str16BufferSize(Steinberg::Vst::String128)).assign(pNoteText);
+            Steinberg::UString(pitchName, str16BufferSize(Steinberg::Vst::String128)).assign(UTF8ToUTF16String(pNoteText).c_str());
             pList->setPitchName(programIdx, pitch, pitchName);
           }
         }
@@ -107,7 +108,7 @@ public:
           unitInfo.id = unitID;
           unitInfo.parentUnitId = Steinberg::Vst::kRootUnitId;
           unitInfo.programListId = Steinberg::Vst::kNoProgramListId;
-          unitNameSetter.fromAscii(paramGroupName);
+          unitNameSetter.assign(UTF8ToUTF16String(paramGroupName).c_str()); // PluginMaker alteration: decode UTF-8
           pEditController->addUnit (new Steinberg::Vst::Unit (unitInfo));
         }
       }
@@ -160,7 +161,8 @@ public:
   {
     if (pPlug->NPresets() && listId == kPresetParam)
     {
-      Steinberg::UString(name, 128).fromAscii(pPlug->GetPresetName(programIndex));
+      // PluginMaker alteration: decode UTF-8 (fromAscii widened each byte).
+      Steinberg::UString(name, 128).assign(UTF8ToUTF16String(pPlug->GetPresetName(programIndex)).c_str());
       return Steinberg::kResultTrue;
     }
 

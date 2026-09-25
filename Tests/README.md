@@ -23,6 +23,11 @@ Parameter names, labels and groups up to 127 bytes are stored whole and cut
 only at a UTF-8 character boundary: the harness checks 34/70/100/200-byte
 names in IParam, the long name an AU host reads, and the VST3 test checks the
 decoded UTF-16 title of a 63-byte non-ASCII name.
+Saved state and strings: an AU ClassInfo saved with an 82-byte preset name
+reopens, NULL / non-dictionary / wrong-typed ClassInfo is refused, a short name
+cut through a UTF-8 character is cut before it, enum labels up to 127 bytes and
+preset names up to 255 bytes are stored whole and bounded, and VST3 units,
+display strings (both directions) and preset names decode UTF-8.
 
 For an optional external-host check, build a new bundle with
 `bash Tests/run-au-sample-rate-tests.sh --bundle /absolute/new/IPlugAURateTest.component`.

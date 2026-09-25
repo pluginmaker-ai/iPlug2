@@ -200,7 +200,7 @@ protected:
   static void PutStrInDict(CFMutableDictionaryRef pDict, const char* key, const char* value);
   static void PutDataInDict(CFMutableDictionaryRef pDict, const char* key, IByteChunk* pChunk);
   static bool GetNumberFromDict(CFDictionaryRef pDict, const char* key, void* pNumber, CFNumberType type);
-  static bool GetStrFromDict(CFDictionaryRef pDict, const char* key, char* value);
+  static bool GetStrFromDict(CFDictionaryRef pDict, const char* key, char* value, size_t valueSize); // PluginMaker alteration: bounded
   static bool GetDataFromDict(CFDictionaryRef pDict, const char* key, IByteChunk* pChunk);
 
 #pragma mark - Specialist Use
