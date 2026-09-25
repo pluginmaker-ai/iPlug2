@@ -51,13 +51,17 @@ private:
 
 struct IPlugAU::CStrLocal : WDL_TypedBuf<char>
 {
+  // PluginMaker alteration: callers pass Get() straight to C string APIs, so it
+  // is never NULL or unterminated. Size for UTF-8 bytes, not characters: a
+  // non-ASCII host string used to fail conversion and leave garbage behind.
   CStrLocal(CFStringRef cfStr)
   {
-    if (cfStr)
-    {
-      Resize((int) CFStringGetLength(cfStr) + 1);
-      CFStringGetCString(cfStr, Get(), GetSize(), kCFStringEncodingUTF8);
-    }
+    const CFIndex maxBytes = cfStr
+        ? CFStringGetMaximumSizeForEncoding(CFStringGetLength(cfStr), kCFStringEncodingUTF8) : 0;
+    Resize((int) std::max<CFIndex>(maxBytes, 0) + 1);
+    Get()[0] = '\0';
+    if (cfStr && !CFStringGetCString(cfStr, Get(), GetSize(), kCFStringEncodingUTF8))
+      Get()[0] = '\0';
   }
 };
 
@@ -249,9 +253,10 @@ OSStatus IPlugAU::IPlugAUEntry(ComponentParameters *params, void* pPlug)
       AudioUnitScope scope = GET_COMP_PARAM(AudioUnitScope, 3, 5);
       AudioUnitElement element = GET_COMP_PARAM(AudioUnitElement, 2, 5);
       const void* pData = GET_COMP_PARAM(const void*, 1, 5);
-      UInt32* pDataSize = GET_COMP_PARAM(UInt32*, 0, 5);
+      // PluginMaker alteration: the size is passed by value, not by pointer.
+      UInt32 dataSize = GET_COMP_PARAM(UInt32, 0, 5);
       
-      return _this->DoSetProperty(_this, propID, scope, element, pData, pDataSize);
+      return _this->DoSetProperty(_this, propID, scope, element, pData, dataSize);
     }
     case kAudioUnitAddPropertyListenerSelect:
     {
@@ -446,6 +451,18 @@ UInt32 IPlugAU::GetChannelLayoutTags(AudioUnitScope scope, AudioUnitElement elem
   }
 }
 
+// PluginMaker alteration: copy a UTF-8 string into a fixed field, dropping a
+// character the limit would cut in half instead of leaving a partial sequence.
+static void CopyUTF8Truncated(char* pDest, size_t destSize, const char* pSrc)
+{
+  const size_t length = strlen(pSrc);
+  size_t end = std::min(length, destSize - 1);
+  // While the first dropped byte continues a character, that character is cut.
+  while (end > 0 && end < length && (static_cast<unsigned char>(pSrc[end]) & 0xC0) == 0x80) --end;
+  memcpy(pDest, pSrc, end);
+  pDest[end] = '\0';
+}
+
 #define ASSERT_SCOPE(reqScope) if (scope != reqScope) { return kAudioUnitErr_InvalidProperty; }
 #define ASSERT_ELEMENT(numElements) if (element >= numElements) { return kAudioUnitErr_InvalidElement; }
 #define ASSERT_INPUT_OR_GLOBAL_SCOPE \
@@ -548,7 +565,8 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
 
         const char* paramName = pParam->GetName();
         pInfo->cfNameString = CFStringCreateWithCString(0, pParam->GetName(), kCFStringEncodingUTF8);
-        strcpy(pInfo->name, paramName);   // Max 52.
+        // PluginMaker alteration: name is a 52-byte field; truncate, never overflow.
+        CopyUTF8Truncated(pInfo->name, sizeof(pInfo->name), paramName);
 
         switch (pParam->Type())
         {
@@ -976,7 +994,9 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
         LEAVE_PARAMS_MUTEX
         if (pIDName->inDesiredLength != kAudioUnitParameterName_Full)
         {
-          int n = std::min<int>(MAX_PARAM_NAME_LEN - 1, pIDName->inDesiredLength);
+          // PluginMaker alteration: clamp the host's length from below too; any
+          // other negative value indexed before the start of cStr.
+          int n = std::clamp<int>(pIDName->inDesiredLength, 0, MAX_PARAM_NAME_LEN - 1);
           cStr[n] = '\0';
         }
         pIDName->outName = CFStringCreateWithCString(0, cStr, kCFStringEncodingUTF8);
@@ -991,7 +1011,9 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
         AudioUnitParameterNameInfo* parameterNameInfo = (AudioUnitParameterNameInfo*) pData;
         int clumpId = parameterNameInfo->inID;
         
-        if (clumpId < 1)
+        // PluginMaker alteration: bound the host's clump ID above as well; an
+        // unknown ID has no group name and must not reach CFStringCreateWithCString.
+        if (clumpId < 1 || clumpId > NParamGroups())
           return kAudioUnitErr_PropertyNotInUse;
         
         parameterNameInfo->outName = CFStringCreateWithCString(0, GetParamGroupName(clumpId-1), kCFStringEncodingUTF8);
@@ -1021,7 +1043,9 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
         AudioUnitParameterStringFromValue* pSFV = (AudioUnitParameterStringFromValue*) pData;
         if (!IsHostParameter(pSFV->inParamID)) return kAudioUnitErr_InvalidParameter;
         ENTER_PARAMS_MUTEX
-        GetParam(pSFV->inParamID)->GetDisplay(*(pSFV->inValue), false, mParamDisplayStr);
+        // PluginMaker alteration: inValue is optional; NULL means the current value.
+        IParam* pParam = GetParam(pSFV->inParamID);
+        pParam->GetDisplay(pSFV->inValue ? *(pSFV->inValue) : pParam->Value(), false, mParamDisplayStr);
         LEAVE_PARAMS_MUTEX
         pSFV->outString = MakeCFString((const char*) mParamDisplayStr.Get());
       }
@@ -1036,6 +1060,8 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
         if (!IsHostParameter(pVFS->inParamID)) return kAudioUnitErr_InvalidParameter;
         if (scope == kAudioUnitScope_Global)
         {
+          // PluginMaker alteration: a value needs a string to parse.
+          if (!pVFS->inString) return kAudioUnitErr_InvalidPropertyValue;
           CStrLocal cStr(pVFS->inString);
           ENTER_PARAMS_MUTEX
           const double v = GetParam(pVFS->inParamID)->StringToValue(cStr.Get());
@@ -1197,7 +1223,9 @@ OSStatus IPlugAU::SetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
       // The connection is OK if the plugin expects the same number of channels as the host is attempting to connect,
       // or if the plugin supports mono channels (meaning it's flexible about how many inputs to expect)
       // and the plugin supports at least as many channels as the host is attempting to connect.
-      bool connectionOK = (nHostChannels > 0);
+      // PluginMaker alteration: a render input BufferList holds at most
+      // AU_MAX_IO_CHANNELS buffers, whatever a wildcard I/O config would allow.
+      bool connectionOK = (nHostChannels > 0 && nHostChannels <= AU_MAX_IO_CHANNELS);
       connectionOK &= CheckLegalIO(scope, element, nHostChannels);
       connectionOK &= (pASBD->mFormatID == kAudioFormatLinearPCM && pASBD->mFormatFlags & kAudioFormatFlagsCanonical);
 
@@ -1279,20 +1307,20 @@ OSStatus IPlugAU::SetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
     //NO_OP(kAudioUnitProperty_ContextName);               // 25,
     case kAudioUnitProperty_ContextName:
     {
+      // PluginMaker alteration: a NULL name clears it, as in Apple's AUBase; the
+      // host's length must not size a stack array, so CStrLocal converts on the heap.
       CFStringRef inStr = *(CFStringRef*) pData;
-      CFIndex bufferSize = CFStringGetLength(inStr) + 1; // The +1 is for having space for the string to be NUL terminated
-      char buffer[bufferSize];
-      if (CFStringGetCString(inStr, buffer, bufferSize, kCFStringEncodingUTF8))
-      {
-          mTrackName.Set(buffer);
-      }
+      mTrackName.Set(inStr ? CStrLocal(inStr).Get() : "");
       return noErr;
     }
     NO_OP(kAudioUnitProperty_RenderQuality);             // 26,
     case kAudioUnitProperty_HostCallbacks:              // 27,
     {
       ASSERT_SCOPE(kAudioUnitScope_Global);
-      memcpy(&mHostCallbacks, pData, sizeof(HostCallbackInfo));
+      // PluginMaker alteration: older hosts pass a shorter HostCallbackInfo;
+      // copy what they sent and leave the newer callbacks NULL.
+      memset(&mHostCallbacks, 0, sizeof(HostCallbackInfo));
+      memcpy(&mHostCallbacks, pData, std::min<size_t>(*pDataSize, sizeof(HostCallbackInfo)));
       return noErr;
     }
     NO_OP(kAudioUnitProperty_InPlaceProcessing);         // 29,
@@ -1577,6 +1605,8 @@ OSStatus IPlugAU::GetParamProc(void* pPlug, AudioUnitParameterID paramID, AudioU
   Trace(TRACELOC, "%d:(%d:%s):%d", paramID, scope, AUScopeStr(scope), element);
 
   ASSERT_SCOPE(kAudioUnitScope_Global);
+  // PluginMaker alteration: this is also the fast-dispatch GetParameter entry.
+  if (!pValue) return kAudio_ParamError;
   IPlugAU* _this = (IPlugAU*) pPlug;
   assert(_this != NULL);
   if (!_this->IsHostParameter(paramID)) return kAudioUnitErr_InvalidParameter;
@@ -1626,10 +1656,15 @@ OSStatus IPlugAU::RenderProc(void* pPlug, AudioUnitRenderActionFlags* pFlags, co
   
   _this->mLastRenderTimeStamp = *pTimestamp;
 
-  if (!(pTimestamp->mFlags & kAudioTimeStampSampleTimeValid) /*|| outputBusIdx >= _this->mOutBuses.GetSize()*/ || nFrames > _this->GetBlockSize())
+  if (!(pTimestamp->mFlags & kAudioTimeStampSampleTimeValid) || nFrames > _this->GetBlockSize())
   {
     return kAudioUnitErr_InvalidPropertyValue;
   }
+
+  // PluginMaker alteration: bound the host's bus on every path, not only under
+  // render admission; an unknown bus used to be a NULL BusChannels below.
+  if (outputBusIdx >= static_cast<UInt32>(_this->mOutBuses.GetSize()))
+    return kAudioUnitErr_InvalidElement;
 
   if (_this->UsesRenderAdmission())
   {
@@ -1708,6 +1743,11 @@ OSStatus IPlugAU::RenderProc(void* pPlug, AudioUnitRenderActionFlags* pFlags, co
 
         if (pInBus->mConnected)
         {
+          // PluginMaker alteration: every host channel needs input scratch and a
+          // BufferList slot; a wider connection is refused, not indexed past them.
+          const int inputCapacity = _this->MaxNChannels(ERoute::kInput) - pInBus->mPlugChannelStartIdx;
+          if (pInBus->mNHostChannels > std::min(inputCapacity, AU_MAX_IO_CHANNELS))
+            return kAudioUnitErr_InvalidPropertyValue;
           pInBufList->mNumberBuffers = pInBus->mNHostChannels;
 
           for (int b = 0; b < pInBufList->mNumberBuffers; ++b)
@@ -1765,6 +1805,18 @@ OSStatus IPlugAU::RenderProc(void* pPlug, AudioUnitRenderActionFlags* pFlags, co
   
     BusChannels* pOutBus = _this->mOutBuses.Get(outputBusIdx);
 
+    // PluginMaker alteration: host buffers past the plug-in's output channels get
+    // no scratch (it holds MaxNChannels(kOutput) channels). They are cleared, and
+    // one without data is refused instead of pointed past the scratch buffer.
+    const int outputCapacity = std::max(_this->MaxNChannels(ERoute::kOutput) - pOutBus->mPlugChannelStartIdx, 0);
+    const UInt32 nAttached = std::min<UInt32>(pOutBufList->mNumberBuffers, outputCapacity);
+    for (UInt32 c = nAttached; c < pOutBufList->mNumberBuffers; ++c)
+    {
+      if (!pOutBufList->mBuffers[c].mData)
+        return kAudioUnitErr_InvalidPropertyValue;
+      memset(pOutBufList->mBuffers[c].mData, 0, pOutBufList->mBuffers[c].mDataByteSize);
+    }
+
     // if this bus is not connected OR the number of buffers that the host has given are not equal to the number the bus expects
     if (!(pOutBus->mConnected) || pOutBus->mNHostChannels != pOutBufList->mNumberBuffers)
     {
@@ -1778,7 +1830,7 @@ OSStatus IPlugAU::RenderProc(void* pPlug, AudioUnitRenderActionFlags* pFlags, co
       pOutBus->mConnected = true;
     }
 
-    for (int c = 0, chIdx = pOutBus->mPlugChannelStartIdx; c < pOutBufList->mNumberBuffers; ++c, ++chIdx)
+    for (int c = 0, chIdx = pOutBus->mPlugChannelStartIdx; c < static_cast<int>(nAttached); ++c, ++chIdx)
     {
       if (!(pOutBufList->mBuffers[c].mData)) // Downstream unit didn't give us buffers.
         pOutBufList->mBuffers[c].mData = _this->mOutScratchBuf.Get() + chIdx * nFrames;
@@ -2287,7 +2339,7 @@ OSStatus IPlugAU::AUMethodGetProperty(void* pSelf, AudioUnitPropertyID inID, Aud
 }
 
 //static
-OSStatus IPlugAU::AUMethodSetProperty(void* pSelf, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void* inData, UInt32* inDataSize)
+OSStatus IPlugAU::AUMethodSetProperty(void* pSelf, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void* inData, UInt32 inDataSize)
 {
   return DoSetProperty(GetPlug(pSelf), inID, inScope, inElement, inData, inDataSize);
 }
@@ -2436,25 +2488,69 @@ OSStatus IPlugAU::DoGetPropertyInfo(IPlugAU* _this, AudioUnitPropertyID prop, Au
 //static
 OSStatus IPlugAU::DoGetProperty(IPlugAU* _this, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, void* outData, UInt32 *ioDataSize)
 {
-  UInt32 dataSize = 0;
-  
-  if (!ioDataSize)
-    ioDataSize = &dataSize;
-  
+  // PluginMaker alteration: GetProperty writes the whole property. Like Apple's
+  // AUPlugInDispatch, fill a temporary when the host's buffer is smaller and
+  // copy back only what fits, instead of writing past the host's buffer.
+  if (!ioDataSize) return kAudio_ParamError;
   Boolean writeable = false;
-  
-  return _this->GetProperty(inID, inScope, inElement, ioDataSize, &writeable, outData);
+  if (!outData) return _this->GetProperty(inID, inScope, inElement, ioDataSize, &writeable, 0);
+
+  const UInt32 hostSize = *ioDataSize;
+  if (!hostSize) return kAudio_ParamError;
+  UInt32 propertySize = 0;
+  _this->GetProperty(inID, inScope, inElement, &propertySize, &writeable, 0);
+  if (propertySize <= hostSize)
+    return _this->GetProperty(inID, inScope, inElement, ioDataSize, &writeable, outData);
+
+  // In/out properties carry their input fields in the host's buffer.
+  WDL_TypedBuf<UInt8> property;
+  property.Resize(propertySize);
+  memset(property.Get(), 0, propertySize);
+  memcpy(property.Get(), outData, hostSize);
+  const OSStatus result = _this->GetProperty(inID, inScope, inElement, &propertySize, &writeable, property.Get());
+  if (result == noErr) memcpy(outData, property.Get(), hostSize);
+  return result;
+}
+
+// PluginMaker alteration: the smallest value each settable property reads.
+static UInt32 MinimumSetPropertySize(AudioUnitPropertyID propID)
+{
+  switch (propID)
+  {
+    case kAudioUnitProperty_ClassInfo:             return sizeof(CFPropertyListRef);
+    case kAudioUnitProperty_MakeConnection:        return sizeof(AudioUnitConnection);
+    case kAudioUnitProperty_SampleRate:            return sizeof(Float64);
+    case kAudioUnitProperty_StreamFormat:          return sizeof(AudioStreamBasicDescription);
+    case kAudioUnitProperty_MaximumFramesPerSlice: return sizeof(UInt32);
+    case kAudioUnitProperty_BypassEffect:          return sizeof(UInt32);
+    case kAudioUnitProperty_SetRenderCallback:     return sizeof(AURenderCallbackStruct);
+    case kAudioUnitProperty_ContextName:           return sizeof(CFStringRef);
+    case kAudioUnitProperty_HostCallbacks:         return sizeof(void*);
+    case kAudioUnitProperty_CurrentPreset:
+    case kAudioUnitProperty_PresentPreset:         return sizeof(AUPreset);
+    case kAudioUnitProperty_OfflineRender:         return sizeof(UInt32);
+    case kAudioUnitProperty_AUHostIdentifier:      return sizeof(AUHostIdentifier);
+    case kAudioUnitProperty_MIDIOutputCallback:    return sizeof(AUMIDIOutputCallbackStruct);
+    default:                                       return 0;
+  }
 }
 
 //static
-OSStatus IPlugAU::DoSetProperty(IPlugAU* _this, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void* inData, UInt32* inDataSize)
+OSStatus IPlugAU::DoSetProperty(IPlugAU* _this, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void* inData, UInt32 inDataSize)
 {
-  return _this->SetProperty(inID, inScope, inElement, inDataSize, inData);
+  // PluginMaker alteration: every SetProperty case reads its value through
+  // inData. A missing value, or one smaller than the property's type, is
+  // refused here rather than read past, as Apple's AUBase does per property.
+  if (!inData) return kAudio_ParamError;
+  if (inDataSize < MinimumSetPropertySize(inID)) return kAudioUnitErr_InvalidPropertyValue;
+  return _this->SetProperty(inID, inScope, inElement, &inDataSize, inData);
 }
 
 //static
 OSStatus IPlugAU::DoAddPropertyListener(IPlugAU* _this, AudioUnitPropertyID prop, AudioUnitPropertyListenerProc proc, void* userData)
 {
+  // PluginMaker alteration: a NULL listener would be called on the next change.
+  if (!proc) return kAudio_ParamError;
   PropertyListener listener;
   listener.mPropID = prop;
   listener.mListenerProc = proc;
@@ -2515,6 +2611,8 @@ OSStatus IPlugAU::DoRemovePropertyListenerWithUserData(IPlugAU* _this, AudioUnit
 //static
 OSStatus IPlugAU::DoAddRenderNotify(IPlugAU* _this, AURenderCallback proc, void* userData)
 {
+  // PluginMaker alteration: a NULL notification would be called on every render.
+  if (!proc) return kAudio_ParamError;
   AURenderCallbackStruct acs;
   acs.inputProc = proc;
   acs.inputProcRefCon = userData;
@@ -2561,6 +2659,8 @@ OSStatus IPlugAU::DoSetParameter(IPlugAU* _this, AudioUnitParameterID param, Aud
 //static
 OSStatus IPlugAU::DoScheduleParameters(IPlugAU* _this, const AudioUnitParameterEvent *pEvent, UInt32 nEvents)
 {
+  // PluginMaker alteration: events without an array are refused.
+  if (nEvents && !pEvent) return kAudio_ParamError;
   //mutex locked below
   for (int i = 0; i < nEvents; ++i, ++pEvent)
   {
@@ -2628,6 +2728,8 @@ OSStatus IPlugAU::DoMIDIEvent(IPlugAU* _this, UInt32 inStatus, UInt32 inData1, U
 //static
 OSStatus IPlugAU::DoSysEx(IPlugAU* _this, const UInt8* inData, UInt32 inLength)
 {
+  // PluginMaker alteration: ProcessSysEx reads inData for mSize (an int) bytes.
+  if (!inData || inLength > static_cast<UInt32>(INT_MAX)) return kAudio_ParamError;
   if(_this->DoesMIDIIn())
   {
     ISysEx sysex;

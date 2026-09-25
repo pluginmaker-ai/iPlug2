@@ -158,7 +158,8 @@ private:
   static OSStatus AUMethodUninitialize(void* pSelf);
   static OSStatus AUMethodGetPropertyInfo(void* pSelf, AudioUnitPropertyID prop, AudioUnitScope scope, AudioUnitElement elem, UInt32* pOutDataSize, Boolean* pOutWritable);
   static OSStatus AUMethodGetProperty(void* pSelf, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, void* pOutData, UInt32* pIODataSize);
-  static OSStatus AUMethodSetProperty(void* pSelf, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void* pInData, UInt32* pInDataSize);
+  // PluginMaker alteration: inDataSize is a value, as in Apple's AudioUnitSetPropertyProc.
+  static OSStatus AUMethodSetProperty(void* pSelf, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void* pInData, UInt32 inDataSize);
   static OSStatus AUMethodAddPropertyListener(void* pSelf, AudioUnitPropertyID prop, AudioUnitPropertyListenerProc proc, void* pUserData);
   static OSStatus AUMethodRemovePropertyListener(void* pSelf, AudioUnitPropertyID prop, AudioUnitPropertyListenerProc proc);
   static OSStatus AUMethodRemovePropertyListenerWithUserData(void* pSelf, AudioUnitPropertyID prop, AudioUnitPropertyListenerProc proc, void* pUserData);
@@ -177,7 +178,7 @@ private:
   static OSStatus DoUninitialize(IPlugAU* pPlug);
   static OSStatus DoGetPropertyInfo(IPlugAU* pPlug, AudioUnitPropertyID prop, AudioUnitScope scope, AudioUnitElement elem, UInt32 *pOutDataSize, Boolean* pOutWritable);
   static OSStatus DoGetProperty(IPlugAU* pPlug, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, void *pOutData, UInt32* pIODataSize);
-  static OSStatus DoSetProperty(IPlugAU* pPlug, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void* pInData, UInt32* pInDataSize);
+  static OSStatus DoSetProperty(IPlugAU* pPlug, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void* pInData, UInt32 inDataSize);
   static OSStatus DoAddPropertyListener(IPlugAU* pPlug, AudioUnitPropertyID prop, AudioUnitPropertyListenerProc proc, void* pUserData);
   static OSStatus DoRemovePropertyListener(IPlugAU* pPlug, AudioUnitPropertyID prop, AudioUnitPropertyListenerProc proc);
   static OSStatus DoRemovePropertyListenerWithUserData(IPlugAU* pPlug, AudioUnitPropertyID prop, AudioUnitPropertyListenerProc proc, void* pUserData);

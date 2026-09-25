@@ -1,6 +1,9 @@
 #include <AudioToolbox/AudioToolbox.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <cstdlib>
+#include <functional>
 #include <iterator>
 #include <cstdio>
 #include <stdexcept>
@@ -236,6 +239,178 @@ void VerifyInternalParameters(AudioUnit unit)
   std::puts("PASS: sparse AU IDs, rejected obsolete automation, compatible legacy state");
 }
 
+void NoteListener(void*, AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement) {}
+
+struct HostInputCase
+{
+  const char* name;
+  std::function<void()> run;
+};
+
+// Each case runs on its own so one refusal cannot hide another. The name is
+// printed before the case runs, so a crash still names it. Set
+// IPLUG_AU_ONLY_CASE=<name> to run a single case.
+int gCasesRun = 0;
+
+void RunCases(const char* suite, std::initializer_list<HostInputCase> cases)
+{
+  const char* only = std::getenv("IPLUG_AU_ONLY_CASE");
+  int failed = 0;
+  for (const auto& hostCase : cases)
+  {
+    if (only && std::strcmp(only, hostCase.name) != 0) continue;
+    ++gCasesRun;
+    std::printf("  case %s\n", hostCase.name);
+    std::fflush(stdout);
+    try { hostCase.run(); }
+    catch (const std::exception& error)
+    {
+      ++failed;
+      std::printf("  FAIL %s: %s\n", hostCase.name, error.what());
+    }
+  }
+  std::fflush(stdout);
+  Require(failed == 0, suite);
+}
+
+// Host-supplied pointers, sizes and indices outside what each property expects:
+// every call must be refused or clamped, never crash or write past the host's data.
+void VerifyHostPropertyInputs(AudioUnit unit)
+{
+  RunCases("AU host property input", {
+    {"short-get-buffer", [&] {
+      struct { AudioUnitParameterID first; UInt32 guard; } shortList{0, 0xfeedfacf};
+      UInt32 size = sizeof(shortList.first);
+      Check(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterList, kAudioUnitScope_Global, 0,
+          &shortList, &size), "short parameter list");
+      Require(shortList.guard == 0xfeedfacf, "GetProperty wrote past the host's buffer");
+      Require(size == sizeof(shortList.first) && shortList.first == 0, "short parameter list contents");
+    }},
+    {"negative-name-length", [&] {
+      AudioUnitParameterIDName idName{0, -5, nullptr};
+      UInt32 size = sizeof(idName);
+      Check(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterIDName, kAudioUnitScope_Global, 0,
+          &idName, &size), "negative desired name length");
+      const bool empty = idName.outName && CFStringGetLength(idName.outName) == 0;
+      if (idName.outName) CFRelease(idName.outName);
+      Require(empty, "negative name length not clamped to empty");
+    }},
+    {"unknown-clump", [&] {
+      AudioUnitParameterNameInfo clump{1, kAudioUnitParameterName_Full, nullptr};
+      UInt32 size = sizeof(clump);
+      Require(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterClumpName, kAudioUnitScope_Global, 0,
+          &clump, &size) == kAudioUnitErr_PropertyNotInUse, "unknown clump ID accepted");
+    }},
+    {"string-from-current-value", [&] {
+      AudioUnitParameterStringFromValue fromValue{0, nullptr, nullptr};
+      UInt32 size = sizeof(fromValue);
+      Check(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterStringFromValue, kAudioUnitScope_Global, 0,
+          &fromValue, &size), "string for the current value");
+      Require(fromValue.outString != nullptr, "no string for the current value");
+      CFRelease(fromValue.outString);
+    }},
+    {"value-from-null-string", [&] {
+      AudioUnitParameterValueFromString fromString{0, nullptr, 0};
+      UInt32 size = sizeof(fromString);
+      Require(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterValueFromString, kAudioUnitScope_Global, 0,
+          &fromString, &size) == kAudioUnitErr_InvalidPropertyValue, "value from a NULL string accepted");
+    }},
+    {"null-set-value", [&] {
+      Require(AudioUnitSetProperty(unit, kAudioUnitProperty_SampleRate, kAudioUnitScope_Global, 0, nullptr, 0) != noErr,
+          "NULL property value accepted");
+    }},
+    {"short-set-value", [&] {
+      Float64 rate = 0, unchanged = 0;
+      UInt32 size = sizeof(rate);
+      Check(AudioUnitGetProperty(unit, kAudioUnitProperty_SampleRate, kAudioUnitScope_Global, 0, &rate, &size), "read rate");
+      const UInt32 shortRate = 22050;
+      Require(AudioUnitSetProperty(unit, kAudioUnitProperty_SampleRate, kAudioUnitScope_Global, 0, &shortRate,
+          sizeof(shortRate)) == kAudioUnitErr_InvalidPropertyValue, "short property value accepted");
+      size = sizeof(unchanged);
+      Check(AudioUnitGetProperty(unit, kAudioUnitProperty_SampleRate, kAudioUnitScope_Global, 0, &unchanged, &size), "reread rate");
+      Require(unchanged == rate, "short property value changed the sample rate");
+    }},
+    {"null-context-name", [&] {
+      CFStringRef before = CFSTR("Before"), noName = nullptr;
+      Check(AudioUnitSetProperty(unit, kAudioUnitProperty_ContextName, kAudioUnitScope_Global, 0, &before,
+          sizeof(before)), "context name");
+      Check(AudioUnitSetProperty(unit, kAudioUnitProperty_ContextName, kAudioUnitScope_Global, 0, &noName,
+          sizeof(noName)), "NULL context name");
+      WDL_String stored;
+      gPlugin->GetTrackName(stored);
+      Require(stored.GetLength() == 0, "NULL context name did not clear the name");
+    }},
+    {"non-ascii-context-name", [&] {
+      CFStringRef trackName = CFSTR("Flügel – Spur 1");
+      Check(AudioUnitSetProperty(unit, kAudioUnitProperty_ContextName, kAudioUnitScope_Global, 0, &trackName,
+          sizeof(trackName)), "non-ASCII context name");
+      WDL_String stored;
+      gPlugin->GetTrackName(stored);
+      Require(std::strcmp(stored.Get(), "Flügel – Spur 1") == 0, "non-ASCII context name lost");
+    }},
+    {"nameless-host-identifier", [&] {
+      AUHostIdentifier hostID{};
+      Check(AudioUnitSetProperty(unit, kAudioUnitProperty_AUHostIdentifier, kAudioUnitScope_Global, 0, &hostID,
+          sizeof(hostID)), "host identifier without a name");
+    }},
+    {"null-parameter-value", [&] {
+      AudioUnitParameterValue value = 0;
+      Require(AudioUnitGetParameter(unit, 0, kAudioUnitScope_Global, 0, nullptr) != noErr, "NULL parameter value accepted");
+      Check(AudioUnitGetParameter(unit, 0, kAudioUnitScope_Global, 0, &value), "parameter read after NULL");
+    }},
+    {"null-scheduled-events", [&] {
+      Require(AudioUnitScheduleParameters(unit, nullptr, 1) != noErr, "NULL scheduled events accepted");
+    }},
+    {"null-render-notify", [&] {
+      Require(AudioUnitAddRenderNotify(unit, nullptr, nullptr) != noErr, "NULL render notification accepted");
+    }},
+    {"null-property-listener", [&] {
+      Require(AudioUnitAddPropertyListener(unit, kAudioUnitProperty_Latency, nullptr, nullptr) != noErr,
+          "NULL property listener accepted");
+      Check(AudioUnitAddPropertyListener(unit, kAudioUnitProperty_Latency, NoteListener, nullptr), "real listener");
+    }},
+    {"sysex-without-data", [&] {
+      if (!gEffect) Require(MusicDeviceSysEx(unit, nullptr, 4) != noErr, "SysEx without data accepted");
+    }},
+  });
+  std::puts("PASS: AU properties, parameters and callbacks refuse NULL, short and out-of-range host input");
+}
+
+// Render calls naming a missing bus, or more buffers than the plug-in has
+// output channels, are refused or cleared instead of reaching unowned memory.
+void VerifyRenderBounds(AudioUnit unit, double& sampleTime)
+{
+  constexpr UInt32 frames = 256;
+  std::vector<float> left(frames), right(frames), extra(frames, 1.f);
+  struct { UInt32 count; AudioBuffer buffers[3]; } three{
+    3, {{1, frames * sizeof(float), left.data()}, {1, frames * sizeof(float), right.data()},
+        {1, frames * sizeof(float), extra.data()}}};
+  auto render = [&](UInt32 bus) {
+    AudioTimeStamp time{};
+    time.mFlags = kAudioTimeStampSampleTimeValid;
+    time.mSampleTime = sampleTime;
+    sampleTime += frames;
+    AudioUnitRenderActionFlags flags = 0;
+    return AudioUnitRender(unit, &flags, &time, bus, frames, reinterpret_cast<AudioBufferList*>(&three));
+  };
+  RunCases("AU render bounds", {
+    {"unknown-output-bus", [&] {
+      Require(render(7) == kAudioUnitErr_InvalidElement, "unknown output bus accepted");
+    }},
+    {"extra-host-buffer", [&] {
+      std::fill(extra.begin(), extra.end(), 1.f);
+      three.buffers[2].mData = extra.data();
+      Check(render(0), "more host buffers than output channels");
+      for (float sample : extra) Require(sample == 0.f, "extra host buffer not cleared");
+    }},
+    {"extra-buffer-without-data", [&] {
+      three.buffers[2].mData = nullptr;
+      Require(render(0) == kAudioUnitErr_InvalidPropertyValue, "extra buffer without data pointed at scratch");
+    }},
+  });
+  std::puts("PASS: AU render refuses unknown buses and extra buffers without data, clears extra host buffers");
+}
+
 void VerifyTone(AudioUnit unit, double rate, double& sampleTime)
 {
   Require(gPlugin->mDSPRate == rate, "DSP configuration is stale");
@@ -431,6 +606,7 @@ void RunLifecycle(AudioUnit unit)
   Require(gPlugin->mRateAtActivation == 48000., "activation preceded DSP configuration");
   double sampleTime = 0.;
   VerifyTone(unit, 48000., sampleTime);
+  VerifyRenderBounds(unit, sampleTime);
 
   for (double rate : {44100., 96000., 48000., 44100., 48000.})
   {
@@ -497,12 +673,15 @@ int main()
       Require(component != nullptr, "register component");
       Check(AudioComponentInstanceNew(component, &unit), "create instance");
       VerifyInternalParameters(unit);
+      VerifyHostPropertyInputs(unit);
       std::printf("Testing %s\n", effect ? "effect" : "instrument");
       RunLifecycle(unit);
       if (!effect) VerifyAdmission(unit);
       Check(AudioComponentInstanceDispose(unit), "dispose instance");
       unit = nullptr;
     }
+    const char* only = std::getenv("IPLUG_AU_ONLY_CASE");
+    Require(!only || gCasesRun > 0, "IPLUG_AU_ONLY_CASE names no case");
     std::puts("RESULT: pass — real AU lifecycle, pitch, parameters, stereo and rejected formats");
     return 0;
   }

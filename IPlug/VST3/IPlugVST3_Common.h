@@ -24,6 +24,8 @@ struct IPlugVST3State
   template <class T>
   static bool GetState(T* pPlug, Steinberg::IBStream* pState)
   {
+    // PluginMaker alteration: no stream, no state.
+    if (!pState) return false;
     IByteChunk chunk;
     
     // TODO: IPlugVer should be in chunk!
@@ -50,6 +52,8 @@ struct IPlugVST3State
   static bool SetState(T* pPlug, Steinberg::IBStream* pState)
   {
     TRACE
+    // PluginMaker alteration: no stream, no state.
+    if (!pState) return false;
     
     IByteChunk chunk;
     
