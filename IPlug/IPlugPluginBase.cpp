@@ -286,7 +286,7 @@ void IPluginBase::MakeDefaultPreset(const char* name, int nPresets)
     if (pPreset)
     {
       pPreset->mInitialized = true;
-      strcpy(pPreset->mName, (name ? name : "Empty"));
+      CopyUTF8Truncated(pPreset->mName, sizeof(pPreset->mName), (name ? name : "Empty")); // PluginMaker alteration: bounded
       SerializeState(pPreset->mChunk);
     }
   }
@@ -298,7 +298,7 @@ void IPluginBase::MakePreset(const char* name, ...)
   if (pPreset)
   {
     pPreset->mInitialized = true;
-    strcpy(pPreset->mName, name);
+    CopyUTF8Truncated(pPreset->mName, sizeof(pPreset->mName), name); // PluginMaker alteration: bounded
     
     int i, n = NParams();
     
@@ -320,7 +320,7 @@ void IPluginBase::MakePresetFromNamedParams(const char* name, int nParamsNamed, 
   if (pPreset)
   {
     pPreset->mInitialized = true;
-    strcpy(pPreset->mName, name);
+    CopyUTF8Truncated(pPreset->mName, sizeof(pPreset->mName), name); // PluginMaker alteration: bounded
     
     int i = 0, n = NParams();
     
@@ -362,7 +362,7 @@ void IPluginBase::MakePresetFromChunk(const char* name, IByteChunk& chunk)
   if (pPreset)
   {
     pPreset->mInitialized = true;
-    strcpy(pPreset->mName, name);
+    CopyUTF8Truncated(pPreset->mName, sizeof(pPreset->mName), name); // PluginMaker alteration: bounded
     
     pPreset->mChunk.PutChunk(&chunk);
   }
@@ -484,7 +484,7 @@ void IPluginBase::ModifyCurrentPreset(const char* name)
     
     if (CStringHasContents(name))
     {
-      strcpy(pPreset->mName, name);
+      CopyUTF8Truncated(pPreset->mName, sizeof(pPreset->mName), name); // PluginMaker alteration: bounded
     }
   }
 }
@@ -519,7 +519,7 @@ int IPluginBase::UnserializePresets(const IByteChunk& chunk, int startPos)
   {
     IPreset* pPreset = mPresets.Get(i);
     pos = chunk.GetStr(name, pos);
-    strcpy(pPreset->mName, name.Get());
+    CopyUTF8Truncated(pPreset->mName, sizeof(pPreset->mName), name.Get()); // PluginMaker alteration: names from saved state are bounded
     
     Trace(TRACELOC, "%d %s", i, pPreset->mName);
     
@@ -666,7 +666,7 @@ bool IPluginBase::SavePresetAsFXP(const char* file) const
     int32_t numParams = WDL_bswap32(NParams());
     char prgName[28];
     memset(prgName, 0, 28);
-    strcpy(prgName, GetPresetName(GetCurrentPresetIdx()));
+    CopyUTF8Truncated(prgName, sizeof(prgName), GetPresetName(GetCurrentPresetIdx())); // PluginMaker alteration: bounded
     
     pgm.Put(&chunkMagic);
     
@@ -791,7 +791,7 @@ bool IPluginBase::SaveBankAsFXB(const char* file) const
         
         char prgName[28];
         memset(prgName, 0, 28);
-        strcpy(prgName, pPreset->mName);
+        CopyUTF8Truncated(prgName, sizeof(prgName), pPreset->mName); // PluginMaker alteration: bounded
         
         bnk.Put(&chunkMagic);
         //byteSize = WDL_bswap32(20 + 28 + (NParams() * 4) );

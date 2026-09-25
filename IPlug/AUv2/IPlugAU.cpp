@@ -90,11 +90,13 @@ inline void IPlugAU::PutDataInDict(CFMutableDictionaryRef pDict, const char* key
   CFRelease(pData);
 }
 
+// PluginMaker alteration: a saved ClassInfo comes from the host, so each value
+// is type-checked before it is read as a number, string or data.
 inline bool IPlugAU::GetNumberFromDict(CFDictionaryRef pDict, const char* key, void* pNumber, CFNumberType type)
 {
   CFStrLocal cfKey(key);
   CFNumberRef pValue = (CFNumberRef) CFDictionaryGetValue(pDict, cfKey.Get());
-  if (pValue)
+  if (pValue && CFGetTypeID(pValue) == CFNumberGetTypeID())
   {
     CFNumberGetValue(pValue, type, pNumber);
     return true;
@@ -102,14 +104,14 @@ inline bool IPlugAU::GetNumberFromDict(CFDictionaryRef pDict, const char* key, v
   return false;
 }
 
-inline bool IPlugAU::GetStrFromDict(CFDictionaryRef pDict, const char* key, char* value)
+inline bool IPlugAU::GetStrFromDict(CFDictionaryRef pDict, const char* key, char* value, size_t valueSize)
 {
   CFStrLocal cfKey(key);
   CFStringRef pValue = (CFStringRef) CFDictionaryGetValue(pDict, cfKey.Get());
-  if (pValue)
+  if (pValue && CFGetTypeID(pValue) == CFStringGetTypeID())
   {
     CStrLocal cStr(pValue);
-    strcpy(value, cStr.Get());
+    CopyUTF8Truncated(value, valueSize, cStr.Get());
     return true;
   }
   value[0] = '\0';
@@ -120,7 +122,7 @@ inline bool IPlugAU::GetDataFromDict(CFDictionaryRef pDict, const char* key, IBy
 {
   CFStrLocal cfKey(key);
   CFDataRef pData = (CFDataRef) CFDictionaryGetValue(pDict, cfKey.Get());
-  if (pData)
+  if (pData && CFGetTypeID(pData) == CFDataGetTypeID())
   {
     CFIndex n = CFDataGetLength(pData);
     pChunk->Resize((int) n);
@@ -449,18 +451,6 @@ UInt32 IPlugAU::GetChannelLayoutTags(AudioUnitScope scope, AudioUnitElement elem
     default:
       return 0;
   }
-}
-
-// PluginMaker alteration: copy a UTF-8 string into a fixed field, dropping a
-// character the limit would cut in half instead of leaving a partial sequence.
-static void CopyUTF8Truncated(char* pDest, size_t destSize, const char* pSrc)
-{
-  const size_t length = strlen(pSrc);
-  size_t end = std::min(length, destSize - 1);
-  // While the first dropped byte continues a character, that character is cut.
-  while (end > 0 && end < length && (static_cast<unsigned char>(pSrc[end]) & 0xC0) == 0x80) --end;
-  memcpy(pDest, pSrc, end);
-  pDest[end] = '\0';
 }
 
 #define ASSERT_SCOPE(reqScope) if (scope != reqScope) { return kAudioUnitErr_InvalidProperty; }
@@ -989,16 +979,15 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
         AudioUnitParameterIDName* pIDName = (AudioUnitParameterIDName*) pData;
         if (!IsHostParameter(pIDName->inID)) return kAudioUnitErr_InvalidParameter;
         char cStr[MAX_PARAM_NAME_LEN];
-        ENTER_PARAMS_MUTEX
-        strcpy(cStr, GetParam(pIDName->inID)->GetName());
-        LEAVE_PARAMS_MUTEX
+        // PluginMaker alteration: clamp the host's length from below too (any
+        // other negative value indexed before the start of cStr), and cut at a
+        // UTF-8 character boundary: a cut character made outName NULL.
+        size_t size = sizeof(cStr);
         if (pIDName->inDesiredLength != kAudioUnitParameterName_Full)
-        {
-          // PluginMaker alteration: clamp the host's length from below too; any
-          // other negative value indexed before the start of cStr.
-          int n = std::clamp<int>(pIDName->inDesiredLength, 0, MAX_PARAM_NAME_LEN - 1);
-          cStr[n] = '\0';
-        }
+          size = static_cast<size_t>(std::clamp<int>(pIDName->inDesiredLength, 0, MAX_PARAM_NAME_LEN - 1)) + 1;
+        ENTER_PARAMS_MUTEX
+        CopyUTF8Truncated(cStr, size, GetParam(pIDName->inID)->GetName());
+        LEAVE_PARAMS_MUTEX
         pIDName->outName = CFStringCreateWithCString(0, cStr, kCFStringEncodingUTF8);
       }
       return noErr;
@@ -1521,14 +1510,20 @@ OSStatus IPlugAU::GetState(CFPropertyListRef* ppPropList)
 
 OSStatus IPlugAU::SetState(CFPropertyListRef pPropList)
 {
+  // PluginMaker alteration: refuse a missing or non-dictionary ClassInfo, as
+  // Apple's AUBase does, and read the preset name into a buffer as large as
+  // any preset name GetState writes (a 64-byte one overflowed and aborted
+  // the host when a project saved with a long preset reopened).
+  if (!pPropList || CFGetTypeID(pPropList) != CFDictionaryGetTypeID())
+    return kAudioUnitErr_InvalidPropertyValue;
   CFDictionaryRef pDict = (CFDictionaryRef) pPropList;
   int version, type, subtype, mfr;
-  char presetName[64];
+  char presetName[MAX_PRESET_NAME_LEN];
   if (!GetNumberFromDict(pDict, kAUPresetVersionKey, &version, kCFNumberSInt32Type) ||
       !GetNumberFromDict(pDict, kAUPresetTypeKey, &type, kCFNumberSInt32Type) ||
       !GetNumberFromDict(pDict, kAUPresetSubtypeKey, &subtype, kCFNumberSInt32Type) ||
       !GetNumberFromDict(pDict, kAUPresetManufacturerKey, &mfr, kCFNumberSInt32Type) ||
-      !GetStrFromDict(pDict, kAUPresetNameKey, presetName) ||
+      !GetStrFromDict(pDict, kAUPresetNameKey, presetName, sizeof(presetName)) ||
       //version != GetPluginVersion(false) ||
       type != GetAUPluginType() ||
       subtype != GetUniqueID() ||

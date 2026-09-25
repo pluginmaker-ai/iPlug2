@@ -7,6 +7,7 @@
 #include "MidiQueueProbe.h"
 #include "NativeModule.h"
 #include "pluginterfaces/vst/ivstmidicontrollers.h"
+#include "pluginterfaces/vst/ivstunits.h"
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
@@ -198,8 +199,31 @@ static void TestInternalParameters()
     ParameterInfo info {};
     Check(controller->getParameterInfo(index, info) == kResultOk, "parameter info failed");
     if (info.id < kBypassParam) ids.push_back(info.id);
+    if (info.id == 2)
+    {
+      Check(std::u16string(info.title) == u"grand_piano_release_trigger_volume_upper_register_überblendung",
+            "long UTF-8 parameter title not decoded whole");
+      Check(std::u16string(info.units) == u"µs", "non-ASCII parameter units not decoded");
+      String128 text {};
+      Check(controller->getParamStringByValue(2, 0.5, text) == kResultOk
+            && std::u16string(text) == u"Flügel – obere Lage", "non-ASCII display text not decoded");
+      ParamValue value = -1.;
+      Check(controller->getParamValueByString(2, text, value) == kResultOk && std::abs(value - 0.5) < 1.e-9,
+            "non-ASCII display text not parsed back to its value");
+      value = -1.;
+      Check(controller->getParamValueByString(2, nullptr, value) == kResultFalse && value == -1.,
+            "NULL display string not refused");
+      controller->getParamStringByValue(2, 0.5, nullptr); // must not write through NULL
+    }
   }
   Check(ids == std::vector<ParamID>({0, 2}), "internal IDs advertised or surviving IDs renumbered");
+  IUnitInfo* units = nullptr;
+  Check(controller->queryInterface(IUnitInfo::iid, reinterpret_cast<void**>(&units)) == kResultOk, "unit info unavailable");
+  String128 program {};
+  Check(units->getProgramName(kPresetParam, 0, program) == kResultTrue
+        && std::u16string(program) == u"Flügel – Voreinstellung", "non-ASCII preset name not decoded");
+  Check(units->getProgramName(kPresetParam, 0, nullptr) == kResultFalse, "NULL program name buffer not refused");
+  units->release();
   for (const ParamID id : {1u, 3u, 4u})
   {
     Check(controller->setParamNormalized(id, 0.99) != kResultOk, "retired controller write accepted");

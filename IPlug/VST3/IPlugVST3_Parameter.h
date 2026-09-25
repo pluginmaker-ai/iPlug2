@@ -25,8 +25,10 @@ public:
   IPlugVST3Parameter(IParam* pParam, Steinberg::Vst::ParamID tag, Steinberg::Vst::UnitID unitID)
   : mIPlugParam(pParam)
   {
-    Steinberg::UString(info.title, str16BufferSize(Steinberg::Vst::String128)).assign(pParam->GetName());
-    Steinberg::UString(info.units, str16BufferSize(Steinberg::Vst::String128)).assign(pParam->GetLabel());
+    // PluginMaker alteration: decode UTF-8. assign(const char*) is fromAscii,
+    // which widened each byte on its own and mangled non-ASCII names.
+    Steinberg::UString(info.title, str16BufferSize(Steinberg::Vst::String128)).assign(UTF8ToUTF16String(pParam->GetName()).c_str());
+    Steinberg::UString(info.units, str16BufferSize(Steinberg::Vst::String128)).assign(UTF8ToUTF16String(pParam->GetLabel()).c_str());
 
     precision = pParam->GetDisplayPrecision();
 
@@ -48,15 +50,21 @@ public:
 
   void toString(Steinberg::Vst::ParamValue valueNormalized, Steinberg::Vst::String128 string) const override
   {
+    // PluginMaker alteration: nothing to write into a NULL host buffer, and
+    // decode UTF-8 display text (fromAscii widened each byte).
+    if (!string) return;
     WDL_String display;
     mIPlugParam->GetDisplay(valueNormalized, true, display);
-    Steinberg::UString(string, 128).fromAscii(display.Get());
+    Steinberg::UString(string, 128).assign(UTF8ToUTF16String(display.Get()).c_str());
   }
 
   bool fromString(const Steinberg::Vst::TChar* string, Steinberg::Vst::ParamValue& valueNormalized) const override
   {
-    Steinberg::String str((Steinberg::Vst::TChar*) string);
-    valueNormalized = mIPlugParam->ToNormalized(mIPlugParam->StringToValue(str.text8()));
+    // PluginMaker alteration: refuse a NULL host string, and encode UTF-8
+    // (text8() narrowed each UTF-16 unit).
+    if (!string) return false;
+    const std::string utf8 = UTF16ToUTF8String(std::u16string(reinterpret_cast<const char16_t*>(string)));
+    valueNormalized = mIPlugParam->ToNormalized(mIPlugParam->StringToValue(utf8.c_str()));
 
     return true;
   }
