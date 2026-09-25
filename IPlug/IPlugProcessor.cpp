@@ -517,19 +517,30 @@ void IPlugProcessor::AttachBuffers(ERoute direction, int idx, int n, PLUG_SAMPLE
   for (auto i = idx; i < endIdx; ++i)
   {
     IChannelData<>* pChannel = channelData.Get(i);
+    // PluginMaker alteration: a host may send no buffer array, or a NULL
+    // channel in one (VST3 allows both for a zero-frame parameter flush). An
+    // input reads silence; an output is disconnected rather than copied to NULL.
+    PLUG_SAMPLE_SRC* pHostData = ppData ? ppData[i - idx] : nullptr;
 
     if (pChannel->mConnected)
     {
       if (direction == ERoute::kInput)
       {
         PLUG_SAMPLE_DST* pScratch = pChannel->mScratchBuf.Get();
-        CastCopy(pScratch, *(ppData++), nFrames);
+        if (pHostData) CastCopy(pScratch, pHostData, nFrames);
+        else memset(pScratch, 0, std::max(nFrames, 0) * sizeof(PLUG_SAMPLE_DST));
         *(pChannel->mData) = pScratch;
       }
-      else // output
+      else if (pHostData) // output
       {
         *(pChannel->mData) = pChannel->mScratchBuf.Get();
-        pChannel->mIncomingData = *(ppData++);
+        pChannel->mIncomingData = pHostData;
+      }
+      else
+      {
+        pChannel->mConnected = false;
+        *(pChannel->mData) = pChannel->mScratchBuf.Get();
+        pChannel->mIncomingData = nullptr;
       }
     }
   }

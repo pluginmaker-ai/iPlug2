@@ -437,6 +437,40 @@ static void TestRenderAdmission()
   Check(!host.plug->mLastOffline, "offline state stuck after mode transition");
 }
 
+// Host buffers and streams the VST3 spec allows to be missing, and more buses
+// than the plug-in has: each call must succeed or fail cleanly, never crash.
+static void TestHostPointers()
+{
+  Host host;
+  AudioBusBuffers output {};
+  output.numChannels = 2;
+  ProcessData data {};
+  data.symbolicSampleSize = kSample32;
+  data.processMode = kRealtime;
+  data.numOutputs = 1;
+  data.outputs = &output;
+  auto process = [&](const char* what) {
+    gInProcess = true;
+    const auto result = host.processor->process(data);
+    gInProcess = false;
+    Check(result == kResultOk, what);
+  };
+  process("zero-frame flush without a buffer array");
+  data.numSamples = 64;
+  float* oneChannel[] {host.left.data(), nullptr};
+  output.channelBuffers32 = oneChannel;
+  process("output channel without a buffer");
+  float* stereo[] {host.left.data(), host.right.data()};
+  AudioBusBuffers twoBuses[2] {};
+  twoBuses[0].numChannels = twoBuses[1].numChannels = 2;
+  twoBuses[0].channelBuffers32 = twoBuses[1].channelBuffers32 = stereo;
+  data.numOutputs = 2;
+  data.outputs = twoBuses;
+  process("more output buses than the plug-in has");
+  Check(host.component->setState(nullptr) == kResultFalse, "state set from a NULL stream");
+  Check(host.component->getState(nullptr) == kResultFalse, "state written to a NULL stream");
+}
+
 int main(int argc, char** argv)
 {
   try
@@ -455,6 +489,7 @@ int main(int argc, char** argv)
     TestOtherMessages(); std::cout << "PASS: pitch bend, pressure, SysEx and same-offset note order\n";
     TestDenseAndAllChannels(); std::cout << "PASS: full MIDI namespace and 20,000-point allocation-free block\n";
     TestFlushAndSinglePoint(); std::cout << "PASS: zero-frame flush and single-point controller\n";
+    TestHostPointers(); std::cout << "PASS: VST3 flush without buffers, NULL channel, extra host bus, NULL state stream\n";
     TestMusicalBlocks(); std::cout << "PASS: sustain/patch with endpoints and ordinary CC values at 32/512/1024/8192 frames, realtime/offline\n";
     std::cout << "RESULT: pass\n";
     return 0;

@@ -12,6 +12,13 @@ It also renders with a NULL `ioActionFlags` (what Logic on Intel sends), a NULL
 is silent, ready and failed, and host MIDI offsets past either end of the block,
 which must be clamped into it. `IPLUG_TEST_ARCHS="arm64 x86_64"` builds and runs
 both macOS slices; x86_64 runs under Rosetta on Apple Silicon.
+Named host-input cases feed properties, parameters, callbacks and render calls
+NULL pointers, short or oversized values and out-of-range indices (a short
+GetProperty buffer, a NULL SetProperty value, an unknown clump or bus, extra
+output buffers). Each case reports on its own; `IPLUG_AU_ONLY_CASE=<name>` runs
+one in isolation. `Tests/run-midi-queue-tests.sh` covers the VST3 side: a
+zero-frame flush without buffers, a NULL output channel, an extra host bus and
+a NULL state stream.
 
 For an optional external-host check, build a new bundle with
 `bash Tests/run-au-sample-rate-tests.sh --bundle /absolute/new/IPlugAURateTest.component`.

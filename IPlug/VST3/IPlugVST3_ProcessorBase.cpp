@@ -433,11 +433,17 @@ void IPlugVST3ProcessorBase::ProcessAudio(ProcessData& data, ProcessSetup& setup
     
   if (sampleSize == kSample32 || sampleSize == kSample64)
   {
-    if (data.numInputs)
+    // PluginMaker alteration: trust the host's bus counts only as far as its
+    // arrays and our own buses go. A plug-in with a sidechain bus used to read
+    // data.inputs[1] from a host that sent one input bus.
+    const int nInputBuses = data.inputs ? std::min<int>(data.numInputs, static_cast<int>(ins.size())) : 0;
+    const int nOutputBuses = data.outputs ? std::min<int>(data.numOutputs, static_cast<int>(outs.size())) : 0;
+
+    if (nInputBuses > 0)
     {
       SetChannelConnections(ERoute::kInput, 0, MaxNChannels(ERoute::kInput), false);
 
-      if (ins.size() > 1)
+      if (nInputBuses > 1)
       {
         if (ins[1].get()->isActive()) // Sidechain is active
         {
@@ -463,13 +469,18 @@ void IPlugVST3ProcessorBase::ProcessAudio(ProcessData& data, ProcessSetup& setup
       }
       else
       {
+        if (mSidechainActive) // The host stopped sending the sidechain bus.
+        {
+          ZeroScratchBuffers();
+          mSidechainActive = false;
+        }
         SetChannelConnections(ERoute::kInput, 0, MaxNChannels(ERoute::kInput), false);
         SetChannelConnections(ERoute::kInput, 0, data.inputs[0].numChannels, true);
         AttachBuffers(ERoute::kInput, 0, data.inputs[0].numChannels, data.inputs[0], data.numSamples, sampleSize);
       }
     }
     
-    for (int outBus = 0, chanOffset = 0; outBus < data.numOutputs; outBus++)
+    for (int outBus = 0, chanOffset = 0; outBus < nOutputBuses; outBus++)
     {
       int busChannels = data.outputs[outBus].numChannels;
       SetChannelConnections(ERoute::kOutput, chanOffset, busChannels, outs[outBus].get()->isActive());
