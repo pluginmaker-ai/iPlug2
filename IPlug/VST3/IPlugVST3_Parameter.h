@@ -50,15 +50,19 @@ public:
 
   void toString(Steinberg::Vst::ParamValue valueNormalized, Steinberg::Vst::String128 string) const override
   {
+    // PluginMaker alteration: nothing to write into a NULL host buffer, and
+    // decode UTF-8 display text (fromAscii widened each byte).
+    if (!string) return;
     WDL_String display;
     mIPlugParam->GetDisplay(valueNormalized, true, display);
-    // PluginMaker alteration: decode UTF-8 display text (fromAscii widened each byte).
     Steinberg::UString(string, 128).assign(UTF8ToUTF16String(display.Get()).c_str());
   }
 
   bool fromString(const Steinberg::Vst::TChar* string, Steinberg::Vst::ParamValue& valueNormalized) const override
   {
-    // PluginMaker alteration: encode UTF-8 (text8() narrowed each UTF-16 unit).
+    // PluginMaker alteration: refuse a NULL host string, and encode UTF-8
+    // (text8() narrowed each UTF-16 unit).
+    if (!string) return false;
     const std::string utf8 = UTF16ToUTF8String(std::u16string(reinterpret_cast<const char16_t*>(string)));
     valueNormalized = mIPlugParam->ToNormalized(mIPlugParam->StringToValue(utf8.c_str()));
 

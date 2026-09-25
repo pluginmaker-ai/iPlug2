@@ -27,7 +27,8 @@ Saved state and strings: an AU ClassInfo saved with an 82-byte preset name
 reopens, NULL / non-dictionary / wrong-typed ClassInfo is refused, a short name
 cut through a UTF-8 character is cut before it, enum labels up to 127 bytes and
 preset names up to 255 bytes are stored whole and bounded, and VST3 units,
-display strings (both directions) and preset names decode UTF-8.
+display strings (both directions) and preset names decode UTF-8; a NULL
+display string or program-name buffer is refused rather than dereferenced.
 
 For an optional external-host check, build a new bundle with
 `bash Tests/run-au-sample-rate-tests.sh --bundle /absolute/new/IPlugAURateTest.component`.

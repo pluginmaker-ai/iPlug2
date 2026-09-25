@@ -159,9 +159,10 @@ public:
   
   Steinberg::tresult PLUGIN_API GetProgramName(IPlugAPIBase* pPlug, Steinberg::Vst::ProgramListID listId, Steinberg::int32 programIndex, Steinberg::Vst::String128 name)
   {
-    if (pPlug->NPresets() && listId == kPresetParam)
+    // PluginMaker alteration: refuse a NULL host buffer, and decode UTF-8
+    // (fromAscii widened each byte).
+    if (name && pPlug->NPresets() && listId == kPresetParam)
     {
-      // PluginMaker alteration: decode UTF-8 (fromAscii widened each byte).
       Steinberg::UString(name, 128).assign(UTF8ToUTF16String(pPlug->GetPresetName(programIndex)).c_str());
       return Steinberg::kResultTrue;
     }
