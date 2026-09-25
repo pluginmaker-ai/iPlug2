@@ -451,6 +451,18 @@ UInt32 IPlugAU::GetChannelLayoutTags(AudioUnitScope scope, AudioUnitElement elem
   }
 }
 
+// PluginMaker alteration: copy a UTF-8 string into a fixed field, dropping a
+// character the limit would cut in half instead of leaving a partial sequence.
+static void CopyUTF8Truncated(char* pDest, size_t destSize, const char* pSrc)
+{
+  const size_t length = strlen(pSrc);
+  size_t end = std::min(length, destSize - 1);
+  // While the first dropped byte continues a character, that character is cut.
+  while (end > 0 && end < length && (static_cast<unsigned char>(pSrc[end]) & 0xC0) == 0x80) --end;
+  memcpy(pDest, pSrc, end);
+  pDest[end] = '\0';
+}
+
 #define ASSERT_SCOPE(reqScope) if (scope != reqScope) { return kAudioUnitErr_InvalidProperty; }
 #define ASSERT_ELEMENT(numElements) if (element >= numElements) { return kAudioUnitErr_InvalidElement; }
 #define ASSERT_INPUT_OR_GLOBAL_SCOPE \
@@ -554,7 +566,7 @@ OSStatus IPlugAU::GetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
         const char* paramName = pParam->GetName();
         pInfo->cfNameString = CFStringCreateWithCString(0, pParam->GetName(), kCFStringEncodingUTF8);
         // PluginMaker alteration: name is a 52-byte field; truncate, never overflow.
-        strlcpy(pInfo->name, paramName, sizeof(pInfo->name));
+        CopyUTF8Truncated(pInfo->name, sizeof(pInfo->name), paramName);
 
         switch (pParam->Type())
         {
@@ -1295,11 +1307,10 @@ OSStatus IPlugAU::SetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
     //NO_OP(kAudioUnitProperty_ContextName);               // 25,
     case kAudioUnitProperty_ContextName:
     {
-      // PluginMaker alteration: the host's string may be NULL, and its length
-      // must not size a stack array; CStrLocal converts it on the heap.
+      // PluginMaker alteration: a NULL name clears it, as in Apple's AUBase; the
+      // host's length must not size a stack array, so CStrLocal converts on the heap.
       CFStringRef inStr = *(CFStringRef*) pData;
-      if (!inStr) return kAudioUnitErr_InvalidPropertyValue;
-      mTrackName.Set(CStrLocal(inStr).Get());
+      mTrackName.Set(inStr ? CStrLocal(inStr).Get() : "");
       return noErr;
     }
     NO_OP(kAudioUnitProperty_RenderQuality);             // 26,

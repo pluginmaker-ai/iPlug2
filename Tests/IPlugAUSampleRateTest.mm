@@ -250,6 +250,8 @@ struct HostInputCase
 // Each case runs on its own so one refusal cannot hide another. The name is
 // printed before the case runs, so a crash still names it. Set
 // IPLUG_AU_ONLY_CASE=<name> to run a single case.
+int gCasesRun = 0;
+
 void RunCases(const char* suite, std::initializer_list<HostInputCase> cases)
 {
   const char* only = std::getenv("IPLUG_AU_ONLY_CASE");
@@ -257,6 +259,7 @@ void RunCases(const char* suite, std::initializer_list<HostInputCase> cases)
   for (const auto& hostCase : cases)
   {
     if (only && std::strcmp(only, hostCase.name) != 0) continue;
+    ++gCasesRun;
     std::printf("  case %s\n", hostCase.name);
     std::fflush(stdout);
     try { hostCase.run(); }
@@ -328,9 +331,14 @@ void VerifyHostPropertyInputs(AudioUnit unit)
       Require(unchanged == rate, "short property value changed the sample rate");
     }},
     {"null-context-name", [&] {
-      CFStringRef noName = nullptr;
-      Require(AudioUnitSetProperty(unit, kAudioUnitProperty_ContextName, kAudioUnitScope_Global, 0, &noName,
-          sizeof(noName)) == kAudioUnitErr_InvalidPropertyValue, "NULL context name accepted");
+      CFStringRef before = CFSTR("Before"), noName = nullptr;
+      Check(AudioUnitSetProperty(unit, kAudioUnitProperty_ContextName, kAudioUnitScope_Global, 0, &before,
+          sizeof(before)), "context name");
+      Check(AudioUnitSetProperty(unit, kAudioUnitProperty_ContextName, kAudioUnitScope_Global, 0, &noName,
+          sizeof(noName)), "NULL context name");
+      WDL_String stored;
+      gPlugin->GetTrackName(stored);
+      Require(stored.GetLength() == 0, "NULL context name did not clear the name");
     }},
     {"non-ascii-context-name", [&] {
       CFStringRef trackName = CFSTR("Flügel – Spur 1");
@@ -672,6 +680,8 @@ int main()
       Check(AudioComponentInstanceDispose(unit), "dispose instance");
       unit = nullptr;
     }
+    const char* only = std::getenv("IPLUG_AU_ONLY_CASE");
+    Require(!only || gCasesRun > 0, "IPLUG_AU_ONLY_CASE names no case");
     std::puts("RESULT: pass — real AU lifecycle, pitch, parameters, stereo and rejected formats");
     return 0;
   }

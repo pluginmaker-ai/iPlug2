@@ -520,6 +520,9 @@ void IPlugProcessor::AttachBuffers(ERoute direction, int idx, int n, PLUG_SAMPLE
     // PluginMaker alteration: a host may send no buffer array, or a NULL
     // channel in one (VST3 allows both for a zero-frame parameter flush). An
     // input reads silence; an output is disconnected rather than copied to NULL.
+    // Host buffers map by position: ppData[k] belongs to channel idx + k.
+    // Upstream packed them onto the connected channels only; every caller
+    // connects whole ranges, where both mappings agree.
     PLUG_SAMPLE_SRC* pHostData = ppData ? ppData[i - idx] : nullptr;
 
     if (pChannel->mConnected)
