@@ -19,6 +19,10 @@ output buffers). Each case reports on its own; `IPLUG_AU_ONLY_CASE=<name>` runs
 one in isolation. `Tests/run-midi-queue-tests.sh` covers the VST3 side: a
 zero-frame flush without buffers, a NULL output channel, an extra host bus and
 a NULL state stream.
+Parameter names, labels and groups up to 127 bytes are stored whole and cut
+only at a UTF-8 character boundary: the harness checks 34/70/100/200-byte
+names in IParam, the long name an AU host reads, and the VST3 test checks the
+decoded UTF-16 title of a 63-byte non-ASCII name.
 
 For an optional external-host check, build a new bundle with
 `bash Tests/run-au-sample-rate-tests.sh --bundle /absolute/new/IPlugAURateTest.component`.

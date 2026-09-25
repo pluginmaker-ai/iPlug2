@@ -198,6 +198,12 @@ static void TestInternalParameters()
     ParameterInfo info {};
     Check(controller->getParameterInfo(index, info) == kResultOk, "parameter info failed");
     if (info.id < kBypassParam) ids.push_back(info.id);
+    if (info.id == 2)
+    {
+      Check(std::u16string(info.title) == u"grand_piano_release_trigger_volume_upper_register_überblendung",
+            "long UTF-8 parameter title not decoded whole");
+      Check(std::u16string(info.units) == u"dB", "parameter units changed");
+    }
   }
   Check(ids == std::vector<ParamID>({0, 2}), "internal IDs advertised or surviving IDs renumbered");
   for (const ParamID id : {1u, 3u, 4u})

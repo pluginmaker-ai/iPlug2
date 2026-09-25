@@ -451,18 +451,6 @@ UInt32 IPlugAU::GetChannelLayoutTags(AudioUnitScope scope, AudioUnitElement elem
   }
 }
 
-// PluginMaker alteration: copy a UTF-8 string into a fixed field, dropping a
-// character the limit would cut in half instead of leaving a partial sequence.
-static void CopyUTF8Truncated(char* pDest, size_t destSize, const char* pSrc)
-{
-  const size_t length = strlen(pSrc);
-  size_t end = std::min(length, destSize - 1);
-  // While the first dropped byte continues a character, that character is cut.
-  while (end > 0 && end < length && (static_cast<unsigned char>(pSrc[end]) & 0xC0) == 0x80) --end;
-  memcpy(pDest, pSrc, end);
-  pDest[end] = '\0';
-}
-
 #define ASSERT_SCOPE(reqScope) if (scope != reqScope) { return kAudioUnitErr_InvalidProperty; }
 #define ASSERT_ELEMENT(numElements) if (element >= numElements) { return kAudioUnitErr_InvalidElement; }
 #define ASSERT_INPUT_OR_GLOBAL_SCOPE \

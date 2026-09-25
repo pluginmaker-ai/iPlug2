@@ -4,6 +4,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <functional>
+#include <memory>
+#include <string>
+#include <tuple>
 #include <iterator>
 #include <cstdio>
 #include <stdexcept>
@@ -23,6 +26,9 @@ bool gEffect = false;
 double gInputPhase = 0.;
 double gInputRate = 48000.;
 bool gAdmissionTest = false;
+// A generated Song Keys-style name, 63 bytes, with a two-byte "ü" across the
+// 51-byte limit of AudioUnitParameterInfo::name.
+constexpr const char* kLongName = "grand_piano_release_trigger_volume_upper_register_überblendung";
 
 void Require(bool condition, const char* message)
 {
@@ -48,7 +54,7 @@ public:
   {
     GetParam(0)->InitDouble("Gain", 0.25, 0., 1., 0.001);
     GetParam(1)->InitDouble("Retired middle", 0.4, 0., 1., 0.001, "", IParam::kFlagInternal);
-    GetParam(2)->InitDouble("Surviving later ID", 0.6, 0., 1., 0.001);
+    GetParam(2)->InitDouble(kLongName, 0.6, 0., 1., 0.001, "dB");
     GetParam(3)->InitDouble("Retired last", 0.8, 0., 1., 0.001, "", IParam::kFlagInternal);
     MakeDefaultPreset();
   }
@@ -271,6 +277,78 @@ void RunCases(const char* suite, std::initializer_list<HostInputCase> cases)
   }
   std::fflush(stdout);
   Require(failed == 0, suite);
+}
+
+// Names, labels and groups longer than their old 32-byte fields are stored
+// whole (up to 127 bytes), never run into the next field, and are cut only at
+// a UTF-8 character boundary.
+void VerifyParamNameStorage()
+{
+  auto stored = [](const std::string& name, const char* label, const char* group) {
+    auto param = std::make_unique<IParam>();
+    param->InitDouble(name.c_str(), 0., 0., 1., 0.01, label, 0, group);
+    return std::make_tuple(std::string(param->GetName()), std::string(param->GetLabel()),
+        std::string(param->GetGroup()));
+  };
+  const std::string songKeys = "grand_piano_release_trigger_volume";
+  RunCases("IParam name storage", {
+    {"name-over-31-bytes", [&] {
+      Require(stored(songKeys, "dB", "Grand Piano") == std::make_tuple(songKeys, std::string("dB"),
+          std::string("Grand Piano")), "34-byte name ran into its label");
+    }},
+    {"name-over-63-bytes", [&] {
+      const std::string name = songKeys + "_" + std::string(35, 'x');
+      Require(stored(name, "frames", "Juno") == std::make_tuple(name, std::string("frames"), std::string("Juno")),
+          "70-byte name overran its label");
+    }},
+    {"name-over-95-bytes", [&] {
+      const std::string name = songKeys + "_" + std::string(65, 'y');
+      Require(stored(name, "%", "Upright") == std::make_tuple(name, std::string("%"), std::string("Upright")),
+          "100-byte name overran its group");
+    }},
+    {"name-over-127-bytes", [&] {
+      const std::string name(200, 'z');
+      Require(stored(name, "dB", "Rhodes") == std::make_tuple(name.substr(0, 127), std::string("dB"),
+          std::string("Rhodes")), "200-byte name not cut to 127 bytes");
+    }},
+    {"name-cut-at-utf8-boundary", [&] {
+      const std::string name = std::string(126, 'a') + "\xC3\xBC" + "tail"; // "ü" across byte 127
+      Require(std::get<0>(stored(name, "", "")) == std::string(126, 'a'), "UTF-8 character cut in half");
+    }},
+  });
+  std::puts("PASS: IParam stores long names, labels and groups whole, bounded and UTF-8 safe");
+}
+
+// The host sees a long generated name in full; the fixed 52-byte ParameterInfo
+// name is cut at a character boundary.
+void VerifyLongParameterName(AudioUnit unit)
+{
+  RunCases("AU long parameter name", {
+    {"long-name-in-parameter-info", [&] {
+      AudioUnitParameterInfo info{};
+      UInt32 size = sizeof(info);
+      Check(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterInfo, kAudioUnitScope_Global, 2, &info, &size),
+          "long parameter info");
+      CFStringRef expected = CFStringCreateWithCString(nullptr, kLongName, kCFStringEncodingUTF8);
+      const bool whole = info.cfNameString && CFStringCompare(info.cfNameString, expected, 0) == kCFCompareEqualTo;
+      CFRelease(expected);
+      if (info.cfNameString) CFRelease(info.cfNameString);
+      Require(whole, "host did not get the whole long name");
+      Require(std::string(info.name) == std::string(kLongName, 50), "52-byte name field not cut at a character boundary");
+    }},
+    {"long-name-by-id", [&] {
+      AudioUnitParameterIDName idName{2, kAudioUnitParameterName_Full, nullptr};
+      UInt32 size = sizeof(idName);
+      Check(AudioUnitGetProperty(unit, kAudioUnitProperty_ParameterIDName, kAudioUnitScope_Global, 0, &idName, &size),
+          "long name by ID");
+      CFStringRef expected = CFStringCreateWithCString(nullptr, kLongName, kCFStringEncodingUTF8);
+      const bool whole = idName.outName && CFStringCompare(idName.outName, expected, 0) == kCFCompareEqualTo;
+      CFRelease(expected);
+      if (idName.outName) CFRelease(idName.outName);
+      Require(whole, "long name by ID not whole");
+    }},
+  });
+  std::puts("PASS: AU hosts see long parameter names whole, with a UTF-8-safe 52-byte field");
 }
 
 // Host-supplied pointers, sizes and indices outside what each property expects:
@@ -662,6 +740,7 @@ int main()
   AudioUnit unit = nullptr;
   try
   {
+    VerifyParamNameStorage();
     for (bool effect : {false, true})
     {
       gEffect = effect;
@@ -674,6 +753,7 @@ int main()
       Check(AudioComponentInstanceNew(component, &unit), "create instance");
       VerifyInternalParameters(unit);
       VerifyHostPropertyInputs(unit);
+      VerifyLongParameterName(unit);
       std::printf("Testing %s\n", effect ? "effect" : "instrument");
       RunLifecycle(unit);
       if (!effect) VerifyAdmission(unit);

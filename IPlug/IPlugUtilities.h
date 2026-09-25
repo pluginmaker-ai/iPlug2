@@ -401,6 +401,23 @@ private:
 };
 #endif
 
+/** PluginMaker alteration: copy a UTF-8 string into a fixed-size field, never
+ * past it, dropping a character the limit would cut in half. NULL copies as "".
+ * @param pDest The destination field
+ * @param destSize The field's size in bytes, including the terminator
+ * @param pSrc The UTF-8 source string */
+static inline void CopyUTF8Truncated(char* pDest, size_t destSize, const char* pSrc)
+{
+  if (!destSize) return;
+  if (!pSrc) pSrc = "";
+  const size_t length = strlen(pSrc);
+  size_t end = std::min(length, destSize - 1);
+  // While the first dropped byte continues a character, that character is cut.
+  while (end > 0 && end < length && (static_cast<unsigned char>(pSrc[end]) & 0xC0) == 0x80) --end;
+  memcpy(pDest, pSrc, end);
+  pDest[end] = '\0';
+}
+
 /** Convert UTF-8 string to UTF-16 std::u16string using WDL functions
  * @param utf8 UTF-8 encoded C string
  * @return UTF-16 encoded std::u16string */

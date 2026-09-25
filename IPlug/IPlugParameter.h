@@ -338,7 +338,7 @@ public:
 
   /** Set the parameters label after creation. WARNING: if this is called after the host has queried plugin parameters, the host may display the label as it was previously
    * @param label CString for the label */
-  void SetLabel(const char* label) { strcpy(mLabel, label); }
+  void SetLabel(const char* label) { CopyUTF8Truncated(mLabel, sizeof(mLabel), label); } // PluginMaker alteration: bounded
   
   /** Set the function to translate display values
    * @param func A function conforming to DisplayFunc */

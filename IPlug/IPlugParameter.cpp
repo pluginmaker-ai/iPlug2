@@ -144,9 +144,12 @@ void IParam::InitDouble(const char* name, double defaultVal, double minVal, doub
 //  assert(CStringHasContents(mName) && "Parameter already initialised!");
 //  assert(CStringHasContents(name) && "Parameter must be given a name!");
 
-  strcpy(mName, name);
-  strcpy(mLabel, label);
-  strcpy(mParamGroup, group);
+  // PluginMaker alteration: bounded copies. A name longer than its field used
+  // to run into mLabel (hosts showed "…volu" + "dB") and, past three fields,
+  // into the rest of the object.
+  CopyUTF8Truncated(mName, sizeof(mName), name);
+  CopyUTF8Truncated(mLabel, sizeof(mLabel), label);
+  CopyUTF8Truncated(mParamGroup, sizeof(mParamGroup), group);
   
   // N.B. apply stepping and constraints to the default value (and store the result)
   mMin = minVal;

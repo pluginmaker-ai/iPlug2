@@ -25,8 +25,10 @@ public:
   IPlugVST3Parameter(IParam* pParam, Steinberg::Vst::ParamID tag, Steinberg::Vst::UnitID unitID)
   : mIPlugParam(pParam)
   {
-    Steinberg::UString(info.title, str16BufferSize(Steinberg::Vst::String128)).assign(pParam->GetName());
-    Steinberg::UString(info.units, str16BufferSize(Steinberg::Vst::String128)).assign(pParam->GetLabel());
+    // PluginMaker alteration: decode UTF-8. assign(const char*) is fromAscii,
+    // which widened each byte on its own and mangled non-ASCII names.
+    Steinberg::UString(info.title, str16BufferSize(Steinberg::Vst::String128)).assign(UTF8ToUTF16String(pParam->GetName()).c_str());
+    Steinberg::UString(info.units, str16BufferSize(Steinberg::Vst::String128)).assign(UTF8ToUTF16String(pParam->GetLabel()).c_str());
 
     precision = pParam->GetDisplayPrecision();
 
